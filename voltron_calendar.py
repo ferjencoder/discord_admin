@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -36,6 +37,9 @@ _MONTHS = {
     "nov": 11,
     "dec": 12,
 }
+
+AKURIER_EVENTS_URL = "https://akurier.pl/events"
+AKURIER_TIMEZONE = ZoneInfo("Europe/Warsaw")
 
 
 class VoltronCalendarError(RuntimeError):
@@ -131,6 +135,81 @@ class _CalendarHTMLParser(HTMLParser):
             cast_texts = self._row["texts"]
             assert isinstance(cast_texts, list)
             cast_texts.append(text)
+
+
+class _AkurierEventsHTMLParser(HTMLParser):
+    """Read only the regular mini-event table and stop before the SK section."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+        self._stopped = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if self._stopped:
+            return
+        tag = tag.casefold()
+        if tag == "tr":
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            self._cell = []
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.replace("\xa0", " ").split())
+        if not text:
+            return
+        if "for sk below" in text.casefold():
+            self._stopped = True
+            self._row = None
+            self._cell = None
+            return
+        if self._cell is not None:
+            self._cell.append(text)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._stopped:
+            return
+        tag = tag.casefold()
+        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
+            value = " ".join(self._cell).strip()
+            self._row.append(value)
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None
+            self._cell = None
+
+
+def parse_akurier_mini_events_html(html: str) -> list[MiniTournament]:
+    parser = _AkurierEventsHTMLParser()
+    parser.feed(html)
+    parser.close()
+
+    events: list[MiniTournament] = []
+    for row in parser.rows:
+        if len(row) < 3:
+            continue
+        raw_date, raw_time, title = row[0].strip(), row[1].strip(), row[2].strip()
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", raw_date):
+            continue
+        if not re.fullmatch(r"\d{1,2}:\d{2}", raw_time):
+            continue
+        if not title or title.casefold() in {"event", "sk event"}:
+            continue
+        try:
+            local = datetime.strptime(f"{raw_date} {raw_time}", "%d.%m.%Y %H:%M").replace(tzinfo=AKURIER_TIMEZONE)
+        except ValueError:
+            continue
+        start_utc = local.astimezone(timezone.utc)
+        events.append(MiniTournament(start_utc=start_utc, end_utc=start_utc, title=title))
+
+    dedup: dict[tuple[datetime, str], MiniTournament] = {}
+    for item in events:
+        dedup[(item.start_utc, item.title.casefold())] = item
+    return sorted(dedup.values(), key=lambda x: (x.start_utc, x.title.casefold()))
 
 
 def _parse_iso_utc(raw: str) -> datetime | None:
@@ -318,6 +397,25 @@ class VoltronCalendarClient:
     def meta_url(self) -> str:
         return self.settings.voltron_base_url.rstrip("/") + "/api/calendar/snapshot-meta"
 
+    async def _fetch_akurier_mini_events(self) -> list[MiniTournament]:
+        try:
+            async with self.session.get(
+                AKURIER_EVENTS_URL,
+                headers={"User-Agent": "OZY-Admin/1.0", "Accept": "text/html"},
+            ) as response:
+                if response.status != 200:
+                    raise VoltronCalendarError(f"Mini-events source returned HTTP {response.status}")
+                html = await response.text()
+            events = parse_akurier_mini_events_html(html)
+            if not events:
+                raise VoltronCalendarError("Mini-events parser returned no regular events")
+            return events
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Akurier mini-events refresh failed; keeping Voltron mini-event fallback: %s", exc)
+            return []
+
     async def _fetch_meta(self) -> datetime | None:
         timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
         try:
@@ -369,6 +467,18 @@ class VoltronCalendarClient:
                     raise VoltronCalendarError(
                         f"Voltron parser produced only {len(parsed.actions)} calendar actions; refusing snapshot"
                     )
+
+                # Mini events come from akurier.pl's regular table. The page also
+                # contains a separate "for SK below" table; the parser stops before it.
+                # If that source is unavailable, retain any minis Voltron itself exposed.
+                akurier_minis = await self._fetch_akurier_mini_events()
+                if akurier_minis:
+                    parsed = replace(
+                        parsed,
+                        mini_tournaments=tuple(akurier_minis),
+                        semantic_hash=_semantic_hash(parsed.actions, akurier_minis),
+                    )
+
                 parsed = replace(parsed, last_synced_utc=last_synced)
                 changed = self._snapshot is None or parsed.semantic_hash != self._snapshot.semantic_hash
                 self._snapshot = parsed
@@ -387,20 +497,61 @@ class VoltronCalendarClient:
                 raise VoltronCalendarError(str(exc)) from exc
 
 
-def _discord_timestamp(dt: datetime, style: str = "t") -> str:
-    return f"<t:{int(dt.timestamp())}:{style}>"
+GAME_RESET_UTC_HOUR = 17
+GAME_RESET_UTC_MINUTE = 0
+
+
+def reset_label(dt: datetime) -> str:
+    """Return Total Battle reset-clock notation for a UTC timestamp.
+
+    17:00 UTC is R+0. Offsets are wrapped to the nearest reset, so the
+    displayed reset clock stays in the familiar R-11 .. R+12 range.
+    Half-hours render as .5 (and quarter-hours as .25/.75 if they occur).
+    """
+    utc = dt.astimezone(timezone.utc)
+    event_minutes = utc.hour * 60 + utc.minute
+    reset_minutes = GAME_RESET_UTC_HOUR * 60 + GAME_RESET_UTC_MINUTE
+    diff = event_minutes - reset_minutes
+
+    # Wrap to the nearest daily reset. Keep +12 rather than -12 at the tie.
+    while diff < -12 * 60:
+        diff += 24 * 60
+    while diff > 12 * 60:
+        diff -= 24 * 60
+
+    sign = "+" if diff >= 0 else "-"
+    value = abs(diff) / 60
+    if value.is_integer():
+        rendered = str(int(value))
+    else:
+        rendered = f"{value:.2f}".rstrip("0").rstrip(".")
+    return f"R{sign}{rendered}"
+
+
+def _clock_time(dt: datetime, timezone_info) -> str:
+    return dt.astimezone(timezone_info).strftime("%H:%M")
 
 
 def _event_line(action: CalendarAction) -> str:
     detail = f" - {action.details}" if action.details else ""
-    return f"- {_discord_timestamp(action.timestamp_utc)} **{action.title}**{detail}"
+    return f"- {reset_label(action.timestamp_utc)} {action.title}{detail}"
 
 
-def _calendar_start_line(action: CalendarAction, end_utc: datetime | None) -> str:
+def _calendar_start_line(action: CalendarAction) -> str:
     detail = f" - {action.details}" if action.details else ""
-    ending = f" · ends {_discord_timestamp(end_utc, 'D')} {_discord_timestamp(end_utc)}" if end_utc else ""
-    return f"- {_discord_timestamp(action.timestamp_utc)} **{action.title}**{detail}{ending}"
+    return f"- {reset_label(action.timestamp_utc)} {action.title}{detail}"
 
+
+def _local_clock_with_date(dt: datetime, timezone_info, game_date: date) -> str:
+    local = dt.astimezone(timezone_info)
+    if local.date() == game_date:
+        return local.strftime("%H:%M")
+    return local.strftime("%a %d %b %H:%M")
+
+
+def _local_event_line(action: CalendarAction, timezone_info, game_date: date) -> str:
+    detail = f" - {action.details}" if action.details else ""
+    return f"- {_local_clock_with_date(action.timestamp_utc, timezone_info, game_date)} {action.title}{detail}"
 
 def _match_end_times(actions: Iterable[CalendarAction]) -> dict[CalendarAction, datetime]:
     ends_by_key: dict[tuple[str, str], list[CalendarAction]] = {}
@@ -450,9 +601,10 @@ def _split_oversized_section(section: str, limit: int) -> list[str]:
     return pieces or [section[:limit]]
 
 
-def _pack_sections(title: str, sections: list[str], footer: str, limit: int = 1650) -> list[str]:
-    # Keep generous headroom below Discord's 2000-character message limit for
-    # per-chunk headings and the source/footer line.
+def _pack_sections(title: str, sections: list[str], footer: str = "", limit: int = 1600) -> list[str]:
+    # Keep generous headroom below Discord's 2000-character message limit.
+    # Messages are intentionally wrapped in triple backticks so leadership can
+    # copy/paste the schedule without Discord markdown or timestamp markup.
     normalized: list[str] = []
     for section in sections:
         normalized.extend(_split_oversized_section(section, limit))
@@ -476,72 +628,69 @@ def _pack_sections(title: str, sections: list[str], footer: str, limit: int = 16
     rendered: list[str] = []
     for index, body in enumerate(bodies, start=1):
         header = title if total == 1 else f"{title} ({index}/{total})"
-        text = f"{header}\n\n{body}"
+        inner = f"{header}\n\n{body}"
         if index == total and footer:
-            text += "\n\n" + footer
+            inner += "\n\n" + footer
+        text = f"```\n{inner}\n```"
         if len(text) > 2000:
             raise VoltronCalendarError("Rendered calendar chunk exceeds Discord's 2000-character limit")
         rendered.append(text)
     return rendered
-
 
 def build_calendar_chunks(
     snapshot: VoltronSnapshot,
     *,
     start_date: date,
     days: int,
-    timezone_info,
+    timezone_info=None,
 ) -> list[str]:
+    """Render the public 30-day calendar in Total Battle reset notation.
+
+    Source timestamps are UTC. Calendar dates are UTC dates; clock values are
+    intentionally replaced by reset offsets (17:00 UTC == R+0).
+    """
     end_date = start_date + timedelta(days=days)
     starts = [
         action
         for action in snapshot.actions
         if action.action == "STARTS"
-        and start_date <= action.timestamp_utc.astimezone(timezone_info).date() < end_date
+        and start_date <= action.timestamp_utc.date() < end_date
     ]
-
-    end_times = _match_end_times(snapshot.actions)
 
     by_day: dict[date, list[CalendarAction]] = {}
     for action in starts:
-        local_day = action.timestamp_utc.astimezone(timezone_info).date()
-        by_day.setdefault(local_day, []).append(action)
+        by_day.setdefault(action.timestamp_utc.date(), []).append(action)
 
     sections: list[str] = []
     for day in sorted(by_day):
-        lines = [f"### {day.strftime('%a %d %b')}"]
-        lines.extend(_calendar_start_line(item, end_times.get(item)) for item in by_day[day])
+        lines = [day.strftime("%a %d %b")]
+        lines.extend(_calendar_start_line(item) for item in sorted(by_day[day], key=lambda x: x.timestamp_utc))
         sections.append("\n".join(lines))
 
     if not sections:
         sections.append("No tournament starts are currently listed in this 30-day window.")
 
-    source = "https://nexusportal.voltron.me/calendar"
-    synced = (
-        f" · source synced {_discord_timestamp(snapshot.last_synced_utc, 'R')}"
-        if snapshot.last_synced_utc else ""
-    )
-    footer = f"Times display in each member's Discord timezone. Source: {source}{synced}"
-    title = "# OZY Tournament Calendar - Next 30 Days"
-    return _pack_sections(title, sections, footer)
+    title = "OZY Tournament Calendar - Next 30 Days"
+    return _pack_sections(title, sections)
 
 
 def build_today_chunks(
     snapshot: VoltronSnapshot,
     *,
     target_date: date,
-    timezone_info,
+    timezone_info=None,
 ) -> list[str]:
+    """Render one UTC calendar day in reset-clock notation."""
     groups: dict[str, list[CalendarAction]] = {"STARTS": [], "CONTINUE": [], "ENDS": []}
     for action in snapshot.actions:
-        if action.timestamp_utc.astimezone(timezone_info).date() != target_date:
+        if action.timestamp_utc.date() != target_date:
             continue
         if action.action in groups:
             groups[action.action].append(action)
 
     minis = [
         item for item in snapshot.mini_tournaments
-        if item.start_utc.astimezone(timezone_info).date() == target_date
+        if item.start_utc.date() == target_date
     ]
 
     sections: list[str] = []
@@ -550,26 +699,61 @@ def build_today_chunks(
         items = groups[key]
         if not items:
             continue
-        lines = [f"### {labels[key]}"]
+        lines = [labels[key]]
         lines.extend(_event_line(item) for item in sorted(items, key=lambda x: x.timestamp_utc))
         sections.append("\n".join(lines))
 
     if minis:
-        lines = ["### Mini tournaments"]
+        lines = ["Mini events"]
         for item in sorted(minis, key=lambda x: x.start_utc):
-            lines.append(
-                f"- {_discord_timestamp(item.start_utc)}-{_discord_timestamp(item.end_utc)} **{item.title}**"
-            )
+            lines.append(f"- {reset_label(item.start_utc)} {item.title}")
         sections.append("\n".join(lines))
 
     if not sections:
         sections.append("No Voltron tournament activity is currently listed for today.")
 
-    source = "https://nexusportal.voltron.me/calendar"
-    synced = (
-        f" · source synced {_discord_timestamp(snapshot.last_synced_utc, 'R')}"
-        if snapshot.last_synced_utc else ""
-    )
-    footer = f"Times display in each member's Discord timezone. Source: {source}{synced}"
-    title = f"# OZY Today - {target_date.strftime('%A %d %B %Y')}"
-    return _pack_sections(title, sections, footer)
+    title = f"OZY Today - {target_date.strftime('%A %d %B %Y')}"
+    return _pack_sections(title, sections)
+
+
+def build_today_local_chunks(
+    snapshot: VoltronSnapshot,
+    *,
+    target_date: date,
+    timezone_info,
+    timezone_label: str,
+) -> list[str]:
+    """Render the same UTC-day schedule using one requested local timezone."""
+    groups: dict[str, list[CalendarAction]] = {"STARTS": [], "CONTINUE": [], "ENDS": []}
+    for action in snapshot.actions:
+        if action.timestamp_utc.date() != target_date:
+            continue
+        if action.action in groups:
+            groups[action.action].append(action)
+
+    minis = [
+        item for item in snapshot.mini_tournaments
+        if item.start_utc.date() == target_date
+    ]
+
+    sections: list[str] = []
+    labels = {"STARTS": "Starts today", "CONTINUE": "Active / continues", "ENDS": "Ends today"}
+    for key in ("STARTS", "CONTINUE", "ENDS"):
+        items = groups[key]
+        if not items:
+            continue
+        lines = [labels[key]]
+        lines.extend(_local_event_line(item, timezone_info, target_date) for item in sorted(items, key=lambda x: x.timestamp_utc))
+        sections.append("\n".join(lines))
+
+    if minis:
+        lines = ["Mini events"]
+        for item in sorted(minis, key=lambda x: x.start_utc):
+            lines.append(f"- {_local_clock_with_date(item.start_utc, timezone_info, target_date)} {item.title}")
+        sections.append("\n".join(lines))
+
+    if not sections:
+        sections.append("No Voltron tournament activity is currently listed for today.")
+
+    title = f"OZY Today - {timezone_label} - {target_date.strftime('%A %d %B %Y')} (game date UTC)"
+    return _pack_sections(title, sections)

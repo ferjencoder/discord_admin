@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -20,6 +21,7 @@ from voltron_calendar import (
     VoltronCalendarError,
     build_calendar_chunks,
     build_today_chunks,
+    build_today_local_chunks,
 )
 
 logging.basicConfig(
@@ -27,6 +29,26 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("ozy-admin")
+
+TIMEZONE_CHOICES = [
+    app_commands.Choice(name="Argentina", value="America/Argentina/Buenos_Aires"),
+    app_commands.Choice(name="UTC / Game time", value="UTC"),
+    app_commands.Choice(name="United Kingdom", value="Europe/London"),
+    app_commands.Choice(name="France / Germany / Spain", value="Europe/Paris"),
+    app_commands.Choice(name="Romania / Bulgaria", value="Europe/Bucharest"),
+    app_commands.Choice(name="Moscow", value="Europe/Moscow"),
+    app_commands.Choice(name="Turkey", value="Europe/Istanbul"),
+    app_commands.Choice(name="UAE / Dubai", value="Asia/Dubai"),
+    app_commands.Choice(name="India", value="Asia/Kolkata"),
+    app_commands.Choice(name="Singapore / Malaysia", value="Asia/Singapore"),
+    app_commands.Choice(name="Australia / Sydney", value="Australia/Sydney"),
+    app_commands.Choice(name="Brazil", value="America/Sao_Paulo"),
+    app_commands.Choice(name="US Eastern", value="America/New_York"),
+    app_commands.Choice(name="US Central", value="America/Chicago"),
+    app_commands.Choice(name="US Pacific", value="America/Los_Angeles"),
+    app_commands.Choice(name="Canada / Toronto", value="America/Toronto"),
+    app_commands.Choice(name="South Africa", value="Africa/Johannesburg"),
+]
 
 
 class AnnouncementModal(discord.ui.Modal):
@@ -672,8 +694,7 @@ class OZYAdminBot(discord.Client):
             return False, str(exc)
 
         snapshot = result.snapshot
-        tz = self.settings.timezone
-        today = datetime.now(tz).date()
+        today = datetime.now(timezone.utc).date()
 
         rendered_start = self.state.get_value("voltron_calendar_start_date")
         window_rolled = rendered_start != today.isoformat()
@@ -684,12 +705,12 @@ class OZYAdminBot(discord.Client):
                     snapshot,
                     start_date=today,
                     days=self.settings.voltron_calendar_days,
-                    timezone_info=tz,
+                    timezone_info=timezone.utc,
                 )
                 await self._upsert_message_series(
                     channel,
                     state_key="voltron_calendar_message_ids",
-                    recovery_prefix="# OZY Tournament Calendar - Next 30 Days",
+                    recovery_prefix="```\nOZY Tournament Calendar - Next 30 Days",
                     chunks=chunks,
                 )
                 self.state.set_value("voltron_calendar_start_date", today.isoformat())
@@ -729,7 +750,7 @@ class OZYAdminBot(discord.Client):
         if not force and self._state_message_ids(state_key):
             return False
 
-        title_prefix = f"# OZY Today - {target_date.strftime('%A %d %B %Y')}"
+        title_prefix = f"```\nOZY Today - {target_date.strftime('%A %d %B %Y')}"
         existing = self._state_message_ids(state_key)
         if not existing:
             recovered = await self._recover_bot_messages(channel, title_prefix)
@@ -738,7 +759,7 @@ class OZYAdminBot(discord.Client):
                 if not force:
                     return False
 
-        chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=self.settings.timezone)
+        chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=timezone.utc)
         await self._upsert_message_series(
             channel,
             state_key=state_key,
@@ -775,7 +796,7 @@ class OZYAdminBot(discord.Client):
             # Catch up after a restart without duplicating the day's canonical post.
             if now >= target:
                 try:
-                    await self._post_voltron_today(now.date(), force=False, actor="automatic today scheduler")
+                    await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
                 except Exception:
                     log.exception("Catch-up Voltron today post failed")
 
@@ -789,7 +810,7 @@ class OZYAdminBot(discord.Client):
                 raise
 
             try:
-                await self._post_voltron_today(next_target.date(), force=False, actor="automatic today scheduler")
+                await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
             except Exception:
                 log.exception("Automatic Voltron today post failed")
 
@@ -1269,9 +1290,9 @@ class OZYAdminBot(discord.Client):
                     raise VoltronCalendarError("No calendar snapshot is available")
                 chunks = build_calendar_chunks(
                     snapshot,
-                    start_date=datetime.now(self.settings.timezone).date(),
+                    start_date=datetime.now(timezone.utc).date(),
                     days=self.settings.voltron_calendar_days,
-                    timezone_info=self.settings.timezone,
+                    timezone_info=timezone.utc,
                 )
                 for chunk in chunks:
                     await interaction.followup.send(
@@ -1298,8 +1319,8 @@ class OZYAdminBot(discord.Client):
                 snapshot = self.voltron.snapshot
                 if snapshot is None:
                     raise VoltronCalendarError("No calendar snapshot is available")
-                target_date = datetime.now(self.settings.timezone).date()
-                chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=self.settings.timezone)
+                target_date = datetime.now(timezone.utc).date()
+                chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=timezone.utc)
                 for chunk in chunks:
                     await interaction.followup.send(
                         chunk,
@@ -1308,6 +1329,36 @@ class OZYAdminBot(discord.Client):
                     )
             except VoltronCalendarError as exc:
                 await interaction.followup.send(f"Today's calendar is unavailable: {exc}", ephemeral=True)
+
+        @self.tree.command(name="time", description="Show today's OZY events in your chosen local timezone")
+        @app_commands.describe(zone="Timezone to convert the current game-day schedule to")
+        @app_commands.choices(zone=TIMEZONE_CHOICES)
+        async def time_converter(interaction: discord.Interaction, zone: app_commands.Choice[str]) -> None:
+            if self.voltron is None:
+                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                if self.voltron.snapshot is None:
+                    await self.voltron.refresh(force=True)
+                snapshot = self.voltron.snapshot
+                if snapshot is None:
+                    raise VoltronCalendarError("No calendar snapshot is available")
+                target_date = datetime.now(timezone.utc).date()
+                chunks = build_today_local_chunks(
+                    snapshot,
+                    target_date=target_date,
+                    timezone_info=ZoneInfo(zone.value),
+                    timezone_label=zone.name,
+                )
+                for chunk in chunks:
+                    await interaction.followup.send(
+                        chunk,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except Exception as exc:
+                await interaction.followup.send(f"Time conversion unavailable: {exc}", ephemeral=True)
 
         @self.tree.command(name="calendar-refresh", description="Leadership: refresh Voltron and update the calendar channel")
         async def calendar_refresh(interaction: discord.Interaction) -> None:
