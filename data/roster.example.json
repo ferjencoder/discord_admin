@@ -1,0 +1,16 @@
+{
+  "members": {
+    "PeekABoo Death": {
+      "status": "active",
+      "rank": "Superior",
+      "level": "100",
+      "might": "1,000,000",
+      "location": "K:1030 X:500 Y:500"
+    },
+    "Example Player": {
+      "status": "active",
+      "rank": "Veteran",
+      "level": "75"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "events": [
+    {
+      "weekdays": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+      "time": "14:00",
+      "title": "Daily reset",
+      "details": "Total Battle daily reset. Replace this example with the actual OZY daily schedule."
+    },
+    {
+      "date": "2026-08-21",
+      "time": "19:00",
+      "title": "Example one-off event",
+      "details": "Date-specific events override nothing; they are added to the recurring entries."
+    }
+  ]
+}

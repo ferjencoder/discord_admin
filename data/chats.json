@@ -1,0 +1,12 @@
+{
+  "chats": [
+    {"key": "news", "label": "Clan Announcements", "name": "OZY ⓝⓔⓦⓢ"},
+    {"key": "chest", "label": "Chest Tracker", "name": "OZY ⓒⓗⓔⓢⓣ"},
+    {"key": "epics", "label": "Epics Guide & Drops", "name": "OZY ⓔⓟⓘⓒⓢ"},
+    {"key": "merc", "label": "Merc Exchange Locations", "name": "OZY ⓜⓔⓡⓒ"},
+    {"key": "cp", "label": "CP Runs & Exchange", "name": "OZY ⓒⓟ"},
+    {"key": "away", "label": "Absences", "name": "OZY ⓐⓦⓐⓨ"},
+    {"key": "vault", "label": "Vaults Posts", "name": "OZY ⓥⓐⓤⓛⓣ"},
+    {"key": "troop", "label": "Troop Level Upgrades", "name": "OZY ⓣⓡⓞⓞⓟ"}
+  ]
+}
