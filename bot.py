@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Optional
@@ -15,13 +16,14 @@ from discord import app_commands
 from data_provider import DataProvider, DataUnavailable
 from settings import ConfigError, Settings, load_settings
 from state import AdminState
-from utils import format_chat_directory, format_schedule, safe_code_block, truncate
-from voltron_calendar import (
+from utils import format_chat_directory, format_chest_ranking_blocks, format_schedule, safe_code_block, truncate
+from event_calendar import (
     VoltronCalendarClient,
     VoltronCalendarError,
     build_calendar_chunks,
     build_today_chunks,
     build_today_local_chunks,
+    reset_label,
 )
 
 logging.basicConfig(
@@ -49,6 +51,334 @@ TIMEZONE_CHOICES = [
     app_commands.Choice(name="Canada / Toronto", value="America/Toronto"),
     app_commands.Choice(name="South Africa", value="Africa/Johannesburg"),
 ]
+
+# Minimal-impact source schedule. Public calendar metadata is checked only four
+# times per UTC day while we learn Voltron's actual source refresh cadence.
+# Akurier regular mini-events are fetched once daily at R+1 (18:00 UTC).
+VOLTRON_META_PROBE_TIMES_UTC = ((0, 30), (6, 30), (12, 30), (18, 30))
+AKURIER_REFRESH_TIME_UTC = (18, 0)
+
+
+def _next_utc_slot(now: datetime, slots: tuple[tuple[int, int], ...]) -> datetime:
+    candidates = [
+        datetime.combine(now.date(), dt_time(hour, minute), tzinfo=timezone.utc)
+        for hour, minute in slots
+    ]
+    for candidate in candidates:
+        if candidate > now:
+            return candidate
+    hour, minute = slots[0]
+    return datetime.combine(
+        now.date() + timedelta(days=1),
+        dt_time(hour, minute),
+        tzinfo=timezone.utc,
+    )
+
+
+_RESET_INPUT_RE = re.compile(r"^\s*R?\s*([+-]?)\s*(\d{1,2}(?:\.\d{1,2})?)\s*$", re.IGNORECASE)
+
+
+def _parse_event_date(value: str, *, now_utc: datetime | None = None):
+    now_utc = now_utc or datetime.now(timezone.utc)
+    text = value.strip().casefold()
+    if text == "today":
+        return now_utc.date()
+    if text == "tomorrow":
+        return now_utc.date() + timedelta(days=1)
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(value.strip(), fmt).date()
+        except ValueError:
+            pass
+    raise ValueError("Date must be `today`, `tomorrow`, YYYY-MM-DD, DD.MM.YYYY, or DD/MM/YYYY.")
+
+
+def _event_datetime_from_reset(date_value: str, reset_value: str, *, now_utc: datetime | None = None) -> tuple[datetime, str]:
+    target_date = _parse_event_date(date_value, now_utc=now_utc)
+    match = _RESET_INPUT_RE.match(reset_value)
+    if not match:
+        raise ValueError("Reset time must look like `R+4`, `R-3`, or `R+1.5`.")
+
+    sign_text, number_text = match.groups()
+    value = float(number_text)
+    if sign_text == "-":
+        value = -value
+    if value < -11 or value > 12:
+        raise ValueError("Reset time must be between R-11 and R+12.")
+
+    raw_minutes = value * 60
+    rounded_minutes = round(raw_minutes)
+    if abs(raw_minutes - rounded_minutes) > 0.001 or rounded_minutes % 15 != 0:
+        raise ValueError("Reset time must use 15-minute steps, for example R+1, R+1.5, or R-3.25.")
+
+    # The calendar date is the UTC date shown publicly. Convert the reset clock
+    # back into that day's UTC wall-clock time rather than blindly adding to the
+    # reset instant (R+9, for example, is 02:00 UTC on that displayed date).
+    clock_minutes = (17 * 60 + rounded_minutes) % (24 * 60)
+    hour, minute = divmod(clock_minutes, 60)
+    start = datetime.combine(target_date, dt_time(hour, minute), tzinfo=timezone.utc)
+    return start, reset_label(start)
+
+
+class EventDetailsModal(discord.ui.Modal):
+    def __init__(
+        self,
+        bot: "OZYAdminBot",
+        *,
+        creator_id: int,
+        voice_channel_id: int,
+        category_name: str,
+    ):
+        super().__init__(title="Create OZY Event", timeout=300)
+        self.bot = bot
+        self.creator_id = creator_id
+        self.voice_channel_id = voice_channel_id
+        self.category_name = category_name
+
+        self.event_name = discord.ui.TextInput(
+            label="Event name",
+            placeholder="Leadership Meeting",
+            max_length=100,
+        )
+        self.event_date = discord.ui.TextInput(
+            label="Date",
+            placeholder="tomorrow or 2026-08-23",
+            max_length=20,
+        )
+        self.reset_time = discord.ui.TextInput(
+            label="Game reset time",
+            placeholder="R+4",
+            max_length=10,
+        )
+        self.duration = discord.ui.TextInput(
+            label="Duration in minutes",
+            default="60",
+            required=True,
+            max_length=4,
+        )
+        self.notes = discord.ui.TextInput(
+            label="Description / notes (optional)",
+            placeholder="Leadership meeting in voice.",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=800,
+        )
+        for item in (self.event_name, self.event_date, self.reset_time, self.duration, self.notes):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.creator_id:
+            await interaction.response.send_message("This event builder belongs to another member.", ephemeral=True)
+            return
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
+            return
+        channel = guild.get_channel(self.voice_channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            await interaction.response.send_message("The selected voice channel is no longer available.", ephemeral=True)
+            return
+
+        try:
+            start_time, reset_text = _event_datetime_from_reset(str(self.event_date.value), str(self.reset_time.value))
+            duration_minutes = int(str(self.duration.value).strip())
+            if duration_minutes < 15 or duration_minutes > 720:
+                raise ValueError("Duration must be between 15 and 720 minutes.")
+            if start_time <= datetime.now(timezone.utc) + timedelta(minutes=1):
+                raise ValueError("The event start must be in the future.")
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        name = str(self.event_name.value).strip()
+        notes = str(self.notes.value or "").strip()
+        description_lines = [f"OZY time: {reset_text}"]
+        if notes:
+            description_lines.append(notes)
+        description = "\n\n".join(description_lines)[:1000]
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            event = await guild.create_scheduled_event(
+                name=name,
+                start_time=start_time,
+                end_time=start_time + timedelta(minutes=duration_minutes),
+                channel=channel,
+                privacy_level=discord.PrivacyLevel.guild_only,
+                description=description,
+                reason=f"OZY event created by {interaction.user}",
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I cannot create the Discord event. Give OZY Admin **Create Events**, plus **View Channel** and **Connect** on the selected voice channel.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as exc:
+            await interaction.followup.send(f"Discord could not create the event: {exc}", ephemeral=True)
+            return
+
+        event_url = f"https://discord.com/events/{guild.id}/{event.id}"
+        await interaction.followup.send(
+            "Event created.\n"
+            f"**{name}**\n"
+            f"Category: **{self.category_name}**\n"
+            f"Voice: {channel.mention}\n"
+            f"Game time: **{reset_text}**\n"
+            f"UTC: **{start_time.strftime('%Y-%m-%d %H:%M')}**\n"
+            f"{event_url}",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await self.bot._audit(
+            "Discord event created",
+            str(interaction.user),
+            f"{name}\nCategory: {self.category_name}\nVoice: #{channel.name}\nStart: {start_time.isoformat()} ({reset_text})",
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Event details modal failed", exc_info=error)
+        if interaction.response.is_done():
+            await interaction.followup.send("Event creation failed. Check the admin-bot logs.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Event creation failed. Check the admin-bot logs.", ephemeral=True)
+
+
+class EventVoiceSelect(discord.ui.Select):
+    def __init__(self, view: "EventLocationView", channels: list[discord.VoiceChannel]):
+        self.builder_view = view
+        options = [
+            discord.SelectOption(label=channel.name[:100], value=str(channel.id))
+            for channel in channels[:25]
+        ]
+        super().__init__(placeholder="2. Select voice channel", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.builder_view.voice_channel_id = int(self.values[0])
+        self.builder_view.details_button.disabled = False
+        await interaction.response.edit_message(content=self.builder_view.content(), view=self.builder_view)
+
+
+class EventCategorySelect(discord.ui.Select):
+    def __init__(self, view: "EventLocationView", categories: list[discord.CategoryChannel]):
+        self.builder_view = view
+        options = []
+        for category in categories[:25]:
+            count = len([ch for ch in category.channels if isinstance(ch, discord.VoiceChannel)])
+            options.append(
+                discord.SelectOption(
+                    label=category.name[:100],
+                    value=str(category.id),
+                    description=f"{count} voice channel{'s' if count != 1 else ''}",
+                )
+            )
+        super().__init__(placeholder="1. Select category", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Guild unavailable.", ephemeral=True)
+            return
+        category = guild.get_channel(int(self.values[0]))
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message("Category unavailable.", ephemeral=True)
+            return
+
+        me = guild.me
+        channels = [
+            ch for ch in category.channels
+            if isinstance(ch, discord.VoiceChannel)
+            and (me is None or (ch.permissions_for(me).view_channel and ch.permissions_for(me).connect))
+        ]
+        if not channels:
+            await interaction.response.send_message("That category has no voice channel OZY Admin can view and connect to.", ephemeral=True)
+            return
+
+        self.builder_view.category_id = category.id
+        self.builder_view.category_name = category.name
+        self.builder_view.voice_channel_id = None
+        self.builder_view.details_button.disabled = True
+        if self.builder_view.voice_select is not None:
+            self.builder_view.remove_item(self.builder_view.voice_select)
+        self.builder_view.voice_select = EventVoiceSelect(self.builder_view, channels)
+        self.builder_view.add_item(self.builder_view.voice_select)
+        await interaction.response.edit_message(content=self.builder_view.content(), view=self.builder_view)
+
+
+class EventDetailsButton(discord.ui.Button):
+    def __init__(self, view: "EventLocationView"):
+        super().__init__(label="Event details", style=discord.ButtonStyle.primary, disabled=True)
+        self.builder_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not self.builder_view.voice_channel_id or not self.builder_view.category_name:
+            await interaction.response.send_message("Select a category and voice channel first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            EventDetailsModal(
+                self.builder_view.bot,
+                creator_id=self.builder_view.creator_id,
+                voice_channel_id=self.builder_view.voice_channel_id,
+                category_name=self.builder_view.category_name,
+            )
+        )
+
+
+class EventCancelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Cancel", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(content="Event creation cancelled.", view=None)
+
+
+class EventLocationView(discord.ui.View):
+    def __init__(self, bot: "OZYAdminBot", interaction: discord.Interaction):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.creator_id = interaction.user.id
+        self.category_id: int | None = None
+        self.category_name: str | None = None
+        self.voice_channel_id: int | None = None
+        self.voice_select: EventVoiceSelect | None = None
+
+        guild = interaction.guild
+        categories: list[discord.CategoryChannel] = []
+        if guild is not None:
+            me = guild.me
+            for category in guild.categories:
+                usable = [
+                    ch for ch in category.channels
+                    if isinstance(ch, discord.VoiceChannel)
+                    and (me is None or (ch.permissions_for(me).view_channel and ch.permissions_for(me).connect))
+                ]
+                if usable:
+                    categories.append(category)
+
+        self.category_select: EventCategorySelect | None = EventCategorySelect(self, categories) if categories else None
+        self.details_button = EventDetailsButton(self)
+        if self.category_select is not None:
+            self.add_item(self.category_select)
+        self.add_item(self.details_button)
+        self.add_item(EventCancelButton())
+
+    def content(self) -> str:
+        lines = [
+            "### Create Discord Event",
+            "Choose the category, then the voice channel inside it.",
+        ]
+        if self.category_name:
+            lines.append(f"Category: **{self.category_name}**")
+        if self.voice_channel_id:
+            lines.append(f"Voice: <#{self.voice_channel_id}>")
+        lines.append("Then click **Event details** to enter the name, date and reset time such as `tomorrow` + `R+4`.")
+        return "\n".join(lines)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.creator_id:
+            return True
+        await interaction.response.send_message("This event builder belongs to another member.", ephemeral=True)
+        return False
 
 
 class AnnouncementModal(discord.ui.Modal):
@@ -121,9 +451,9 @@ class OZYAdminBot(discord.Client):
     # Lifecycle
     # ------------------------------------------------------------------
     async def setup_hook(self) -> None:
-        self.http_session = aiohttp.ClientSession(
-            headers={"User-Agent": "OZY-Admin-Bot/1.0"}
-        )
+        # Use aiohttp's normal client defaults. Do not advertise project/bot names
+        # in outbound read-only source requests.
+        self.http_session = aiohttp.ClientSession()
         self.data = DataProvider(self.settings, self.http_session)
         self.voltron = VoltronCalendarClient(self.settings, self.http_session)
 
@@ -136,8 +466,18 @@ class OZYAdminBot(discord.Client):
 
         self.background_tasks.append(asyncio.create_task(self._daily_schedule_loop(), name="daily-schedule"))
         self.background_tasks.append(asyncio.create_task(self._away_expiry_loop(), name="away-expiry"))
+        if self.settings.chest_reset_post_enabled and self.settings.chest_channel_id:
+            self.background_tasks.append(asyncio.create_task(self._daily_chest_ranking_loop(), name="daily-chest-ranking"))
+        if (
+            self.settings.rank_role_map
+            or self.settings.verified_role_id
+            or self.settings.unverified_role_id
+            or self.settings.special_access_role_id
+        ):
+            self.background_tasks.append(asyncio.create_task(self._roster_access_sync_loop(), name="roster-access-sync"))
         if self.settings.voltron_calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
             self.background_tasks.append(asyncio.create_task(self._voltron_refresh_loop(), name="voltron-refresh"))
+            self.background_tasks.append(asyncio.create_task(self._akurier_refresh_loop(), name="akurier-refresh"))
             if self.settings.voltron_today_enabled and self.settings.today_channel_id:
                 self.background_tasks.append(asyncio.create_task(self._voltron_today_loop(), name="voltron-today"))
 
@@ -230,6 +570,7 @@ class OZYAdminBot(discord.Client):
             "TODAY_CHANNEL_ID": self.settings.today_channel_id,
             "AWAY_CHANNEL_ID": self.settings.away_channel_id,
             "AUDIT_CHANNEL_ID": self.settings.audit_channel_id,
+            "CHEST_CHANNEL_ID": self.settings.chest_channel_id,
         }
         for label, channel_id in configured_channels.items():
             if channel_id is None:
@@ -249,6 +590,12 @@ class OZYAdminBot(discord.Client):
         role_ids = set(self.settings.rank_role_map.values())
         if self.settings.away_role_id:
             role_ids.add(self.settings.away_role_id)
+        if self.settings.verified_role_id:
+            role_ids.add(self.settings.verified_role_id)
+        if self.settings.unverified_role_id:
+            role_ids.add(self.settings.unverified_role_id)
+        if self.settings.special_access_role_id:
+            role_ids.add(self.settings.special_access_role_id)
         if self.settings.announcement_ping_role_id:
             role_ids.add(self.settings.announcement_ping_role_id)
         role_ids.update(self.settings.leadership_role_ids)
@@ -261,6 +608,12 @@ class OZYAdminBot(discord.Client):
         managed_role_ids = set(self.settings.rank_role_map.values())
         if self.settings.away_role_id:
             managed_role_ids.add(self.settings.away_role_id)
+        if self.settings.verified_role_id:
+            managed_role_ids.add(self.settings.verified_role_id)
+        if self.settings.unverified_role_id:
+            managed_role_ids.add(self.settings.unverified_role_id)
+        if self.settings.special_access_role_id:
+            managed_role_ids.add(self.settings.special_access_role_id)
         for role_id in managed_role_ids:
             role = guild.get_role(role_id)
             if role and role >= me.top_role:
@@ -284,6 +637,12 @@ class OZYAdminBot(discord.Client):
 
         if not self.settings.rank_role_map:
             log.warning("RANK_ROLE_MAP is empty; roster linking will work but rank roles will not be changed")
+        if not self.settings.verified_role_id or not self.settings.unverified_role_id:
+            log.warning(
+                "VERIFIED_ROLE_ID and UNVERIFIED_ROLE_ID should both be configured to enforce roster-gated server access"
+            )
+        if self.settings.chest_reset_post_enabled and not self.settings.chest_channel_id:
+            log.warning("CHEST_RESET_POST_ENABLED=true but CHEST_CHANNEL_ID is not configured")
 
         log.info("Validated OZY Admin configuration for guild %s", guild.name)
 
@@ -323,12 +682,22 @@ class OZYAdminBot(discord.Client):
 
     async def _resolve_member_game_name(self, member: discord.Member) -> str | None:
         assert self.data is not None
-        linked = self.state.get_link(member.id)
-        if linked:
-            canonical = await self.data.exact_roster_name(linked)
-            if canonical:
-                if canonical != linked:
-                    self.state.set_link(member.id, canonical, "canonicalized")
+        link = self.state.get_link_record(member.id)
+        if link:
+            info = await self.data.resolve_roster_member(
+                game_name=link.game_name,
+                game_user_id=link.game_user_id,
+            )
+            if info:
+                canonical = str(info["name"])
+                stable_id = str(info.get("user_id", "")).strip() or None
+                if canonical != link.game_name or stable_id != link.game_user_id:
+                    self.state.set_link(
+                        member.id,
+                        canonical,
+                        "canonicalized",
+                        game_user_id=stable_id,
+                    )
                 return canonical
 
         # A Discord nickname is not proof of Total Battle identity. Exact-name
@@ -337,22 +706,89 @@ class OZYAdminBot(discord.Client):
         if self.settings.trust_exact_display_name:
             exact = await self.data.exact_roster_name(member.display_name)
             if exact:
-                self.state.set_link(member.id, exact, "trusted-exact-display-name")
+                info = await self.data.member_info(exact)
+                stable_id = str((info or {}).get("user_id", "")).strip() or None
+                linked_user = self.state.linked_user_for_identity(exact, stable_id)
+                if linked_user not in (None, member.id):
+                    return None
+                self.state.set_link(
+                    member.id,
+                    exact,
+                    "trusted-exact-display-name",
+                    game_user_id=stable_id,
+                )
                 return exact
         return None
+
+    async def _sync_access_roles(self, member: discord.Member, active_roster_member: bool) -> str:
+        """Apply roster-gated access roles without touching unrelated Discord roles."""
+        guild = member.guild
+        me = guild.me
+        if me is None:
+            return "bot guild member unavailable"
+
+        verified = guild.get_role(self.settings.verified_role_id) if self.settings.verified_role_id else None
+        unverified = guild.get_role(self.settings.unverified_role_id) if self.settings.unverified_role_id else None
+        special = guild.get_role(self.settings.special_access_role_id) if self.settings.special_access_role_id else None
+        has_special = bool(special and special in member.roles)
+
+        add_roles: list[discord.Role] = []
+        remove_roles: list[discord.Role] = []
+
+        if active_roster_member:
+            if verified and verified not in member.roles:
+                add_roles.append(verified)
+            if unverified and unverified in member.roles:
+                remove_roles.append(unverified)
+            # A roster member no longer needs the exception role.
+            if special and special in member.roles:
+                remove_roles.append(special)
+            state = "verified roster member"
+        elif has_special:
+            if verified and verified in member.roles:
+                remove_roles.append(verified)
+            if unverified and unverified in member.roles:
+                remove_roles.append(unverified)
+            state = "special access"
+        else:
+            if verified and verified in member.roles:
+                remove_roles.append(verified)
+            if unverified and unverified not in member.roles:
+                add_roles.append(unverified)
+            state = "unverified"
+
+        # Roster rank roles are never kept for non-roster exceptions.
+        if not active_roster_member:
+            managed_rank_ids = set(self.settings.rank_role_map.values())
+            remove_roles.extend(
+                role for role in member.roles
+                if role.id in managed_rank_ids and role not in remove_roles
+            )
+
+        try:
+            if remove_roles:
+                await member.remove_roles(*remove_roles, reason=f"OZY access sync: {state}")
+            if add_roles:
+                await member.add_roles(*add_roles, reason=f"OZY access sync: {state}")
+        except discord.HTTPException as exc:
+            return f"access role update failed: {exc}"
+
+        return state
 
     async def _sync_rank_role(self, member: discord.Member, game_name: str) -> str:
         assert self.data is not None
         info = await self.data.member_info(game_name)
         if not info:
-            return "roster member not found"
+            access_result = await self._sync_access_roles(member, active_roster_member=False)
+            return f"roster member not found; {access_result}"
 
+        access_result = await self._sync_access_roles(member, active_roster_member=True)
         rank = str(info.get("rank", "")).strip()
         if not rank:
-            return "roster rank is blank"
+            return f"{access_result}; roster rank is blank"
         target_role_id = self.settings.rank_role_map.get(rank.casefold())
         if target_role_id is None:
-            return f"no Discord role configured for roster rank {rank}"
+            return f"{access_result}; no Discord role configured for roster rank {rank}"
 
         guild = member.guild
         target_role = guild.get_role(target_role_id)
@@ -379,7 +815,7 @@ class OZYAdminBot(discord.Client):
             except discord.HTTPException as exc:
                 log.warning("Nickname sync failed for %s: %s", member.id, exc)
 
-        return f"{rank} -> {target_role.name}"
+        return f"{access_result}; {rank} -> {target_role.name}"
 
     # ------------------------------------------------------------------
     # Welcome / roster verification
@@ -391,6 +827,10 @@ class OZYAdminBot(discord.Client):
             return
         assert self.data is not None
 
+        # New arrivals start without normal clan access until roster verification
+        # succeeds or leadership grants the separate Special Access role.
+        await self._sync_access_roles(member, active_roster_member=False)
+
         matched_name: str | None = None
         suggestions: list[str] = []
         role_result: str | None = None
@@ -398,8 +838,20 @@ class OZYAdminBot(discord.Client):
             matched_name = await self.data.exact_roster_name(member.display_name)
             if matched_name:
                 if self.settings.trust_exact_display_name:
-                    self.state.set_link(member.id, matched_name, "trusted-join-exact-display-name")
-                    role_result = await self._sync_rank_role(member, matched_name)
+                    info = await self.data.member_info(matched_name)
+                    stable_id = str((info or {}).get("user_id", "")).strip() or None
+                    linked_user = self.state.linked_user_for_identity(matched_name, stable_id)
+                    if linked_user in (None, member.id):
+                        self.state.set_link(
+                            member.id,
+                            matched_name,
+                            "trusted-join-exact-display-name",
+                            game_user_id=stable_id,
+                        )
+                        role_result = await self._sync_rank_role(member, matched_name)
+                    else:
+                        self.state.set_verification_request(member.id, matched_name, "join-name-already-linked")
+                        role_result = "pending leadership verification; roster name is already linked"
                 else:
                     self.state.set_verification_request(member.id, matched_name, "join-exact-display-name")
                     role_result = "pending leadership verification"
@@ -480,7 +932,23 @@ class OZYAdminBot(discord.Client):
             return
         if exact:
             if self.settings.trust_exact_display_name:
-                self.state.set_link(after.id, exact, "trusted-nickname-exact-match")
+                info = await self.data.member_info(exact)
+                stable_id = str((info or {}).get("user_id", "")).strip() or None
+                linked_user = self.state.linked_user_for_identity(exact, stable_id)
+                if linked_user not in (None, after.id):
+                    self.state.set_verification_request(after.id, exact, "nickname-name-already-linked")
+                    await self._audit(
+                        "Roster verification requested",
+                        str(after),
+                        f"Changed Discord name matches {exact}, but that roster identity is already linked to Discord ID {linked_user}",
+                    )
+                    return
+                self.state.set_link(
+                    after.id,
+                    exact,
+                    "trusted-nickname-exact-match",
+                    game_user_id=stable_id,
+                )
                 result = await self._sync_rank_role(after, exact)
                 action = "Roster auto-link"
                 details = f"Matched changed Discord name to {exact}; role sync: {result}"
@@ -606,6 +1074,105 @@ class OZYAdminBot(discord.Client):
                 log.exception("Automatic daily schedule post failed")
 
     # ------------------------------------------------------------------
+    # Daily chest ranking
+    # ------------------------------------------------------------------
+    async def _post_chest_ranking(self, target_date, *, force: bool, actor: str) -> bool:
+        if not self.settings.chest_channel_id:
+            return False
+        channel = self.get_channel(self.settings.chest_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return False
+
+        state_key = f"chest_ranking_posted:{target_date.isoformat()}"
+        if not force and self.state.get_value(state_key):
+            return False
+
+        assert self.data is not None
+        # R+0 should always use the newest website snapshot, not a minute-old cache.
+        self.data.invalidate("roster")
+        self.data.invalidate("chests")
+        try:
+            leaderboard = await self.data.chest_leaderboard(today=target_date)
+        except DataUnavailable as exc:
+            log.warning("Chest ranking unavailable: %s", exc)
+            return False
+        if leaderboard is None or not leaderboard.members:
+            log.warning("Chest ranking skipped: no current leaderboard data")
+            return False
+
+        blocks = format_chest_ranking_blocks(
+            leaderboard,
+            chunk_size=self.settings.chest_report_chunk_size,
+        )
+        if not blocks:
+            return False
+
+        message_ids: list[int] = []
+        for block in blocks:
+            message = await channel.send(
+                block,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            message_ids.append(message.id)
+
+        self.state.set_value(state_key, ",".join(str(x) for x in message_ids))
+        await self._audit(
+            "Chest ranking posted",
+            actor,
+            (
+                f"Date: {target_date.isoformat()}\nChannel: #{channel.name}\n"
+                f"Week: {leaderboard.week_label}\nPlayers: {len(leaderboard.members)}\n"
+                f"Points: {leaderboard.total_points:,}\nSource generated: {leaderboard.generated or 'unknown'}"
+            ),
+        )
+        return True
+
+    async def _daily_chest_ranking_loop(self) -> None:
+        await self.wait_until_ready()
+        if not self.settings.chest_reset_post_enabled:
+            return
+
+        hour, minute = [int(x) for x in self.settings.chest_reset_post_time_utc.split(":", 1)]
+        tz = timezone.utc
+
+        while not self.is_closed():
+            now = datetime.now(tz)
+            today_target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
+            state_key = f"chest_ranking_posted:{now.date().isoformat()}"
+
+            if now >= today_target and not self.state.get_value(state_key):
+                try:
+                    await self._post_chest_ranking(
+                        now.date(),
+                        force=False,
+                        actor="automatic R+0 chest scheduler",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Catch-up R+0 chest ranking post failed")
+
+            now = datetime.now(tz)
+            next_target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
+            if next_target <= now:
+                next_target += timedelta(days=1)
+            try:
+                await asyncio.sleep(max(1.0, (next_target - now).total_seconds()))
+            except asyncio.CancelledError:
+                raise
+
+            try:
+                await self._post_chest_ranking(
+                    next_target.date(),
+                    force=False,
+                    actor="automatic R+0 chest scheduler",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Automatic R+0 chest ranking post failed")
+
+    # ------------------------------------------------------------------
     # Voltron tournament calendar
     # ------------------------------------------------------------------
     def _state_message_ids(self, key: str) -> list[int]:
@@ -681,19 +1248,42 @@ class OZYAdminBot(discord.Client):
             self._save_message_ids(state_key, ids)
             return ids
 
-    async def _refresh_voltron(self, *, force: bool, actor: str) -> tuple[bool, str]:
+    async def _refresh_voltron(self, *, force: bool, actor: str, refresh_akurier: bool = False) -> tuple[bool, str]:
         if not self.settings.voltron_calendar_enabled:
             return False, "Voltron calendar integration is disabled"
         if self.voltron is None:
             return False, "Voltron calendar client is unavailable"
 
         try:
-            result = await self.voltron.refresh(force=force)
+            result = await self.voltron.refresh(force=force, refresh_akurier=refresh_akurier)
         except VoltronCalendarError as exc:
             await self._audit("Voltron calendar refresh failed", actor, str(exc))
             return False, str(exc)
 
         snapshot = result.snapshot
+
+        # Record the public source timestamp only when it changes. This lets us
+        # learn Voltron's real refresh cadence and later reduce the four daily
+        # metadata probes to one check 20-30 minutes after its normal update.
+        if result.source_last_synced_utc is not None:
+            source_iso = result.source_last_synced_utc.isoformat()
+            previous_source_iso = self.state.get_value("voltron_source_last_synced_utc")
+            if previous_source_iso != source_iso:
+                self.state.set_value("voltron_source_last_synced_utc", source_iso)
+                observed = datetime.now(timezone.utc).isoformat()
+                log.info(
+                    "Voltron source timestamp observed: source=%s observed=%s previous=%s",
+                    source_iso, observed, previous_source_iso or "none",
+                )
+                if previous_source_iso:
+                    await self._audit(
+                        "Voltron source refresh observed",
+                        actor,
+                        f"Previous source sync: {previous_source_iso}\n"
+                        f"New source sync: {source_iso}\n"
+                        f"Observed at: {observed}",
+                    )
+
         today = datetime.now(timezone.utc).date()
 
         rendered_start = self.state.get_value("voltron_calendar_start_date")
@@ -710,7 +1300,7 @@ class OZYAdminBot(discord.Client):
                 await self._upsert_message_series(
                     channel,
                     state_key="voltron_calendar_message_ids",
-                    recovery_prefix="```\nOZY Tournament Calendar - Next 30 Days",
+                    recovery_prefix="OZY Tournament Calendar - Next 30 Days",
                     chunks=chunks,
                 )
                 self.state.set_value("voltron_calendar_start_date", today.isoformat())
@@ -730,6 +1320,50 @@ class OZYAdminBot(discord.Client):
             )
         return result.changed, "ok"
 
+    async def _refresh_akurier(self, *, actor: str) -> tuple[bool, str]:
+        if not self.settings.voltron_calendar_enabled or self.voltron is None:
+            return False, "Calendar integration is unavailable"
+        if self.voltron.snapshot is None:
+            return False, "No Voltron snapshot is available"
+
+        try:
+            result = await self.voltron.refresh_akurier()
+        except VoltronCalendarError as exc:
+            log.warning("Akurier mini-event refresh skipped: %s", exc)
+            return False, str(exc)
+
+        if result.changed:
+            today = datetime.now(timezone.utc).date()
+
+            # Akurier mini-events belong in both public schedule surfaces. Update
+            # from the cache only; do not make another Voltron request here.
+            if self.settings.calendar_channel_id:
+                channel = self.get_channel(self.settings.calendar_channel_id)
+                if isinstance(channel, discord.TextChannel):
+                    chunks = build_calendar_chunks(
+                        result.snapshot,
+                        start_date=today,
+                        days=self.settings.voltron_calendar_days,
+                        timezone_info=timezone.utc,
+                    )
+                    await self._upsert_message_series(
+                        channel,
+                        state_key="voltron_calendar_message_ids",
+                        recovery_prefix="OZY Tournament Calendar - Next 30 Days",
+                        chunks=chunks,
+                    )
+                    self.state.set_value("voltron_calendar_start_date", today.isoformat())
+
+            if self.settings.today_channel_id:
+                await self._post_voltron_today(today, force=True, actor="mini-event refresh")
+
+            await self._audit(
+                "Mini events updated",
+                actor,
+                f"Regular mini events: {len(result.snapshot.mini_tournaments)}",
+            )
+        return result.changed, "ok"
+
     async def _post_voltron_today(self, target_date, *, force: bool, actor: str) -> bool:
         if not self.settings.today_channel_id or self.voltron is None:
             return False
@@ -738,7 +1372,10 @@ class OZYAdminBot(discord.Client):
             return False
 
         try:
-            await self.voltron.refresh(force=self.voltron.snapshot is None)
+            # Discord rendering uses the in-memory cache. Only contact Voltron if
+            # startup has not populated a snapshot yet.
+            if self.voltron.snapshot is None:
+                await self.voltron.refresh(force=True)
         except VoltronCalendarError as exc:
             log.warning("Today's Voltron post skipped: %s", exc)
             return False
@@ -775,14 +1412,79 @@ class OZYAdminBot(discord.Client):
 
     async def _voltron_refresh_loop(self) -> None:
         await self.wait_until_ready()
+
+        # One startup read is needed to populate the in-memory cache. After that,
+        # only lightweight metadata probes run at the fixed times below. Full
+        # calendar content is downloaded only when metadata reports a change.
+        try:
+            await self._refresh_voltron(
+                force=self.voltron.snapshot is None if self.voltron else True,
+                actor="startup calendar refresh",
+                refresh_akurier=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Startup Voltron calendar refresh failed")
+
         while not self.is_closed():
+            now = datetime.now(timezone.utc)
+            target = _next_utc_slot(now, VOLTRON_META_PROBE_TIMES_UTC)
             try:
-                await self._refresh_voltron(force=self.voltron.snapshot is None if self.voltron else True, actor="automatic calendar refresh")
+                await asyncio.sleep(max(1.0, (target - now).total_seconds()))
+            except asyncio.CancelledError:
+                raise
+
+            try:
+                log.info("Running lightweight Voltron metadata probe at %s", target.isoformat())
+                await self._refresh_voltron(
+                    force=False,
+                    actor="automatic metadata probe",
+                    refresh_akurier=False,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Automatic Voltron calendar refresh failed")
-            await asyncio.sleep(self.settings.voltron_refresh_minutes * 60)
+                log.exception("Automatic Voltron metadata probe failed")
+
+    async def _akurier_refresh_loop(self) -> None:
+        await self.wait_until_ready()
+        hour, minute = AKURIER_REFRESH_TIME_UTC
+
+        while not self.is_closed():
+            now = datetime.now(timezone.utc)
+            today_target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=timezone.utc)
+            last_attempt = self.state.get_value("akurier_last_attempt_date_utc")
+
+            # Catch up once if the service starts after R+1 and today's single
+            # Akurier fetch has not yet been attempted. A failed attempt is not
+            # hammered with retries; the existing cached/fallback data remains.
+            if now >= today_target and last_attempt != now.date().isoformat():
+                # On a fresh deploy the Voltron startup read may still be running.
+                # Wait briefly rather than consuming today's single Akurier attempt
+                # before there is a snapshot to attach the mini-events to.
+                if self.voltron is None or self.voltron.snapshot is None:
+                    try:
+                        await asyncio.sleep(10)
+                    except asyncio.CancelledError:
+                        raise
+                    continue
+
+                self.state.set_value("akurier_last_attempt_date_utc", now.date().isoformat())
+                try:
+                    log.info("Running once-daily Akurier mini-event refresh at R+1")
+                    await self._refresh_akurier(actor="automatic daily mini-event refresh")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Automatic Akurier mini-event refresh failed")
+                continue
+
+            next_target = today_target if today_target > now else today_target + timedelta(days=1)
+            try:
+                await asyncio.sleep(max(1.0, (next_target - now).total_seconds()))
+            except asyncio.CancelledError:
+                raise
 
     async def _voltron_today_loop(self) -> None:
         await self.wait_until_ready()
@@ -813,6 +1515,91 @@ class OZYAdminBot(discord.Client):
                 await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
             except Exception:
                 log.exception("Automatic Voltron today post failed")
+
+    # ------------------------------------------------------------------
+    # Authoritative roster/access synchronization
+    # ------------------------------------------------------------------
+    async def _sync_all_member_access(self, *, apply: bool) -> dict[str, int]:
+        assert self.data is not None
+        self.data.invalidate("roster")
+        roster = await self.data.roster()
+        exact_lookup = {name.casefold(): name for name in roster}
+        user_id_lookup = {
+            str(info.get("user_id", "")).strip(): name
+            for name, info in roster.items()
+            if str(info.get("user_id", "")).strip()
+        }
+        links = self.state.all_link_records()
+        guild = self.get_guild(self.settings.server_id)
+        if guild is None:
+            raise DataUnavailable("OZY guild unavailable")
+
+        special_role = guild.get_role(self.settings.special_access_role_id) if self.settings.special_access_role_id else None
+        counts = {
+            "discord_members": 0,
+            "roster_linked": 0,
+            "special_access": 0,
+            "unverified": 0,
+            "stale_links": 0,
+        }
+
+        for member in guild.members:
+            if member.bot:
+                continue
+            counts["discord_members"] += 1
+            link = links.get(member.id)
+            canonical = None
+            if link:
+                if link.game_user_id:
+                    canonical = user_id_lookup.get(link.game_user_id)
+                if canonical is None:
+                    canonical = exact_lookup.get(link.game_name.casefold())
+            if canonical:
+                counts["roster_linked"] += 1
+                if apply:
+                    roster_user_id = str(roster[canonical].get("user_id", "")).strip() or None
+                    if canonical != link.game_name or roster_user_id != link.game_user_id:
+                        self.state.set_link(
+                            member.id,
+                            canonical,
+                            "canonicalized-access-sync",
+                            game_user_id=roster_user_id,
+                        )
+                    await self._sync_rank_role(member, canonical)
+                continue
+
+            if link:
+                counts["stale_links"] += 1
+
+            has_special = bool(special_role and special_role in member.roles)
+            if has_special:
+                counts["special_access"] += 1
+            else:
+                counts["unverified"] += 1
+            if apply:
+                await self._sync_access_roles(member, active_roster_member=False)
+
+        return counts
+
+    async def _roster_access_sync_loop(self) -> None:
+        await self.wait_until_ready()
+
+        while not self.is_closed():
+            try:
+                await self._sync_all_member_access(apply=True)
+            except asyncio.CancelledError:
+                raise
+            except DataUnavailable as exc:
+                # If the website is unavailable, preserve current Discord access
+                # rather than mass-revoking members because of an upstream outage.
+                log.warning("Roster access sync skipped; authoritative roster unavailable: %s", exc)
+            except Exception:
+                log.exception("Roster access sync failed")
+
+            try:
+                await asyncio.sleep(self.settings.roster_access_sync_minutes * 60)
+            except asyncio.CancelledError:
+                raise
 
     # ------------------------------------------------------------------
     # Away expiry
@@ -928,8 +1715,19 @@ class OZYAdminBot(discord.Client):
                         text += " Did you mean: " + ", ".join(f"**{m.name}**" for m in suggestions)
                     await interaction.response.send_message(text, ephemeral=True)
                     return
-                existing = self.state.get_link(interaction.user.id)
-                if existing and existing.casefold() == canonical.casefold():
+                info = await self.data.member_info(canonical)
+                stable_id = str((info or {}).get("user_id", "")).strip() or None
+                existing = self.state.get_link_record(interaction.user.id)
+                if existing and (
+                    (stable_id and existing.game_user_id == stable_id)
+                    or existing.game_name.casefold() == canonical.casefold()
+                ):
+                    self.state.set_link(
+                        interaction.user.id,
+                        canonical,
+                        "self-verify-refresh",
+                        game_user_id=stable_id,
+                    )
                     role_result = await self._sync_rank_role(interaction.user, canonical)
                     await interaction.response.send_message(
                         f"You are already linked to **{canonical}**. Role sync: {role_result}.",
@@ -938,11 +1736,25 @@ class OZYAdminBot(discord.Client):
                     return
 
                 if self.settings.trust_exact_display_name and interaction.user.display_name.casefold() == canonical.casefold():
-                    self.state.set_link(interaction.user.id, canonical, "trusted-self-verify")
-                    self.state.clear_verification_request(interaction.user.id)
-                    role_result = await self._sync_rank_role(interaction.user, canonical)
-                    outcome = f"auto-approved; role sync: {role_result}"
-                    response = f"Linked to **{canonical}**. Role sync: {role_result}."
+                    linked_user = self.state.linked_user_for_identity(canonical, stable_id)
+                    if linked_user in (None, interaction.user.id):
+                        self.state.set_link(
+                            interaction.user.id,
+                            canonical,
+                            "trusted-self-verify",
+                            game_user_id=stable_id,
+                        )
+                        self.state.clear_verification_request(interaction.user.id)
+                        role_result = await self._sync_rank_role(interaction.user, canonical)
+                        outcome = f"auto-approved; role sync: {role_result}"
+                        response = f"Linked to **{canonical}**. Role sync: {role_result}."
+                    else:
+                        self.state.set_verification_request(interaction.user.id, canonical, "self-verify-name-already-linked")
+                        outcome = f"pending leadership approval; already linked to Discord ID {linked_user}"
+                        response = (
+                            f"Verification request recorded for **{canonical}**. "
+                            "That roster name is already linked to another Discord account, so leadership must resolve it."
+                        )
                 else:
                     self.state.set_verification_request(interaction.user.id, canonical, "self-verify")
                     outcome = "pending leadership approval"
@@ -992,7 +1804,23 @@ class OZYAdminBot(discord.Client):
                 if canonical is None:
                     await interaction.response.send_message("That exact name is not in the active roster.", ephemeral=True)
                     return
-                self.state.set_link(member.id, canonical, f"leadership:{interaction.user.id}")
+                info = await self.data.member_info(canonical)
+                stable_id = str((info or {}).get("user_id", "")).strip() or None
+                linked_user = self.state.linked_user_for_identity(canonical, stable_id)
+                if linked_user not in (None, member.id):
+                    other = interaction.guild.get_member(linked_user) if interaction.guild else None
+                    other_name = other.display_name if other else f"Discord ID {linked_user}"
+                    await interaction.response.send_message(
+                        f"**{canonical}** is already linked to **{other_name}**. Unlink/reassign that identity before approving another account.",
+                        ephemeral=True,
+                    )
+                    return
+                self.state.set_link(
+                    member.id,
+                    canonical,
+                    f"leadership:{interaction.user.id}",
+                    game_user_id=stable_id,
+                )
                 self.state.clear_verification_request(member.id)
                 role_result = await self._sync_rank_role(member, canonical)
             except DataUnavailable as exc:
@@ -1160,6 +1988,178 @@ class OZYAdminBot(discord.Client):
             q = current.casefold().strip()
             names = [name for name in roster if not q or q in name.casefold()][:25]
             return [app_commands.Choice(name=name[:100], value=name) for name in names]
+
+        @self.tree.command(name="chest-ranking", description="Leadership: preview or post the current OZY chest ranking")
+        @app_commands.describe(post="False = private preview; True = post now in IMPORTANT / #chests")
+        async def chest_ranking(interaction: discord.Interaction, post: bool = False) -> None:
+            if not await self._require_leadership(interaction):
+                return
+            assert self.data is not None
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            target_date = datetime.now(self.settings.timezone).date()
+
+            if post:
+                try:
+                    posted = await self._post_chest_ranking(
+                        target_date,
+                        force=True,
+                        actor=str(interaction.user),
+                    )
+                except Exception as exc:
+                    log.exception("Manual chest ranking post failed")
+                    await interaction.followup.send(f"Chest ranking post failed: {exc}", ephemeral=True)
+                    return
+                await interaction.followup.send(
+                    "Chest ranking posted to the configured #chests channel." if posted else "No chest ranking was available to post.",
+                    ephemeral=True,
+                )
+                return
+
+            self.data.invalidate("roster")
+            self.data.invalidate("chests")
+            try:
+                leaderboard = await self.data.chest_leaderboard(today=target_date)
+            except DataUnavailable as exc:
+                await interaction.followup.send(f"Chest data unavailable: {exc}", ephemeral=True)
+                return
+            if leaderboard is None:
+                await interaction.followup.send("No current chest leaderboard is available.", ephemeral=True)
+                return
+
+            blocks = format_chest_ranking_blocks(leaderboard, self.settings.chest_report_chunk_size)
+            await interaction.followup.send(
+                f"Preview: **{leaderboard.week_label}** - {len(leaderboard.members)} active roster members - {leaderboard.total_points:,} points.",
+                ephemeral=True,
+            )
+            for block in blocks:
+                await interaction.followup.send(
+                    block,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+        @self.tree.command(name="data-status", description="Leadership: verify roster and chest website/API data")
+        async def data_status(interaction: discord.Interaction) -> None:
+            if not await self._require_leadership(interaction):
+                return
+            assert self.data is not None
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            self.data.invalidate("roster")
+            self.data.invalidate("chests")
+
+            lines = ["## OZY data status"]
+            try:
+                roster = await self.data.roster()
+                ranks: dict[str, int] = {}
+                for info in roster.values():
+                    rank = str(info.get("rank", "Unknown") or "Unknown")
+                    ranks[rank] = ranks.get(rank, 0) + 1
+                rank_text = ", ".join(f"{rank}: {count}" for rank, count in sorted(ranks.items()))
+                source = self.settings.roster_url or str(self.settings.roster_file)
+                lines.append(f"Roster: **OK** - {len(roster)} active members\nSource: `{source}`\nRanks: {rank_text or 'none'}")
+            except DataUnavailable as exc:
+                lines.append(f"Roster: **FAILED** - {exc}")
+
+            try:
+                board = await self.data.chest_leaderboard(today=datetime.now(self.settings.timezone).date())
+                source = self.settings.chest_data_url or str(self.settings.chest_data_file)
+                if board is None:
+                    lines.append(f"Chests: **NO CURRENT DATA**\nSource: `{source}`")
+                else:
+                    lines.append(
+                        f"Chests: **OK** - {board.week_label}\nSource: `{source}`\n"
+                        f"Players ranked: {len(board.members)} - Points: {board.total_points:,} - Chests: {board.total_chests:,}\n"
+                        f"Generated: {board.generated or 'unknown'}"
+                    )
+            except DataUnavailable as exc:
+                lines.append(f"Chests: **FAILED** - {exc}")
+
+            await interaction.followup.send("\n\n".join(lines), ephemeral=True)
+
+        @self.tree.command(name="special-access", description="Leadership: grant or revoke non-roster server access")
+        @app_commands.describe(member="Discord member", grant="True to grant; False to revoke", reason="Optional audit note")
+        async def special_access(
+            interaction: discord.Interaction,
+            member: discord.Member,
+            grant: bool,
+            reason: str = "",
+        ) -> None:
+            if not await self._require_leadership(interaction):
+                return
+            if not self.settings.special_access_role_id:
+                await interaction.response.send_message("SPECIAL_ACCESS_ROLE_ID is not configured.", ephemeral=True)
+                return
+            role = member.guild.get_role(self.settings.special_access_role_id)
+            if role is None:
+                await interaction.response.send_message("The configured Special Access role does not exist.", ephemeral=True)
+                return
+
+            assert self.data is not None
+            try:
+                active_game_name = await self._resolve_member_game_name(member)
+            except DataUnavailable:
+                active_game_name = None
+
+            try:
+                if grant:
+                    if active_game_name:
+                        result = await self._sync_rank_role(member, active_game_name)
+                        await interaction.response.send_message(
+                            f"{member.mention} is already an active roster member. Normal roster access is authoritative. {result}.",
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        return
+                    if role not in member.roles:
+                        await member.add_roles(role, reason=f"OZY special access granted by {interaction.user}: {reason or 'no reason'}")
+                    result = await self._sync_access_roles(member, active_roster_member=False)
+                    action = "granted"
+                else:
+                    if role in member.roles:
+                        await member.remove_roles(role, reason=f"OZY special access revoked by {interaction.user}: {reason or 'no reason'}")
+                    if active_game_name:
+                        result = await self._sync_rank_role(member, active_game_name)
+                    else:
+                        result = await self._sync_access_roles(member, active_roster_member=False)
+                    action = "revoked"
+            except discord.HTTPException as exc:
+                await interaction.response.send_message(f"Discord role update failed: {exc}", ephemeral=True)
+                return
+
+            await self._audit(
+                f"Special access {action}",
+                str(interaction.user),
+                f"Member: {member} ({member.id})\nReason: {reason or 'none'}\nResult: {result}",
+            )
+            await interaction.response.send_message(
+                f"Special access {action} for {member.mention}. Access state: {result}.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        @self.tree.command(name="access-sync", description="Leadership: preview or apply roster-gated server access")
+        @app_commands.describe(apply="False = preview counts; True = apply access and roster-rank roles now")
+        async def access_sync(interaction: discord.Interaction, apply: bool = False) -> None:
+            if not await self._require_leadership(interaction):
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                counts = await self._sync_all_member_access(apply=apply)
+            except DataUnavailable as exc:
+                await interaction.followup.send(f"Roster unavailable: {exc}", ephemeral=True)
+                return
+
+            mode = "APPLIED" if apply else "PREVIEW"
+            text = (
+                f"**{mode}**\n"
+                f"Discord members: **{counts['discord_members']}**\n"
+                f"Approved active-roster links: **{counts['roster_linked']}**\n"
+                f"Special-access exceptions: **{counts['special_access']}**\n"
+                f"Unverified/no access: **{counts['unverified']}**\n"
+                f"Saved links no longer in active roster: **{counts['stale_links']}**"
+            )
+            await self._audit("Roster access sync", str(interaction.user), text)
+            await interaction.followup.send(text, ephemeral=True)
 
         @self.tree.command(name="away", description="Mark yourself away from clan activity")
         @app_commands.describe(days="Number of days away (1-90)", reason="Short reason")
@@ -1365,7 +2365,11 @@ class OZYAdminBot(discord.Client):
             if not await self._require_leadership(interaction):
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
-            changed, status = await self._refresh_voltron(force=True, actor=str(interaction.user))
+            changed, status = await self._refresh_voltron(
+                force=True,
+                actor=str(interaction.user),
+                refresh_akurier=True,
+            )
             if status != "ok":
                 await interaction.followup.send(f"Refresh failed: {status}", ephemeral=True)
             else:
@@ -1384,13 +2388,34 @@ class OZYAdminBot(discord.Client):
             lines = [
                 f"Enabled: **{self.settings.voltron_calendar_enabled}**",
                 f"Realm: **{self.settings.voltron_realm}**",
-                f"Refresh: **{self.settings.voltron_refresh_minutes} min**",
+                "Voltron probes: **00:30, 06:30, 12:30, 18:30 UTC**",
+                "Akurier mini-events: **18:00 UTC / R+1, once daily**",
                 f"Cached actions: **{len(snapshot.actions) if snapshot else 0}**",
                 f"Cached mini tournaments: **{len(snapshot.mini_tournaments) if snapshot else 0}**",
-                f"Last successful fetch: **{last_success.isoformat() if last_success else 'never'}**",
+                f"Source last synced: **{self.voltron.last_meta_utc.isoformat() if self.voltron and self.voltron.last_meta_utc else 'unknown'}**",
+                f"Last metadata check: **{self.voltron.last_meta_checked_utc.isoformat() if self.voltron and self.voltron.last_meta_checked_utc else 'never'}**",
+                f"Last Akurier success: **{self.voltron.last_akurier_success_utc.isoformat() if self.voltron and self.voltron.last_akurier_success_utc else 'never'}**",
+                f"Last successful calendar fetch/probe: **{last_success.isoformat() if last_success else 'never'}**",
                 f"Last error: **{last_error or 'none'}**",
             ]
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+        @self.tree.command(name="event-create", description="Leadership: create a Discord scheduled event in an OZY voice channel")
+        async def event_create(interaction: discord.Interaction) -> None:
+            if not await self._require_leadership(interaction):
+                return
+            if interaction.guild is None:
+                await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
+                return
+            view = EventLocationView(self, interaction)
+            if view.category_select is None:
+                await interaction.response.send_message(
+                    "I cannot find any category containing a voice channel I can view and connect to.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(view.content(), view=view, ephemeral=True)
 
         @self.tree.command(name="announce", description="Leadership: open the OZY announcement popup")
         @app_commands.describe(ping="Ping the configured announcement notification role")

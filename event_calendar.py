@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import logging
 import re
+import zlib
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from html.parser import HTMLParser
@@ -15,7 +17,7 @@ import aiohttp
 
 from settings import Settings
 
-log = logging.getLogger("ozy-admin.voltron")
+log = logging.getLogger("ozy-admin.calendar")
 
 _ACTION_RE = re.compile(r"\b(STARTS|ENDS|CONTINUE)\b", re.IGNORECASE)
 _MINI_RE = re.compile(
@@ -78,6 +80,8 @@ class VoltronSnapshot:
 class RefreshResult:
     snapshot: VoltronSnapshot
     changed: bool
+    source_last_synced_utc: datetime | None = None
+    source_changed: bool = False
 
 
 class _CalendarHTMLParser(HTMLParser):
@@ -384,6 +388,10 @@ class VoltronCalendarClient:
         self._snapshot: VoltronSnapshot | None = None
         self.last_error: str | None = None
         self.last_success_utc: datetime | None = None
+        self.last_meta_utc: datetime | None = None
+        self.last_meta_checked_utc: datetime | None = None
+        self.last_akurier_success_utc: datetime | None = None
+        self.last_akurier_error: str | None = None
 
     @property
     def snapshot(self) -> VoltronSnapshot | None:
@@ -401,23 +409,59 @@ class VoltronCalendarClient:
         try:
             async with self.session.get(
                 AKURIER_EVENTS_URL,
-                headers={"User-Agent": "OZY-Admin/1.0", "Accept": "text/html"},
+                headers={
+                    "Accept": "text/html",
+                    # Ask for plain HTML. Some upstream/CDN responses have still
+                    # arrived as zstd, so decompression is disabled below and any
+                    # returned encoding is handled explicitly.
+                    "Accept-Encoding": "identity",
+                },
+                auto_decompress=False,
             ) as response:
                 if response.status != 200:
                     raise VoltronCalendarError(f"Mini-events source returned HTTP {response.status}")
-                html = await response.text()
+                body = await response.read()
+                content_encoding = (response.headers.get("Content-Encoding") or "").strip().casefold()
+                if content_encoding in {"", "identity"}:
+                    pass
+                elif content_encoding == "gzip":
+                    body = gzip.decompress(body)
+                elif content_encoding == "deflate":
+                    try:
+                        body = zlib.decompress(body)
+                    except zlib.error:
+                        body = zlib.decompress(body, -zlib.MAX_WBITS)
+                elif content_encoding == "zstd":
+                    try:
+                        from compression import zstd  # Python 3.14+ (Render runtime)
+                    except ImportError as exc:
+                        raise VoltronCalendarError(
+                            "Mini-events source returned zstd but this Python runtime has no zstd decoder"
+                        ) from exc
+                    body = zstd.decompress(body)
+                else:
+                    raise VoltronCalendarError(
+                        f"Unsupported mini-events content encoding: {content_encoding}"
+                    )
+
+                charset = response.charset or "utf-8"
+                html = body.decode(charset, errors="replace")
             events = parse_akurier_mini_events_html(html)
             if not events:
                 raise VoltronCalendarError("Mini-events parser returned no regular events")
+            self.last_akurier_success_utc = datetime.now(timezone.utc)
+            self.last_akurier_error = None
             return events
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("Akurier mini-events refresh failed; keeping Voltron mini-event fallback: %s", exc)
+            self.last_akurier_error = str(exc)
+            log.warning("Akurier mini-events refresh failed; keeping cached/fallback mini events: %s", exc)
             return []
 
     async def _fetch_meta(self) -> datetime | None:
         timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
+        self.last_meta_checked_utc = datetime.now(timezone.utc)
         try:
             async with self.session.get(
                 self.meta_url,
@@ -431,7 +475,10 @@ class VoltronCalendarClient:
         except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
             return None
         if isinstance(payload, dict):
-            return _parse_last_synced(payload.get("lastSynced"))
+            value = _parse_last_synced(payload.get("lastSynced"))
+            if value is not None:
+                self.last_meta_utc = value
+            return value
         return None
 
     async def _fetch_content(self) -> str:
@@ -446,20 +493,47 @@ class VoltronCalendarClient:
                 raise VoltronCalendarError(f"Voltron calendar returned HTTP {response.status}")
             return await response.text()
 
-    async def refresh(self, *, force: bool = False) -> RefreshResult:
+    async def refresh(self, *, force: bool = False, refresh_akurier: bool = False) -> RefreshResult:
+        """Refresh the cached Voltron snapshot with minimal source traffic.
+
+        Automatic probes first read only snapshot-meta. If a snapshot already exists
+        and metadata is unchanged (or temporarily unavailable), no full calendar
+        download is made. Full content is fetched on startup, when metadata changes,
+        or when a leadership user explicitly forces a refresh.
+        """
         async with self._lock:
             try:
+                previous_source = self._snapshot.last_synced_utc if self._snapshot else None
                 last_synced = await self._fetch_meta()
-                if (
-                    not force
-                    and self._snapshot is not None
-                    and last_synced is not None
-                    and self._snapshot.last_synced_utc is not None
-                    and last_synced == self._snapshot.last_synced_utc
-                ):
-                    self.last_success_utc = datetime.now(timezone.utc)
-                    self.last_error = None
-                    return RefreshResult(self._snapshot, False)
+                source_changed = (
+                    last_synced is not None
+                    and previous_source is not None
+                    and last_synced != previous_source
+                )
+
+                if not force and self._snapshot is not None:
+                    # Minimal-impact behavior: if metadata is temporarily unavailable,
+                    # keep the last good snapshot rather than downloading full content.
+                    if last_synced is None:
+                        self.last_success_utc = datetime.now(timezone.utc)
+                        self.last_error = None
+                        return RefreshResult(
+                            self._snapshot, False,
+                            source_last_synced_utc=None,
+                            source_changed=False,
+                        )
+
+                    if (
+                        self._snapshot.last_synced_utc is not None
+                        and last_synced == self._snapshot.last_synced_utc
+                    ):
+                        self.last_success_utc = datetime.now(timezone.utc)
+                        self.last_error = None
+                        return RefreshResult(
+                            self._snapshot, False,
+                            source_last_synced_utc=last_synced,
+                            source_changed=False,
+                        )
 
                 html = await self._fetch_content()
                 parsed = parse_voltron_calendar_html(html)
@@ -468,15 +542,24 @@ class VoltronCalendarClient:
                         f"Voltron parser produced only {len(parsed.actions)} calendar actions; refusing snapshot"
                     )
 
-                # Mini events come from akurier.pl's regular table. The page also
-                # contains a separate "for SK below" table; the parser stops before it.
-                # If that source is unavailable, retain any minis Voltron itself exposed.
-                akurier_minis = await self._fetch_akurier_mini_events()
-                if akurier_minis:
+                # Akurier is intentionally NOT contacted on normal Voltron probes.
+                # Its regular mini-event table has its own once-daily scheduler.
+                # A forced leadership refresh may explicitly refresh it as well.
+                if refresh_akurier:
+                    akurier_minis = await self._fetch_akurier_mini_events()
+                    if akurier_minis:
+                        parsed = replace(
+                            parsed,
+                            mini_tournaments=tuple(akurier_minis),
+                            semantic_hash=_semantic_hash(parsed.actions, akurier_minis),
+                        )
+                elif self._snapshot is not None and self._snapshot.mini_tournaments:
+                    # Preserve the latest independently cached mini-events when the
+                    # Voltron calendar itself changes.
                     parsed = replace(
                         parsed,
-                        mini_tournaments=tuple(akurier_minis),
-                        semantic_hash=_semantic_hash(parsed.actions, akurier_minis),
+                        mini_tournaments=self._snapshot.mini_tournaments,
+                        semantic_hash=_semantic_hash(parsed.actions, self._snapshot.mini_tournaments),
                     )
 
                 parsed = replace(parsed, last_synced_utc=last_synced)
@@ -484,7 +567,11 @@ class VoltronCalendarClient:
                 self._snapshot = parsed
                 self.last_success_utc = datetime.now(timezone.utc)
                 self.last_error = None
-                return RefreshResult(parsed, changed)
+                return RefreshResult(
+                    parsed, changed,
+                    source_last_synced_utc=last_synced,
+                    source_changed=source_changed,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -495,6 +582,36 @@ class VoltronCalendarClient:
                 if isinstance(exc, VoltronCalendarError):
                     raise
                 raise VoltronCalendarError(str(exc)) from exc
+
+    async def refresh_akurier(self) -> RefreshResult:
+        """Refresh only the regular Akurier mini-event table.
+
+        This is scheduled once per UTC day at 18:00 (R+1). It never downloads
+        Voltron calendar content. If Akurier is unavailable, the current snapshot
+        and its existing mini-event fallback are retained.
+        """
+        async with self._lock:
+            if self._snapshot is None:
+                raise VoltronCalendarError("No Voltron snapshot is available for mini-event update")
+
+            minis = await self._fetch_akurier_mini_events()
+            if not minis:
+                return RefreshResult(self._snapshot, False)
+
+            new_hash = _semantic_hash(self._snapshot.actions, minis)
+            changed = new_hash != self._snapshot.semantic_hash
+            self._snapshot = replace(
+                self._snapshot,
+                mini_tournaments=tuple(minis),
+                semantic_hash=new_hash,
+                fetched_at_utc=datetime.now(timezone.utc),
+            )
+            return RefreshResult(
+                self._snapshot,
+                changed,
+                source_last_synced_utc=self._snapshot.last_synced_utc,
+                source_changed=False,
+            )
 
 
 GAME_RESET_UTC_HOUR = 17
@@ -637,6 +754,43 @@ def _pack_sections(title: str, sections: list[str], footer: str = "", limit: int
         rendered.append(text)
     return rendered
 
+
+def _pack_fenced_sections(title: str, sections: list[str], limit: int = 1900) -> list[str]:
+    """Pack calendar days so every day remains its own copyable code block."""
+    normalized: list[str] = []
+    for section in sections:
+        # Leave enough room for the fences and a repeated heading if one day is huge.
+        normalized.extend(_split_oversized_section(section, max(200, limit - 20)))
+
+    if not normalized:
+        normalized = ["No calendar items available."]
+
+    bodies: list[list[str]] = []
+    current: list[str] = []
+    for section in normalized:
+        block = f"```\n{section}\n```"
+        candidate_blocks = current + [block]
+        # Reserve room for a part-numbered title.
+        candidate = title + " (99/99)\n\n" + "\n\n".join(candidate_blocks)
+        if len(candidate) <= limit:
+            current.append(block)
+            continue
+        if current:
+            bodies.append(current)
+        current = [block]
+    if current:
+        bodies.append(current)
+
+    total = len(bodies)
+    rendered: list[str] = []
+    for index, blocks in enumerate(bodies, start=1):
+        header = title if total == 1 else f"{title} ({index}/{total})"
+        text = header + "\n\n" + "\n\n".join(blocks)
+        if len(text) > 2000:
+            raise VoltronCalendarError("Rendered calendar chunk exceeds Discord's 2000-character limit")
+        rendered.append(text)
+    return rendered
+
 def build_calendar_chunks(
     snapshot: VoltronSnapshot,
     *,
@@ -657,21 +811,36 @@ def build_calendar_chunks(
         and start_date <= action.timestamp_utc.date() < end_date
     ]
 
-    by_day: dict[date, list[CalendarAction]] = {}
+    starts_by_day: dict[date, list[CalendarAction]] = {}
     for action in starts:
-        by_day.setdefault(action.timestamp_utc.date(), []).append(action)
+        starts_by_day.setdefault(action.timestamp_utc.date(), []).append(action)
+
+    minis = [
+        item
+        for item in snapshot.mini_tournaments
+        if start_date <= item.start_utc.date() < end_date
+    ]
+    minis_by_day: dict[date, list[MiniTournament]] = {}
+    for item in minis:
+        minis_by_day.setdefault(item.start_utc.date(), []).append(item)
 
     sections: list[str] = []
-    for day in sorted(by_day):
+    for day in sorted(set(starts_by_day) | set(minis_by_day)):
         lines = [day.strftime("%a %d %b")]
-        lines.extend(_calendar_start_line(item) for item in sorted(by_day[day], key=lambda x: x.timestamp_utc))
+        day_starts = sorted(starts_by_day.get(day, []), key=lambda x: x.timestamp_utc)
+        if day_starts:
+            lines.extend(_calendar_start_line(item) for item in day_starts)
+        day_minis = sorted(minis_by_day.get(day, []), key=lambda x: x.start_utc)
+        if day_minis:
+            lines.append("Mini Events")
+            lines.extend(f"- {reset_label(item.start_utc)} {item.title}" for item in day_minis)
         sections.append("\n".join(lines))
 
     if not sections:
-        sections.append("No tournament starts are currently listed in this 30-day window.")
+        sections.append("No tournament starts or mini events are currently listed in this 30-day window.")
 
     title = "OZY Tournament Calendar - Next 30 Days"
-    return _pack_sections(title, sections)
+    return _pack_fenced_sections(title, sections)
 
 
 def build_today_chunks(
@@ -695,18 +864,24 @@ def build_today_chunks(
 
     sections: list[str] = []
     labels = {"STARTS": "Starts today", "CONTINUE": "Active / continues", "ENDS": "Ends today"}
-    for key in ("STARTS", "CONTINUE", "ENDS"):
+
+    if groups["STARTS"]:
+        lines = [labels["STARTS"]]
+        lines.extend(_event_line(item) for item in sorted(groups["STARTS"], key=lambda x: x.timestamp_utc))
+        sections.append("\n".join(lines))
+
+    if minis:
+        lines = ["Mini Events"]
+        for item in sorted(minis, key=lambda x: x.start_utc):
+            lines.append(f"- {reset_label(item.start_utc)} {item.title}")
+        sections.append("\n".join(lines))
+
+    for key in ("CONTINUE", "ENDS"):
         items = groups[key]
         if not items:
             continue
         lines = [labels[key]]
         lines.extend(_event_line(item) for item in sorted(items, key=lambda x: x.timestamp_utc))
-        sections.append("\n".join(lines))
-
-    if minis:
-        lines = ["Mini events"]
-        for item in sorted(minis, key=lambda x: x.start_utc):
-            lines.append(f"- {reset_label(item.start_utc)} {item.title}")
         sections.append("\n".join(lines))
 
     if not sections:
@@ -738,18 +913,24 @@ def build_today_local_chunks(
 
     sections: list[str] = []
     labels = {"STARTS": "Starts today", "CONTINUE": "Active / continues", "ENDS": "Ends today"}
-    for key in ("STARTS", "CONTINUE", "ENDS"):
+
+    if groups["STARTS"]:
+        lines = [labels["STARTS"]]
+        lines.extend(_local_event_line(item, timezone_info, target_date) for item in sorted(groups["STARTS"], key=lambda x: x.timestamp_utc))
+        sections.append("\n".join(lines))
+
+    if minis:
+        lines = ["Mini Events"]
+        for item in sorted(minis, key=lambda x: x.start_utc):
+            lines.append(f"- {_local_clock_with_date(item.start_utc, timezone_info, target_date)} {item.title}")
+        sections.append("\n".join(lines))
+
+    for key in ("CONTINUE", "ENDS"):
         items = groups[key]
         if not items:
             continue
         lines = [labels[key]]
         lines.extend(_local_event_line(item, timezone_info, target_date) for item in sorted(items, key=lambda x: x.timestamp_utc))
-        sections.append("\n".join(lines))
-
-    if minis:
-        lines = ["Mini events"]
-        for item in sorted(minis, key=lambda x: x.start_utc):
-            lines.append(f"- {_local_clock_with_date(item.start_utc, timezone_info, target_date)} {item.title}")
         sections.append("\n".join(lines))
 
     if not sections:

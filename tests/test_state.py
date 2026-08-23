@@ -51,3 +51,27 @@ def test_generic_bot_state_roundtrip(tmp_path):
     assert state.get_value("calendar") == "[1,2,3]"
     state.delete_value("calendar")
     assert state.get_value("calendar") is None
+
+
+def test_linked_user_for_game_name_is_case_insensitive(tmp_path):
+    state = AdminState(tmp_path / "state.sqlite3")
+    state.set_link(123, "PeekABoo Death", "test")
+    assert state.linked_user_for_game_name("peekaboo death") == 123
+    assert state.linked_user_for_game_name("Other") is None
+
+
+def test_member_link_stable_user_id_survives_name_change(tmp_path):
+    state = AdminState(tmp_path / "state.sqlite3")
+    state.set_link(123, "Old Name", "test", game_user_id="tb:90741542")
+
+    record = state.get_link_record(123)
+    assert record is not None
+    assert record.game_name == "Old Name"
+    assert record.game_user_id == "tb:90741542"
+    assert state.linked_user_for_identity("New Name", "tb:90741542") == 123
+
+    state.set_link(123, "New Name", "canonicalized", game_user_id="tb:90741542")
+    record = state.get_link_record(123)
+    assert record is not None
+    assert record.game_name == "New Name"
+    assert record.game_user_id == "tb:90741542"

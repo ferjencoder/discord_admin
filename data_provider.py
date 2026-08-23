@@ -36,6 +36,26 @@ class ChestStats:
 
 
 @dataclass(frozen=True)
+class ChestRankEntry:
+    name: str
+    points: int
+    chests: int
+    met_target: bool
+
+
+@dataclass(frozen=True)
+class ChestLeaderboard:
+    week_label: str
+    start: str
+    end: str
+    target: int
+    total_points: int
+    total_chests: int
+    generated: str | None
+    members: tuple[ChestRankEntry, ...]
+
+
+@dataclass(frozen=True)
 class ScheduleItem:
     time: str
     title: str
@@ -55,7 +75,14 @@ class DataProvider:
             self._locks[key] = asyncio.Lock()
         return self._locks[key]
 
-    async def _load_json(self, key: str, url: str | None, path: Path) -> Any:
+    async def _load_json(
+        self,
+        key: str,
+        url: str | None,
+        path: Path,
+        *,
+        ozy_api_auth: bool = False,
+    ) -> Any:
         now = time.monotonic()
         cached = self._cache.get(key)
         if cached and now - cached[0] < self.settings.data_cache_seconds:
@@ -70,7 +97,10 @@ class DataProvider:
             if url:
                 try:
                     timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
-                    async with self.session.get(url, timeout=timeout) as response:
+                    headers = {}
+                    if ozy_api_auth and self.settings.ozy_data_api_token:
+                        headers["X-OZY-Admin-Token"] = self.settings.ozy_data_api_token
+                    async with self.session.get(url, timeout=timeout, headers=headers) as response:
                         if response.status != 200:
                             raise DataUnavailable(f"{key} source returned HTTP {response.status}")
                         data = await response.json(content_type=None)
@@ -101,7 +131,12 @@ class DataProvider:
             self._cache.pop(key, None)
 
     async def roster(self) -> dict[str, dict[str, Any]]:
-        raw = await self._load_json("roster", self.settings.roster_url, self.settings.roster_file)
+        raw = await self._load_json(
+            "roster",
+            self.settings.roster_url,
+            self.settings.roster_file,
+            ozy_api_auth=True,
+        )
         members = raw.get("members", raw) if isinstance(raw, dict) else raw
 
         result: dict[str, dict[str, Any]] = {}
@@ -150,8 +185,27 @@ class DataProvider:
         return matches[:limit]
 
     async def member_info(self, game_name: str) -> dict[str, Any] | None:
+        return await self.resolve_roster_member(game_name=game_name)
+
+    async def resolve_roster_member(
+        self,
+        *,
+        game_name: str | None = None,
+        game_user_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Resolve a roster identity by stable TB user_id first, then exact name."""
         roster = await self.roster()
-        canonical = await self.exact_roster_name(game_name)
+        stable_id = (game_user_id or "").strip()
+        if stable_id:
+            for name, info in roster.items():
+                if str(info.get("user_id", "")).strip() == stable_id:
+                    return {"name": name, **info}
+
+        candidate = (game_name or "").strip()
+        if not candidate:
+            return None
+        lookup = {name.casefold(): name for name in roster}
+        canonical = lookup.get(candidate.casefold())
         if canonical is None:
             return None
         return {"name": canonical, **roster[canonical]}
@@ -161,6 +215,7 @@ class DataProvider:
             "chests",
             self.settings.chest_data_url,
             self.settings.chest_data_file,
+            ozy_api_auth=True,
         )
         if not isinstance(raw, dict):
             raise DataUnavailable("Chest data must be a JSON object")
@@ -214,6 +269,83 @@ class DataProvider:
                 breakdown=breakdown,
             )
         return None
+
+    async def chest_leaderboard(self, today: date | None = None) -> ChestLeaderboard | None:
+        """Return the current chest ranking using the active roster as authority.
+
+        Players missing from chest_data.json are included with zero points. Players
+        present in chest data but absent from the active roster are excluded.
+        """
+        raw = await self._load_json(
+            "chests",
+            self.settings.chest_data_url,
+            self.settings.chest_data_file,
+            ozy_api_auth=True,
+        )
+        if not isinstance(raw, dict):
+            raise DataUnavailable("Chest data must be a JSON object")
+
+        weeks = raw.get("weeks") or []
+        if not isinstance(weeks, list) or not weeks:
+            return None
+
+        today = today or datetime.now(self.settings.timezone).date()
+        selected = None
+        for week in weeks:
+            if not isinstance(week, dict):
+                continue
+            try:
+                start = date.fromisoformat(str(week.get("start")))
+                end = date.fromisoformat(str(week.get("end")))
+            except (TypeError, ValueError):
+                continue
+            if start <= today <= end:
+                selected = week
+                break
+        if selected is None:
+            selected = next((w for w in weeks if isinstance(w, dict)), None)
+        if selected is None:
+            return None
+
+        target = int(raw.get("weekly_target") or selected.get("weekly_target") or 0)
+        chest_lookup: dict[str, dict[str, Any]] = {}
+        for item in selected.get("members") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if name:
+                chest_lookup[name.casefold()] = item
+
+        roster = await self.roster()
+        entries: list[ChestRankEntry] = []
+        for roster_name in roster:
+            item = chest_lookup.get(roster_name.casefold(), {})
+            points = int(item.get("points") or 0)
+            chests = int(item.get("chests") or 0)
+            met_target = bool(item.get("met_target")) or (target > 0 and points >= target)
+            entries.append(
+                ChestRankEntry(
+                    name=roster_name,
+                    points=points,
+                    chests=chests,
+                    met_target=met_target,
+                )
+            )
+
+        entries.sort(key=lambda item: (-item.points, -item.chests, item.name.casefold()))
+        total_points = sum(item.points for item in entries)
+        total_chests = sum(item.chests for item in entries)
+
+        return ChestLeaderboard(
+            week_label=str(selected.get("label") or f"{selected.get('start', '')} - {selected.get('end', '')}"),
+            start=str(selected.get("start") or ""),
+            end=str(selected.get("end") or ""),
+            target=target,
+            total_points=total_points,
+            total_chests=total_chests,
+            generated=str(raw.get("generated")) if raw.get("generated") not in (None, "") else None,
+            members=tuple(entries),
+        )
 
     async def chats(self) -> list[dict[str, str]]:
         raw = await self._load_json("chats", None, self.settings.chats_file)

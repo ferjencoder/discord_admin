@@ -26,6 +26,7 @@ Recommended permissions:
 - Embed Links
 - Read Message History
 - Manage Roles
+- Create Events
 
 Only add **Manage Nicknames** if you later enable `AUTO_SYNC_NICKNAME=true`.
 
@@ -108,7 +109,6 @@ CALENDAR_CHANNEL_ID=...
 TODAY_CHANNEL_ID=...
 VOLTRON_CALENDAR_ENABLED=true
 VOLTRON_REALM=Regular
-VOLTRON_REFRESH_MINUTES=30
 VOLTRON_CALENDAR_DAYS=30
 VOLTRON_TODAY_ENABLED=true
 VOLTRON_TODAY_TIME=08:00
@@ -119,6 +119,9 @@ AUTO_SYNC_NICKNAME=false
 
 The Voltron integration does not require a Voltron login, cookie, SignalR connection,
 or personal account token. It uses the public calendar endpoints exposed by the site.
+Automatic source traffic is intentionally sparse: four lightweight metadata probes per UTC
+day while the source cadence is learned, full content only when metadata changes, and one
+Akurier mini-event fetch per day at 18:00 UTC (R+1).
 The 30-day calendar lists tournament STARTS; the daily post includes starts, continues,
 ends, and the mini-tournament schedule for that day.
 
@@ -153,11 +156,13 @@ Test in this order:
 13. `/today`
 14. `/calendar-refresh`
 15. confirm the calendar channel is edited in place rather than spammed
-16. `/sync-roles apply:false`
-17. inspect the preview
-18. `/sync-roles apply:true`
-19. `/announce ping:false`
-20. only after that, test `/announce ping:true`
+16. `/event-create` - select a restricted category + voice channel and create a test event
+17. confirm only members who can view that voice channel can access the scheduled event
+18. `/sync-roles apply:false`
+19. inspect the preview
+20. `/sync-roles apply:true`
+21. `/announce ping:false`
+22. only after that, test `/announce ping:true`
 
 ## 9. Test a new member
 

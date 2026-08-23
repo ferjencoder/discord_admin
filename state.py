@@ -16,6 +16,14 @@ class AwayRecord:
     reason: str
 
 
+@dataclass(frozen=True)
+class MemberLink:
+    discord_user_id: int
+    game_name: str
+    game_user_id: str | None
+    source: str
+
+
 class AdminState:
     def __init__(self, path: Path):
         self.path = path
@@ -43,6 +51,7 @@ class AdminState:
                 CREATE TABLE IF NOT EXISTS member_links (
                     discord_user_id INTEGER PRIMARY KEY,
                     game_name TEXT NOT NULL,
+                    game_user_id TEXT,
                     linked_at_utc TEXT NOT NULL,
                     source TEXT NOT NULL
                 );
@@ -82,19 +91,42 @@ class AdminState:
                 """
             )
 
-    def set_link(self, discord_user_id: int, game_name: str, source: str) -> None:
+            # Safe in-place migration for existing OZY Admin databases created
+            # before stable Total Battle user IDs were stored with member links.
+            member_link_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(member_links)").fetchall()
+            }
+            if "game_user_id" not in member_link_columns:
+                conn.execute("ALTER TABLE member_links ADD COLUMN game_user_id TEXT")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_member_links_game_user_id
+                ON member_links(game_user_id)
+                WHERE game_user_id IS NOT NULL AND game_user_id <> ''
+                """
+            )
+
+    def set_link(
+        self,
+        discord_user_id: int,
+        game_name: str,
+        source: str,
+        game_user_id: str | None = None,
+    ) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        stable_id = (game_user_id or "").strip() or None
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO member_links(discord_user_id, game_name, linked_at_utc, source)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO member_links(discord_user_id, game_name, game_user_id, linked_at_utc, source)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(discord_user_id) DO UPDATE SET
                     game_name=excluded.game_name,
+                    game_user_id=COALESCE(excluded.game_user_id, member_links.game_user_id),
                     linked_at_utc=excluded.linked_at_utc,
                     source=excluded.source
                 """,
-                (discord_user_id, game_name, now, source),
+                (discord_user_id, game_name, stable_id, now, source),
             )
 
     def get_link(self, discord_user_id: int) -> str | None:
@@ -105,6 +137,44 @@ class AdminState:
             ).fetchone()
         return row["game_name"] if row else None
 
+    def get_link_record(self, discord_user_id: int) -> MemberLink | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT discord_user_id, game_name, game_user_id, source
+                FROM member_links
+                WHERE discord_user_id=?
+                """,
+                (discord_user_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return MemberLink(
+            discord_user_id=int(row["discord_user_id"]),
+            game_name=row["game_name"],
+            game_user_id=row["game_user_id"],
+            source=row["source"],
+        )
+
+    def linked_user_for_game_name(self, game_name: str) -> int | None:
+        target = game_name.casefold()
+        for discord_user_id, linked_name in self.all_links().items():
+            if linked_name.casefold() == target:
+                return discord_user_id
+        return None
+
+    def linked_user_for_identity(self, game_name: str, game_user_id: str | None = None) -> int | None:
+        stable_id = (game_user_id or "").strip()
+        if stable_id:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT discord_user_id FROM member_links WHERE game_user_id=?",
+                    (stable_id,),
+                ).fetchone()
+            if row:
+                return int(row["discord_user_id"])
+        return self.linked_user_for_game_name(game_name)
+
     def remove_link(self, discord_user_id: int) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM member_links WHERE discord_user_id=?", (discord_user_id,))
@@ -113,6 +183,21 @@ class AdminState:
         with self._conn() as conn:
             rows = conn.execute("SELECT discord_user_id, game_name FROM member_links").fetchall()
         return {int(row["discord_user_id"]): row["game_name"] for row in rows}
+
+    def all_link_records(self) -> dict[int, MemberLink]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT discord_user_id, game_name, game_user_id, source FROM member_links"
+            ).fetchall()
+        return {
+            int(row["discord_user_id"]): MemberLink(
+                discord_user_id=int(row["discord_user_id"]),
+                game_name=row["game_name"],
+                game_user_id=row["game_user_id"],
+                source=row["source"],
+            )
+            for row in rows
+        }
 
     def set_away(
         self,

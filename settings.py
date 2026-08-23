@@ -133,6 +133,9 @@ class Settings:
     leadership_role_ids: frozenset[int]
     rank_role_map: dict[str, int]
     away_role_id: int | None
+    verified_role_id: int | None
+    unverified_role_id: int | None
+    special_access_role_id: int | None
 
     welcome_channel_id: int | None
     announcement_channel_id: int | None
@@ -142,11 +145,13 @@ class Settings:
     today_channel_id: int | None
     away_channel_id: int | None
     audit_channel_id: int | None
+    chest_channel_id: int | None
 
     roster_url: str | None
     roster_file: Path
     chest_data_url: str | None
     chest_data_file: Path
+    ozy_data_api_token: str | None
     schedule_url: str | None
     schedule_file: Path
     chats_file: Path
@@ -156,6 +161,11 @@ class Settings:
     schedule_timezone: str
     daily_schedule_time: str
     daily_schedule_enabled: bool
+
+    chest_reset_post_enabled: bool
+    chest_reset_post_time_utc: str
+    chest_report_chunk_size: int
+    roster_access_sync_minutes: int
 
     voltron_calendar_enabled: bool
     voltron_base_url: str
@@ -205,6 +215,9 @@ def load_settings() -> Settings:
         leadership_role_ids=_id_set("LEADERSHIP_ROLE_IDS"),
         rank_role_map=_rank_role_map(),
         away_role_id=_optional_id("AWAY_ROLE_ID"),
+        verified_role_id=_optional_id("VERIFIED_ROLE_ID"),
+        unverified_role_id=_optional_id("UNVERIFIED_ROLE_ID"),
+        special_access_role_id=_optional_id("SPECIAL_ACCESS_ROLE_ID"),
 
         welcome_channel_id=_optional_id("WELCOME_CHANNEL_ID"),
         announcement_channel_id=_optional_id("ANNOUNCEMENT_CHANNEL_ID"),
@@ -214,11 +227,13 @@ def load_settings() -> Settings:
         today_channel_id=_optional_id("TODAY_CHANNEL_ID"),
         away_channel_id=_optional_id("AWAY_CHANNEL_ID"),
         audit_channel_id=_optional_id("AUDIT_CHANNEL_ID"),
+        chest_channel_id=_optional_id("CHEST_CHANNEL_ID"),
 
         roster_url=os.getenv("ROSTER_URL", "").strip() or None,
         roster_file=Path(os.getenv("ROSTER_FILE", "data/roster.json")).expanduser(),
         chest_data_url=os.getenv("CHEST_DATA_URL", "").strip() or None,
         chest_data_file=Path(os.getenv("CHEST_DATA_FILE", "data/chest_data.json")).expanduser(),
+        ozy_data_api_token=os.getenv("OZY_DATA_API_TOKEN", "").strip() or None,
         schedule_url=os.getenv("SCHEDULE_URL", "").strip() or None,
         schedule_file=Path(os.getenv("SCHEDULE_FILE", "data/schedule.json")).expanduser(),
         chats_file=Path(os.getenv("CHATS_FILE", "data/chats.json")).expanduser(),
@@ -231,6 +246,14 @@ def load_settings() -> Settings:
             os.getenv("DAILY_SCHEDULE_TIME", "08:00").strip() or "08:00",
         ),
         daily_schedule_enabled=_env_bool("DAILY_SCHEDULE_ENABLED", True),
+
+        chest_reset_post_enabled=_env_bool("CHEST_RESET_POST_ENABLED", False),
+        chest_reset_post_time_utc=_validate_hhmm(
+            "CHEST_RESET_POST_TIME_UTC",
+            os.getenv("CHEST_RESET_POST_TIME_UTC", "17:00").strip() or "17:00",
+        ),
+        chest_report_chunk_size=_env_int("CHEST_REPORT_CHUNK_SIZE", 20, 1),
+        roster_access_sync_minutes=_env_int("ROSTER_ACCESS_SYNC_MINUTES", 10, 1),
 
         voltron_calendar_enabled=_env_bool("VOLTRON_CALENDAR_ENABLED", True),
         voltron_base_url=os.getenv("VOLTRON_BASE_URL", "https://nexusportal.voltron.me").strip().rstrip("/"),
