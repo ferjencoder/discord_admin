@@ -10,6 +10,7 @@ def base_env(monkeypatch):
     monkeypatch.setenv("SERVER_ID", "123")
     monkeypatch.delenv("RANK_ROLE_MAP", raising=False)
     monkeypatch.delenv("LEADERSHIP_ROLE_IDS", raising=False)
+    monkeypatch.setenv("CALENDAR_BASE_URL", "https://calendar.example.test")
     for name in (
         "VERIFIED_ROLE_ID", "UNVERIFIED_ROLE_ID", "SPECIAL_ACCESS_ROLE_ID",
         "CHEST_CHANNEL_ID", "CHEST_RESET_POST_ENABLED", "CHEST_RESET_POST_TIME_UTC",
@@ -47,15 +48,14 @@ def test_invalid_schedule_time(monkeypatch):
         load_settings()
 
 
-def test_voltron_defaults(monkeypatch):
+def test_calendar_defaults(monkeypatch):
     base_env(monkeypatch)
     settings = load_settings()
-    assert settings.voltron_calendar_enabled is True
-    assert settings.voltron_base_url == "https://nexusportal.voltron.me"
-    assert settings.voltron_realm == "Regular"
-    assert settings.voltron_refresh_minutes == 30
-    assert settings.voltron_calendar_days == 30
-    assert settings.voltron_today_time == "08:00"
+    assert settings.calendar_enabled is True
+    assert settings.calendar_base_url == "https://calendar.example.test"
+    assert settings.calendar_realm == "Regular"
+    assert settings.calendar_refresh_minutes == 30
+    assert settings.calendar_days == 30
 
 
 def test_access_and_chest_settings(monkeypatch):

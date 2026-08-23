@@ -18,11 +18,13 @@ from settings import ConfigError, Settings, load_settings
 from state import AdminState
 from utils import format_chat_directory, format_chest_ranking_blocks, format_schedule, safe_code_block, truncate
 from event_calendar import (
-    VoltronCalendarClient,
-    VoltronCalendarError,
+    TournamentCalendarClient,
+    CalendarSourceError,
     build_calendar_chunks,
     build_today_chunks,
     build_today_local_chunks,
+    game_day_bounds,
+    game_day_for_instant,
     reset_label,
 )
 
@@ -53,9 +55,9 @@ TIMEZONE_CHOICES = [
 ]
 
 # Minimal-impact source schedule. Public calendar metadata is checked only four
-# times per UTC day while we learn Voltron's actual source refresh cadence.
+# times per UTC day while we learn the tournament source's actual refresh cadence.
 # Akurier regular mini-events are fetched once daily at R+1 (18:00 UTC).
-VOLTRON_META_PROBE_TIMES_UTC = ((0, 30), (6, 30), (12, 30), (18, 30))
+CALENDAR_META_PROBE_TIMES_UTC = ((0, 30), (6, 30), (12, 30), (18, 30))
 AKURIER_REFRESH_TIME_UTC = (18, 0)
 
 
@@ -111,12 +113,11 @@ def _event_datetime_from_reset(date_value: str, reset_value: str, *, now_utc: da
     if abs(raw_minutes - rounded_minutes) > 0.001 or rounded_minutes % 15 != 0:
         raise ValueError("Reset time must use 15-minute steps, for example R+1, R+1.5, or R-3.25.")
 
-    # The calendar date is the UTC date shown publicly. Convert the reset clock
-    # back into that day's UTC wall-clock time rather than blindly adding to the
-    # reset instant (R+9, for example, is 02:00 UTC on that displayed date).
-    clock_minutes = (17 * 60 + rounded_minutes) % (24 * 60)
-    hour, minute = divmod(clock_minutes, 60)
-    start = datetime.combine(target_date, dt_time(hour, minute), tzinfo=timezone.utc)
+    # The entered date is the date of R+0. Add the reset offset to that reset
+    # instant so late offsets correctly cross UTC midnight (for example R+10
+    # becomes 03:00 UTC on the following calendar date).
+    reset_start = datetime.combine(target_date, dt_time(17, 0), tzinfo=timezone.utc)
+    start = reset_start + timedelta(minutes=rounded_minutes)
     return start, reset_label(start)
 
 
@@ -141,8 +142,8 @@ class EventDetailsModal(discord.ui.Modal):
             max_length=100,
         )
         self.event_date = discord.ui.TextInput(
-            label="Date",
-            placeholder="tomorrow or 2026-08-23",
+            label="R+0 reset date",
+            placeholder="tomorrow or 2026-08-24",
             max_length=20,
         )
         self.reset_time = discord.ui.TextInput(
@@ -371,7 +372,7 @@ class EventLocationView(discord.ui.View):
             lines.append(f"Category: **{self.category_name}**")
         if self.voice_channel_id:
             lines.append(f"Voice: <#{self.voice_channel_id}>")
-        lines.append("Then click **Event details** to enter the name, date and reset time such as `tomorrow` + `R+4`.")
+        lines.append("Then click **Event details**. The date is the date of R+0; for example `tomorrow` + `R+4`.")
         return "\n".join(lines)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -439,7 +440,7 @@ class OZYAdminBot(discord.Client):
 
         self.http_session: aiohttp.ClientSession | None = None
         self.data: DataProvider | None = None
-        self.voltron: VoltronCalendarClient | None = None
+        self.calendar_client: TournamentCalendarClient | None = None
         self.health_runner: web.AppRunner | None = None
         self.background_tasks: list[asyncio.Task] = []
         self._guild_validated = False
@@ -455,14 +456,26 @@ class OZYAdminBot(discord.Client):
         # in outbound read-only source requests.
         self.http_session = aiohttp.ClientSession()
         self.data = DataProvider(self.settings, self.http_session)
-        self.voltron = VoltronCalendarClient(self.settings, self.http_session)
+        self.calendar_client = TournamentCalendarClient(self.settings, self.http_session)
 
         await self._start_health_server()
 
         guild = discord.Object(id=self.settings.server_id)
         self.tree.copy_global_to(guild=guild)
         synced = await self.tree.sync(guild=guild)
-        log.info("Synced %d application commands to guild %s", len(synced), self.settings.server_id)
+        synced_names = {command.name for command in synced}
+        required_commands = {"event-create", "calendar", "today", "time"}
+        missing_commands = sorted(required_commands - synced_names)
+        if missing_commands:
+            raise RuntimeError(
+                "Discord command sync is incomplete; missing: " + ", ".join(missing_commands)
+            )
+        log.info(
+            "Synced %d application commands to guild %s: %s",
+            len(synced),
+            self.settings.server_id,
+            ", ".join(sorted(synced_names)),
+        )
 
         self.background_tasks.append(asyncio.create_task(self._daily_schedule_loop(), name="daily-schedule"))
         self.background_tasks.append(asyncio.create_task(self._away_expiry_loop(), name="away-expiry"))
@@ -475,11 +488,11 @@ class OZYAdminBot(discord.Client):
             or self.settings.special_access_role_id
         ):
             self.background_tasks.append(asyncio.create_task(self._roster_access_sync_loop(), name="roster-access-sync"))
-        if self.settings.voltron_calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
-            self.background_tasks.append(asyncio.create_task(self._voltron_refresh_loop(), name="voltron-refresh"))
+        if self.settings.calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
+            self.background_tasks.append(asyncio.create_task(self._calendar_refresh_loop(), name="calendar-refresh"))
             self.background_tasks.append(asyncio.create_task(self._akurier_refresh_loop(), name="akurier-refresh"))
-            if self.settings.voltron_today_enabled and self.settings.today_channel_id:
-                self.background_tasks.append(asyncio.create_task(self._voltron_today_loop(), name="voltron-today"))
+            if self.settings.today_enabled and self.settings.today_channel_id:
+                self.background_tasks.append(asyncio.create_task(self._today_loop(), name="ozy-today"))
 
         if self.settings.self_ping_enabled and self.settings.render_external_url:
             self.background_tasks.append(asyncio.create_task(self._self_ping_loop(), name="self-ping"))
@@ -1173,7 +1186,7 @@ class OZYAdminBot(discord.Client):
                 log.exception("Automatic R+0 chest ranking post failed")
 
     # ------------------------------------------------------------------
-    # Voltron tournament calendar
+    # Tournament calendar
     # ------------------------------------------------------------------
     def _state_message_ids(self, key: str) -> list[int]:
         raw = self.state.get_value(key)
@@ -1248,36 +1261,36 @@ class OZYAdminBot(discord.Client):
             self._save_message_ids(state_key, ids)
             return ids
 
-    async def _refresh_voltron(self, *, force: bool, actor: str, refresh_akurier: bool = False) -> tuple[bool, str]:
-        if not self.settings.voltron_calendar_enabled:
-            return False, "Voltron calendar integration is disabled"
-        if self.voltron is None:
-            return False, "Voltron calendar client is unavailable"
+    async def _refresh_calendar(self, *, force: bool, actor: str, refresh_akurier: bool = False) -> tuple[bool, str]:
+        if not self.settings.calendar_enabled:
+            return False, "Tournament calendar integration is disabled"
+        if self.calendar_client is None:
+            return False, "Tournament calendar client is unavailable"
 
         try:
-            result = await self.voltron.refresh(force=force, refresh_akurier=refresh_akurier)
-        except VoltronCalendarError as exc:
-            await self._audit("Voltron calendar refresh failed", actor, str(exc))
+            result = await self.calendar_client.refresh(force=force, refresh_akurier=refresh_akurier)
+        except CalendarSourceError as exc:
+            await self._audit("Tournament calendar refresh failed", actor, str(exc))
             return False, str(exc)
 
         snapshot = result.snapshot
 
         # Record the public source timestamp only when it changes. This lets us
-        # learn Voltron's real refresh cadence and later reduce the four daily
+        # learn the source's real refresh cadence and later reduce the four daily
         # metadata probes to one check 20-30 minutes after its normal update.
         if result.source_last_synced_utc is not None:
             source_iso = result.source_last_synced_utc.isoformat()
-            previous_source_iso = self.state.get_value("voltron_source_last_synced_utc")
+            previous_source_iso = self.state.get_value("calendar_source_last_synced_utc")
             if previous_source_iso != source_iso:
-                self.state.set_value("voltron_source_last_synced_utc", source_iso)
+                self.state.set_value("calendar_source_last_synced_utc", source_iso)
                 observed = datetime.now(timezone.utc).isoformat()
                 log.info(
-                    "Voltron source timestamp observed: source=%s observed=%s previous=%s",
+                    "Tournament source timestamp observed: source=%s observed=%s previous=%s",
                     source_iso, observed, previous_source_iso or "none",
                 )
                 if previous_source_iso:
                     await self._audit(
-                        "Voltron source refresh observed",
+                        "Tournament source refresh observed",
                         actor,
                         f"Previous source sync: {previous_source_iso}\n"
                         f"New source sync: {source_iso}\n"
@@ -1285,8 +1298,9 @@ class OZYAdminBot(discord.Client):
                     )
 
         today = datetime.now(timezone.utc).date()
+        game_day = game_day_for_instant()
 
-        rendered_start = self.state.get_value("voltron_calendar_start_date")
+        rendered_start = self.state.get_value("calendar_start_date")
         window_rolled = rendered_start != today.isoformat()
         if self.settings.calendar_channel_id and (result.changed or force or window_rolled):
             channel = self.get_channel(self.settings.calendar_channel_id)
@@ -1294,26 +1308,26 @@ class OZYAdminBot(discord.Client):
                 chunks = build_calendar_chunks(
                     snapshot,
                     start_date=today,
-                    days=self.settings.voltron_calendar_days,
+                    days=self.settings.calendar_days,
                     timezone_info=timezone.utc,
                 )
                 await self._upsert_message_series(
                     channel,
-                    state_key="voltron_calendar_message_ids",
+                    state_key="calendar_message_ids",
                     recovery_prefix="OZY Tournament Calendar - Next 30 Days",
                     chunks=chunks,
                 )
-                self.state.set_value("voltron_calendar_start_date", today.isoformat())
+                self.state.set_value("calendar_start_date", today.isoformat())
 
         # If today's post already exists, silently keep it current after source changes.
         if self.settings.today_channel_id and result.changed:
-            today_key = f"voltron_today_message_ids:{today.isoformat()}"
+            today_key = f"today_message_ids:{game_day.isoformat()}"
             if self._state_message_ids(today_key):
-                await self._post_voltron_today(today, force=True, actor="calendar refresh")
+                await self._post_today(game_day, force=True, actor="calendar refresh")
 
         if result.changed:
             await self._audit(
-                "Voltron calendar updated",
+                "Tournament calendar updated",
                 actor,
                 f"Actions: {len(snapshot.actions)}\nMini tournaments: {len(snapshot.mini_tournaments)}\n"
                 f"Hash: {snapshot.semantic_hash[:12]}",
@@ -1321,41 +1335,42 @@ class OZYAdminBot(discord.Client):
         return result.changed, "ok"
 
     async def _refresh_akurier(self, *, actor: str) -> tuple[bool, str]:
-        if not self.settings.voltron_calendar_enabled or self.voltron is None:
+        if not self.settings.calendar_enabled or self.calendar_client is None:
             return False, "Calendar integration is unavailable"
-        if self.voltron.snapshot is None:
-            return False, "No Voltron snapshot is available"
+        if self.calendar_client.snapshot is None:
+            return False, "No tournament calendar snapshot is available"
 
         try:
-            result = await self.voltron.refresh_akurier()
-        except VoltronCalendarError as exc:
+            result = await self.calendar_client.refresh_akurier()
+        except CalendarSourceError as exc:
             log.warning("Akurier mini-event refresh skipped: %s", exc)
             return False, str(exc)
 
         if result.changed:
             today = datetime.now(timezone.utc).date()
+            game_day = game_day_for_instant()
 
             # Akurier mini-events belong in both public schedule surfaces. Update
-            # from the cache only; do not make another Voltron request here.
+            # from the cache only; do not make another tournament-source request here.
             if self.settings.calendar_channel_id:
                 channel = self.get_channel(self.settings.calendar_channel_id)
                 if isinstance(channel, discord.TextChannel):
                     chunks = build_calendar_chunks(
                         result.snapshot,
                         start_date=today,
-                        days=self.settings.voltron_calendar_days,
+                        days=self.settings.calendar_days,
                         timezone_info=timezone.utc,
                     )
                     await self._upsert_message_series(
                         channel,
-                        state_key="voltron_calendar_message_ids",
+                        state_key="calendar_message_ids",
                         recovery_prefix="OZY Tournament Calendar - Next 30 Days",
                         chunks=chunks,
                     )
-                    self.state.set_value("voltron_calendar_start_date", today.isoformat())
+                    self.state.set_value("calendar_start_date", today.isoformat())
 
             if self.settings.today_channel_id:
-                await self._post_voltron_today(today, force=True, actor="mini-event refresh")
+                await self._post_today(game_day, force=True, actor="mini-event refresh")
 
             await self._audit(
                 "Mini events updated",
@@ -1364,26 +1379,26 @@ class OZYAdminBot(discord.Client):
             )
         return result.changed, "ok"
 
-    async def _post_voltron_today(self, target_date, *, force: bool, actor: str) -> bool:
-        if not self.settings.today_channel_id or self.voltron is None:
+    async def _post_today(self, target_date, *, force: bool, actor: str) -> bool:
+        if not self.settings.today_channel_id or self.calendar_client is None:
             return False
         channel = self.get_channel(self.settings.today_channel_id)
         if not isinstance(channel, discord.TextChannel):
             return False
 
         try:
-            # Discord rendering uses the in-memory cache. Only contact Voltron if
+            # Discord rendering uses the in-memory cache. Only contact the source if
             # startup has not populated a snapshot yet.
-            if self.voltron.snapshot is None:
-                await self.voltron.refresh(force=True)
-        except VoltronCalendarError as exc:
-            log.warning("Today's Voltron post skipped: %s", exc)
+            if self.calendar_client.snapshot is None:
+                await self.calendar_client.refresh(force=True)
+        except CalendarSourceError as exc:
+            log.warning("Today's tournament post skipped: %s", exc)
             return False
-        snapshot = self.voltron.snapshot
+        snapshot = self.calendar_client.snapshot
         if snapshot is None:
             return False
 
-        state_key = f"voltron_today_message_ids:{target_date.isoformat()}"
+        state_key = f"today_message_ids:{target_date.isoformat()}"
         if not force and self._state_message_ids(state_key):
             return False
 
@@ -1404,40 +1419,40 @@ class OZYAdminBot(discord.Client):
             chunks=chunks,
         )
         await self._audit(
-            "Voltron today posted" if not existing else "Voltron today updated",
+            "OZY Today posted" if not existing else "OZY Today updated",
             actor,
             f"Date: {target_date.isoformat()}\nChannel: #{channel.name}",
         )
         return True
 
-    async def _voltron_refresh_loop(self) -> None:
+    async def _calendar_refresh_loop(self) -> None:
         await self.wait_until_ready()
 
         # One startup read is needed to populate the in-memory cache. After that,
         # only lightweight metadata probes run at the fixed times below. Full
         # calendar content is downloaded only when metadata reports a change.
         try:
-            await self._refresh_voltron(
-                force=self.voltron.snapshot is None if self.voltron else True,
+            await self._refresh_calendar(
+                force=self.calendar_client.snapshot is None if self.calendar_client else True,
                 actor="startup calendar refresh",
                 refresh_akurier=False,
             )
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Startup Voltron calendar refresh failed")
+            log.exception("Startup tournament calendar refresh failed")
 
         while not self.is_closed():
             now = datetime.now(timezone.utc)
-            target = _next_utc_slot(now, VOLTRON_META_PROBE_TIMES_UTC)
+            target = _next_utc_slot(now, CALENDAR_META_PROBE_TIMES_UTC)
             try:
                 await asyncio.sleep(max(1.0, (target - now).total_seconds()))
             except asyncio.CancelledError:
                 raise
 
             try:
-                log.info("Running lightweight Voltron metadata probe at %s", target.isoformat())
-                await self._refresh_voltron(
+                log.info("Running lightweight tournament metadata probe at %s", target.isoformat())
+                await self._refresh_calendar(
                     force=False,
                     actor="automatic metadata probe",
                     refresh_akurier=False,
@@ -1445,7 +1460,7 @@ class OZYAdminBot(discord.Client):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Automatic Voltron metadata probe failed")
+                log.exception("Automatic tournament metadata probe failed")
 
     async def _akurier_refresh_loop(self) -> None:
         await self.wait_until_ready()
@@ -1460,10 +1475,10 @@ class OZYAdminBot(discord.Client):
             # Akurier fetch has not yet been attempted. A failed attempt is not
             # hammered with retries; the existing cached/fallback data remains.
             if now >= today_target and last_attempt != now.date().isoformat():
-                # On a fresh deploy the Voltron startup read may still be running.
+                # On a fresh deploy the tournament startup read may still be running.
                 # Wait briefly rather than consuming today's single Akurier attempt
                 # before there is a snapshot to attach the mini-events to.
-                if self.voltron is None or self.voltron.snapshot is None:
+                if self.calendar_client is None or self.calendar_client.snapshot is None:
                     try:
                         await asyncio.sleep(10)
                     except asyncio.CancelledError:
@@ -1486,35 +1501,35 @@ class OZYAdminBot(discord.Client):
             except asyncio.CancelledError:
                 raise
 
-    async def _voltron_today_loop(self) -> None:
+    async def _today_loop(self) -> None:
         await self.wait_until_ready()
-        hour, minute = [int(x) for x in self.settings.voltron_today_time.split(":", 1)]
-        tz = self.settings.timezone
-
+        # "Today" is a Total Battle game day, not a midnight-to-midnight civil
+        # day. Roll the canonical post at R+0 (17:00 UTC) and keep that same
+        # message updated until the next reset.
         while not self.is_closed():
-            now = datetime.now(tz)
-            target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
+            now = datetime.now(timezone.utc)
+            game_day = game_day_for_instant(now)
+            current_reset, next_reset = game_day_bounds(game_day)
 
-            # Catch up after a restart without duplicating the day's canonical post.
-            if now >= target:
+            # Catch up after a restart without duplicating the current game day.
+            if now >= current_reset:
                 try:
-                    await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
+                    await self._post_today(game_day, force=False, actor="automatic today scheduler")
                 except Exception:
-                    log.exception("Catch-up Voltron today post failed")
+                    log.exception("Catch-up OZY Today post failed")
 
-            now = datetime.now(tz)
-            next_target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
-            if next_target <= now:
-                next_target += timedelta(days=1)
+            now = datetime.now(timezone.utc)
+            game_day = game_day_for_instant(now)
+            _, next_target = game_day_bounds(game_day)
             try:
                 await asyncio.sleep(max(1.0, (next_target - now).total_seconds()))
             except asyncio.CancelledError:
                 raise
 
             try:
-                await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
+                await self._post_today(game_day_for_instant(), force=False, actor="automatic today scheduler")
             except Exception:
-                log.exception("Automatic Voltron today post failed")
+                log.exception("Automatic OZY Today post failed")
 
     # ------------------------------------------------------------------
     # Authoritative roster/access synchronization
@@ -2272,26 +2287,26 @@ class OZYAdminBot(discord.Client):
                     ephemeral=True,
                 )
 
-        @self.tree.command(name="calendar", description="Show the next 30 days of Voltron tournament starts")
+        @self.tree.command(name="calendar", description="Show the next 30 days of OZY tournament starts")
         @app_commands.describe(public="Post publicly instead of only showing it to you")
         async def calendar(interaction: discord.Interaction, public: bool = False) -> None:
             if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
                 await interaction.response.send_message("Only leadership can post the calendar publicly.", ephemeral=True)
                 return
-            if self.voltron is None:
-                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=not public, thinking=True)
             try:
-                if self.voltron.snapshot is None:
-                    await self.voltron.refresh(force=True)
-                snapshot = self.voltron.snapshot
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
                 if snapshot is None:
-                    raise VoltronCalendarError("No calendar snapshot is available")
+                    raise CalendarSourceError("No calendar snapshot is available")
                 chunks = build_calendar_chunks(
                     snapshot,
                     start_date=datetime.now(timezone.utc).date(),
-                    days=self.settings.voltron_calendar_days,
+                    days=self.settings.calendar_days,
                     timezone_info=timezone.utc,
                 )
                 for chunk in chunks:
@@ -2300,26 +2315,26 @@ class OZYAdminBot(discord.Client):
                         ephemeral=not public,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-            except VoltronCalendarError as exc:
+            except CalendarSourceError as exc:
                 await interaction.followup.send(f"Calendar unavailable: {exc}", ephemeral=True)
 
-        @self.tree.command(name="today", description="Show today's Voltron tournament activity")
+        @self.tree.command(name="today", description="Show the current reset-to-reset OZY game day")
         @app_commands.describe(public="Post publicly instead of only showing it to you")
         async def today(interaction: discord.Interaction, public: bool = False) -> None:
             if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
                 await interaction.response.send_message("Only leadership can post today's schedule publicly.", ephemeral=True)
                 return
-            if self.voltron is None:
-                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=not public, thinking=True)
             try:
-                if self.voltron.snapshot is None:
-                    await self.voltron.refresh(force=True)
-                snapshot = self.voltron.snapshot
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
                 if snapshot is None:
-                    raise VoltronCalendarError("No calendar snapshot is available")
-                target_date = datetime.now(timezone.utc).date()
+                    raise CalendarSourceError("No calendar snapshot is available")
+                target_date = game_day_for_instant()
                 chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=timezone.utc)
                 for chunk in chunks:
                     await interaction.followup.send(
@@ -2327,24 +2342,24 @@ class OZYAdminBot(discord.Client):
                         ephemeral=not public,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-            except VoltronCalendarError as exc:
+            except CalendarSourceError as exc:
                 await interaction.followup.send(f"Today's calendar is unavailable: {exc}", ephemeral=True)
 
         @self.tree.command(name="time", description="Show today's OZY events in your chosen local timezone")
         @app_commands.describe(zone="Timezone to convert the current game-day schedule to")
         @app_commands.choices(zone=TIMEZONE_CHOICES)
         async def time_converter(interaction: discord.Interaction, zone: app_commands.Choice[str]) -> None:
-            if self.voltron is None:
-                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                if self.voltron.snapshot is None:
-                    await self.voltron.refresh(force=True)
-                snapshot = self.voltron.snapshot
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
                 if snapshot is None:
-                    raise VoltronCalendarError("No calendar snapshot is available")
-                target_date = datetime.now(timezone.utc).date()
+                    raise CalendarSourceError("No calendar snapshot is available")
+                target_date = game_day_for_instant()
                 chunks = build_today_local_chunks(
                     snapshot,
                     target_date=target_date,
@@ -2360,12 +2375,12 @@ class OZYAdminBot(discord.Client):
             except Exception as exc:
                 await interaction.followup.send(f"Time conversion unavailable: {exc}", ephemeral=True)
 
-        @self.tree.command(name="calendar-refresh", description="Leadership: refresh Voltron and update the calendar channel")
+        @self.tree.command(name="calendar-refresh", description="Leadership: refresh tournament data and update the calendar")
         async def calendar_refresh(interaction: discord.Interaction) -> None:
             if not await self._require_leadership(interaction):
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
-            changed, status = await self._refresh_voltron(
+            changed, status = await self._refresh_calendar(
                 force=True,
                 actor=str(interaction.user),
                 refresh_akurier=True,
@@ -2374,27 +2389,27 @@ class OZYAdminBot(discord.Client):
                 await interaction.followup.send(f"Refresh failed: {status}", ephemeral=True)
             else:
                 await interaction.followup.send(
-                    "Voltron calendar refreshed. " + ("Discord calendar updated." if changed else "No event changes detected."),
+                    "Tournament calendar refreshed. " + ("Discord calendar updated." if changed else "No event changes detected."),
                     ephemeral=True,
                 )
 
-        @self.tree.command(name="calendar-status", description="Leadership: show Voltron calendar integration status")
+        @self.tree.command(name="calendar-status", description="Leadership: show tournament calendar integration status")
         async def calendar_status(interaction: discord.Interaction) -> None:
             if not await self._require_leadership(interaction):
                 return
-            snapshot = self.voltron.snapshot if self.voltron else None
-            last_success = self.voltron.last_success_utc if self.voltron else None
-            last_error = self.voltron.last_error if self.voltron else "client unavailable"
+            snapshot = self.calendar_client.snapshot if self.calendar_client else None
+            last_success = self.calendar_client.last_success_utc if self.calendar_client else None
+            last_error = self.calendar_client.last_error if self.calendar_client else "client unavailable"
             lines = [
-                f"Enabled: **{self.settings.voltron_calendar_enabled}**",
-                f"Realm: **{self.settings.voltron_realm}**",
-                "Voltron probes: **00:30, 06:30, 12:30, 18:30 UTC**",
-                "Akurier mini-events: **18:00 UTC / R+1, once daily**",
+                f"Enabled: **{self.settings.calendar_enabled}**",
+                f"Realm: **{self.settings.calendar_realm}**",
+                "Tournament-source probes: **00:30, 06:30, 12:30, 18:30 UTC**",
+                "Mini-event source: **18:00 UTC / R+1, once daily**",
                 f"Cached actions: **{len(snapshot.actions) if snapshot else 0}**",
                 f"Cached mini tournaments: **{len(snapshot.mini_tournaments) if snapshot else 0}**",
-                f"Source last synced: **{self.voltron.last_meta_utc.isoformat() if self.voltron and self.voltron.last_meta_utc else 'unknown'}**",
-                f"Last metadata check: **{self.voltron.last_meta_checked_utc.isoformat() if self.voltron and self.voltron.last_meta_checked_utc else 'never'}**",
-                f"Last Akurier success: **{self.voltron.last_akurier_success_utc.isoformat() if self.voltron and self.voltron.last_akurier_success_utc else 'never'}**",
+                f"Source last synced: **{self.calendar_client.last_meta_utc.isoformat() if self.calendar_client and self.calendar_client.last_meta_utc else 'unknown'}**",
+                f"Last metadata check: **{self.calendar_client.last_meta_checked_utc.isoformat() if self.calendar_client and self.calendar_client.last_meta_checked_utc else 'never'}**",
+                f"Last mini-event refresh: **{self.calendar_client.last_akurier_success_utc.isoformat() if self.calendar_client and self.calendar_client.last_akurier_success_utc else 'never'}**",
                 f"Last successful calendar fetch/probe: **{last_success.isoformat() if last_success else 'never'}**",
                 f"Last error: **{last_error or 'none'}**",
             ]

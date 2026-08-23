@@ -4,7 +4,8 @@ from zoneinfo import ZoneInfo
 from event_calendar import (
     build_calendar_chunks,
     build_today_chunks,
-    parse_voltron_calendar_html,
+    game_day_for_instant,
+    parse_tournament_calendar_html,
     reset_label,
     build_today_local_chunks,
     parse_akurier_mini_events_html,
@@ -41,7 +42,7 @@ HTML = r'''
 
 
 def snapshot():
-    return parse_voltron_calendar_html(
+    return parse_tournament_calendar_html(
         HTML,
         reference=datetime(2026, 8, 21, 22, 0, tzinfo=timezone.utc),
     )
@@ -89,7 +90,7 @@ def test_calendar_only_lists_starts():
     assert "```\nFri 21 Aug" in joined
     assert "```\nSat 22 Aug" in joined
     assert "Times display in each member's Discord timezone" not in joined
-    assert "nexusportal.voltron.me" not in joined
+    assert "Source:" not in joined
     assert "R+0 Ragnarök" in joined
     assert "ends" not in joined
     assert "Mini Events" in joined
@@ -108,11 +109,11 @@ def test_today_includes_major_actions_and_minis():
     assert "Starts today" in joined
     assert "Ragnarök" in joined
     assert "Summon Mastery" in joined
-    assert "Mini Events" in joined
-    assert "Hammer and Anvil" in joined
+    assert "Mini Events" not in joined
+    assert "Hammer and Anvil" not in joined
     assert joined.startswith("```\nOZY Today")
     assert "Times display in each member's Discord timezone" not in joined
-    assert "nexusportal.voltron.me" not in joined
+    assert "Source:" not in joined
 
 
 def test_semantic_hash_is_stable_for_same_html():
@@ -128,7 +129,7 @@ def test_calendar_chunking_stays_under_discord_limit():
             f'<div class="vl-cal__row" data-utc="2026-08-22T{(i % 24):02d}:00:00Z">'
             f'<span>{(i % 24):02d}:00 UTC STARTS</span><div>Very Long Tournament Name {i} ' + ('X' * 40) + '</div></div>'
         )
-    snap = parse_voltron_calendar_html('<div id="vl-cal-timeline">' + ''.join(rows) + '</div>')
+    snap = parse_tournament_calendar_html('<div id="vl-cal-timeline">' + ''.join(rows) + '</div>')
     chunks = build_calendar_chunks(
         snap,
         start_date=date(2026, 8, 21),
@@ -159,7 +160,7 @@ def test_local_time_view_is_timezone_specific_and_start_only():
     joined = "\n".join(chunks)
     assert "OZY Today - Argentina" in joined
     assert "14:00 Ragnarök" in joined
-    assert "22:00 Hammer and Anvil" in joined
+    assert "Hammer and Anvil" not in joined
     assert "01:00" not in joined
     assert "ends" not in joined
 
@@ -178,13 +179,52 @@ AKURIER_HTML = r'''<html><body>
 </body></html>'''
 
 
-def test_akurier_regular_events_only_and_warsaw_to_utc_conversion():
+def test_mini_event_source_times_are_already_utc():
     events = parse_akurier_mini_events_html(AKURIER_HTML)
     assert [e.title for e in events] == ["Tar Mastery", "Gold Rush", "Battle Training"]
-    # Warsaw is UTC+2 on 22 Aug 2026.
-    assert events[0].start_utc.isoformat() == "2026-08-22T08:00:00+00:00"
-    assert events[1].start_utc.isoformat() == "2026-08-22T15:00:00+00:00"
-    assert events[2].start_utc.isoformat() == "2026-08-22T23:30:00+00:00"
+    assert events[0].start_utc.isoformat() == "2026-08-22T10:00:00+00:00"
+    assert events[1].start_utc.isoformat() == "2026-08-22T17:00:00+00:00"
+    assert events[2].start_utc.isoformat() == "2026-08-23T01:30:00+00:00"
+    assert events[0].bonus == "+10% crypt efficiency"
     assert all("SK" not in e.title for e in events)
-    assert reset_label(events[1].start_utc) == "R-2"
-    assert reset_label(events[2].start_utc) == "R+6.5"
+    assert reset_label(events[1].start_utc) == "R+0"
+    assert reset_label(events[2].start_utc) == "R+8.5"
+
+
+RESET_WINDOW_MINIS = r'''<html><body><table>
+<tr><th>Start date:</th><th>Time</th><th>Event</th><th>Time till start</th><th>Bonus</th></tr>
+<tr><td>23.08.2026</td><td>17:00</td><td>Crypt Raiders</td><td>started</td><td>+10% crypt efficiency</td></tr>
+<tr><td>23.08.2026</td><td>22:00</td><td>Blessing of the Good</td><td>02:44</td><td>+10% health</td></tr>
+<tr><td>24.08.2026</td><td>03:00</td><td>The Quest for Chests</td><td>07:44</td><td>+35% all RS prod.</td></tr>
+<tr><td>24.08.2026</td><td>05:00</td><td>Power Points</td><td>09:44</td><td>+35% all RS prod.</td></tr>
+<tr><td>24.08.2026</td><td>08:30</td><td>Castle Development</td><td>13:14</td><td>+10% constr. speed</td></tr>
+<tr><td>24.08.2026</td><td>12:00</td><td>Officer Academy</td><td>16:44</td><td>+10% strength</td></tr>
+<tr><td>24.08.2026</td><td>17:00</td><td>Capital Challenge</td><td>21:44</td><td>+50% RS gather. speed</td></tr>
+<tr><td>24.08.2026</td><td>19:00</td><td>The King's Mercy</td><td>23:44</td><td>+10% health</td></tr>
+</table></body></html>'''
+
+
+def test_today_mini_events_use_reset_to_reset_window():
+    snap = snapshot()
+    minis = parse_akurier_mini_events_html(RESET_WINDOW_MINIS)
+    snap = snap.__class__(
+        actions=snap.actions,
+        mini_tournaments=tuple(minis),
+        semantic_hash=snap.semantic_hash,
+        last_synced_utc=snap.last_synced_utc,
+        fetched_at_utc=snap.fetched_at_utc,
+    )
+    joined = "\n".join(build_today_chunks(snap, target_date=date(2026, 8, 23)))
+    assert "R+0 Crypt Raiders - +10% crypt efficiency" in joined
+    assert "R+5 Blessing of the Good - +10% health" in joined
+    assert "R+10 The Quest for Chests" in joined
+    assert "R+12 Power Points" in joined
+    assert "R-8.5 Castle Development" in joined
+    assert "R-5 Officer Academy" in joined
+    assert "Capital Challenge" not in joined  # exactly next R+0 belongs to next game day
+    assert "The King's Mercy" not in joined
+
+
+def test_game_day_rolls_at_1700_utc():
+    assert game_day_for_instant(datetime(2026, 8, 23, 16, 59, tzinfo=timezone.utc)) == date(2026, 8, 22)
+    assert game_day_for_instant(datetime(2026, 8, 23, 17, 0, tzinfo=timezone.utc)) == date(2026, 8, 23)

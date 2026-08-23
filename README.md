@@ -1,6 +1,6 @@
 # OZY Admin Bot
 
-See `CALENDAR_SETUP.md` for the Voltron/Discord calendar deployment walkthrough.
+See `CALENDAR_SETUP.md` for the tournament-calendar deployment walkthrough.
 
 A separate, least-privilege Discord operations bot for the OZY Total Battle clan.
 
@@ -102,40 +102,35 @@ The Discord announcement is posted to `ANNOUNCEMENT_CHANNEL_ID`. If TB text is s
 
 The schedule can come from `SCHEDULE_URL` or `SCHEDULE_FILE`.
 
-### Voltron tournament calendar
+### Tournament calendar
 
-OZY Admin can consume Voltron's public Total Battle calendar directly:
-
-```text
-https://nexusportal.voltron.me/api/calendar/content?realm=Regular
-```
-
-No Voltron login, cookie, personal account token, browser automation, or SignalR client is required. Automatic checks use Voltron's lightweight `snapshot-meta` endpoint first. Once a good snapshot exists, a temporary metadata failure keeps the cache instead of triggering an unnecessary full-content download.
+OZY Admin reads the configured tournament calendar source through `CALENDAR_BASE_URL`. The source is treated as read-only. No account login, browser cookie, personal token, browser automation, or websocket client is required. Automatic checks read lightweight metadata first and download full content only when needed.
 
 Behavior:
 
 - `CALENDAR_CHANNEL_ID` holds a rolling **30-day tournament calendar**.
-- The calendar is a small canonical message series that is **edited in place**, not reposted on every refresh.
-- The 30-day view lists tournament **STARTS** only so the channel remains readable.
-- `TODAY_CHANNEL_ID` gets one canonical daily post.
-- Today's post includes **starts, active/continues, ends, and regular mini events** for that UTC game date.
-- If Voltron changes after today's message was posted, OZY Admin edits the existing message instead of adding another one.
-- Repeated reactions/restarts are irrelevant; canonical message IDs are stored in SQLite and can also be recovered by scanning recent bot messages if Render loses the local database.
-- Tournament source times are parsed as UTC. Public calendar/today posts use the Total Battle reset clock: **17:00 UTC = R+0**. Fractional offsets such as `R+1.5` are supported.
-- Regular mini events are read from `https://akurier.pl/events` **once per UTC day at 18:00 (R+1)**; the separate **for SK below** table is intentionally ignored. Akurier clock values are interpreted as `Europe/Warsaw` and converted to UTC before reset-clock formatting.
-- `/time` gives the requesting member an **ephemeral** local-time version of today's schedule for a selected timezone. Discord does not expose a member's country/timezone to the bot, so this is user-selected.
-- The parser rejects suspiciously empty snapshots instead of wiping the existing Discord calendar.
-- If Voltron is temporarily unavailable, the last good Discord calendar remains untouched.
+- Every calendar day is rendered as its **own triple-backtick block**, so a single day can be copied cleanly into Total Battle chat.
+- The calendar is a canonical message series that is **edited in place**, not reposted on every refresh.
+- The 30-day view lists tournament **STARTS** plus the regular mini-event schedule.
+- `TODAY_CHANNEL_ID` gets one canonical post for the current **Total Battle game day**.
+- A game day runs from **R+0 at 17:00 UTC through, but not including, the next R+0**. It is not midnight-to-midnight.
+- Today's post includes tournament starts, continues, ends, and **all regular mini events inside that reset-to-reset window**, including events after UTC midnight.
+- The canonical Today post rolls at **17:00 UTC / R+0**.
+- Regular mini-event `Start date` and `Time` values are parsed as **UTC exactly as published**. No extra timezone conversion is applied.
+- Mini-event bonuses are preserved in the Today output when available.
+- `/time` gives the requesting member an ephemeral local-time version of the same reset-to-reset game day.
+- Suspiciously empty source snapshots are rejected instead of wiping the existing Discord calendar.
+- If the tournament source is temporarily unavailable, the last good Discord calendar remains untouched.
 
 Commands:
 
-- `/calendar` - view the rolling calendar on demand.
-- `/today` - view today's tournament activity on demand.
+- `/calendar` - view the rolling 30-day calendar on demand.
+- `/today` - view the current reset-to-reset game day.
 - `/calendar-refresh` - leadership-only forced refresh/update.
 - `/calendar-status` - leadership diagnostics.
-- `/time` - private local-time conversion of today's game schedule.
+- `/time` - private local-time conversion of the current game day.
 
-Automatic Voltron traffic is deliberately sparse while the source cadence is being learned: lightweight metadata probes run at **00:30, 06:30, 12:30 and 18:30 UTC**. Full calendar content is downloaded only on startup, when `snapshot-meta` changes, or when leadership explicitly runs `/calendar-refresh`. Source timestamp changes are logged so the probe schedule can later be reduced to one check roughly 20-30 minutes after Voltron's normal refresh.
+Automatic source traffic is deliberately sparse: lightweight metadata probes run at **00:30, 06:30, 12:30 and 18:30 UTC**. Full calendar content is downloaded on startup, when source metadata changes, or when leadership explicitly runs `/calendar-refresh`. The regular mini-event table is refreshed once per UTC day at **18:00 UTC / R+1**.
 
 ### Audit log
 
@@ -160,13 +155,13 @@ Administrative actions can be written to `AUDIT_CHANNEL_ID`, including:
 | `/away` | Everyone | Register absence |
 | `/back` | Everyone | Clear absence |
 | `/schedule` | Everyone | View today's OZY-specific schedule |
-| `/calendar` | Everyone | View the next 30 days of Voltron tournament starts |
-| `/today` | Everyone | View today's Voltron tournament activity |
+| `/calendar` | Everyone | View the next 30 days of OZY tournament starts |
+| `/today` | Everyone | View the current reset-to-reset OZY game day |
 | `/event-create` | Leadership | Create a Discord scheduled event using category + voice-channel selectors and reset time |
 | `/announce` | Leadership | Open announcement modal |
 | `/schedule-post` | Leadership | Force-post today's OZY-specific schedule |
-| `/calendar-refresh` | Leadership | Force Voltron refresh and update Discord |
-| `/calendar-status` | Leadership | Show Voltron source/cache health |
+| `/calendar-refresh` | Leadership | Force tournament-source refresh and update Discord |
+| `/calendar-status` | Leadership | Show tournament source/cache health |
 | `/member-link` | Leadership | Approve/link a Discord member to roster |
 | `/pending-verifications` | Leadership | Review pending roster-link requests |
 | `/sync-roles` | Leadership | Preview/apply rank role sync for approved links |
@@ -233,11 +228,11 @@ AWAY_ROLE_ID=...
 ROSTER_URL=...
 CHEST_DATA_URL=...
 SCHEDULE_URL=...
-VOLTRON_CALENDAR_ENABLED=true
-VOLTRON_REALM=Regular
-VOLTRON_CALENDAR_DAYS=30
-VOLTRON_TODAY_ENABLED=true
-VOLTRON_TODAY_TIME=08:00
+CALENDAR_ENABLED=true
+CALENDAR_BASE_URL=...
+CALENDAR_REALM=Regular
+CALENDAR_DAYS=30
+TODAY_ENABLED=true
 ```
 
 ## Roster data

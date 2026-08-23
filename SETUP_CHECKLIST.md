@@ -107,23 +107,21 @@ DAILY_SCHEDULE_TIME=08:00
 
 CALENDAR_CHANNEL_ID=...
 TODAY_CHANNEL_ID=...
-VOLTRON_CALENDAR_ENABLED=true
-VOLTRON_REALM=Regular
-VOLTRON_CALENDAR_DAYS=30
-VOLTRON_TODAY_ENABLED=true
-VOLTRON_TODAY_TIME=08:00
+CALENDAR_ENABLED=true
+CALENDAR_BASE_URL=...
+CALENDAR_REALM=Regular
+CALENDAR_DAYS=30
+TODAY_ENABLED=true
 
 TRUST_EXACT_DISPLAY_NAME=false
 AUTO_SYNC_NICKNAME=false
 ```
 
-The Voltron integration does not require a Voltron login, cookie, SignalR connection,
-or personal account token. It uses the public calendar endpoints exposed by the site.
-Automatic source traffic is intentionally sparse: four lightweight metadata probes per UTC
-day while the source cadence is learned, full content only when metadata changes, and one
-Akurier mini-event fetch per day at 18:00 UTC (R+1).
-The 30-day calendar lists tournament STARTS; the daily post includes starts, continues,
-ends, and the mini-tournament schedule for that day.
+The tournament integration does not require a source-site login, cookie, websocket connection,
+or personal account token. Automatic traffic is intentionally sparse: four lightweight metadata
+probes per UTC day, full content only when metadata changes, and one regular mini-event refresh
+per day at 18:00 UTC (R+1). The 30-day calendar uses copyable day blocks. `OZY Today` runs
+reset-to-reset from 17:00 UTC through the next 17:00 UTC and includes every mini event in that window.
 
 Start command:
 

@@ -1,0 +1,12 @@
+Required neutral tournament-calendar variables for Render:
+
+CALENDAR_ENABLED=true
+CALENDAR_BASE_URL=<use the same calendar source base URL you already use>
+CALENDAR_REALM=Regular
+CALENDAR_REFRESH_MINUTES=30
+CALENDAR_DAYS=30
+TODAY_ENABLED=true
+CALENDAR_MIN_ACTIONS=10
+
+OZY Today now rolls automatically at R+0 = 17:00 UTC.
+There is no separate Today posting-time variable anymore.

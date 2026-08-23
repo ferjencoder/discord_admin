@@ -1,22 +1,22 @@
-# OZY Admin - Voltron Calendar Setup
+# OZY Admin - Tournament Calendar Setup
 
 ## What this integration does
 
-OZY Admin reads Voltron's public Total Battle tournament calendar and maintains two Discord outputs:
+OZY Admin maintains two Discord outputs from a configured read-only tournament calendar source:
 
 - `CALENDAR_CHANNEL_ID`: rolling next-30-days tournament calendar.
-- `TODAY_CHANNEL_ID`: one daily "OZY Today" post with today's tournament activity.
+- `TODAY_CHANNEL_ID`: one canonical `OZY Today` post for the current Total Battle game day.
 
-The bot does **not** need a Voltron login, browser cookie, account token, or SignalR/WebSocket connection.
+The bot does not need a source-site login, browser cookie, personal account token, browser automation, or websocket client.
 
-Source endpoints:
+The source base URL is supplied through `CALENDAR_BASE_URL`. The bot reads:
 
 ```text
-https://nexusportal.voltron.me/api/calendar/snapshot-meta?realm=Regular
-https://nexusportal.voltron.me/api/calendar/content?realm=Regular
+/api/calendar/snapshot-meta?realm=Regular
+/api/calendar/content?realm=Regular
 ```
 
-The lightweight `snapshot-meta` request is used for automatic change detection. After a good snapshot exists, a temporary metadata failure keeps the cached calendar and does **not** trigger a full download. Full content is fetched on startup, when metadata changes, or on an explicit leadership refresh.
+The lightweight metadata request is used for automatic change detection. After a good snapshot exists, a temporary metadata failure keeps the cached calendar and does not trigger an unnecessary full download.
 
 ## Discord channels
 
@@ -27,91 +27,86 @@ Create or choose two normal text channels, for example:
 #today
 ```
 
-Copy each channel ID and add it to Render:
+Add the IDs to Render:
 
 ```env
 CALENDAR_CHANNEL_ID=123456789012345678
 TODAY_CHANNEL_ID=234567890123456789
 ```
 
-OZY Admin needs these permissions in both channels:
+OZY Admin needs in both channels:
 
 - View Channel
 - Send Messages
 - Read Message History
 
-`Read Message History` is important because the bot recovers its canonical posts after a restart and edits them instead of creating duplicates.
-
-It does not need Manage Messages for this feature.
+`Read Message History` is required so the bot can recover its canonical posts after a restart and edit them instead of creating duplicates.
 
 ## Render variables
 
-Recommended initial configuration:
-
 ```env
-VOLTRON_CALENDAR_ENABLED=true
-VOLTRON_BASE_URL=https://nexusportal.voltron.me
-VOLTRON_REALM=Regular
-VOLTRON_CALENDAR_DAYS=30
-VOLTRON_TODAY_ENABLED=true
-VOLTRON_TODAY_TIME=08:00
-VOLTRON_MIN_ACTIONS=10
+CALENDAR_ENABLED=true
+CALENDAR_BASE_URL=<calendar source base URL>
+CALENDAR_REALM=Regular
+CALENDAR_DAYS=30
+TODAY_ENABLED=true
+CALENDAR_MIN_ACTIONS=10
 ```
 
-Public Voltron calendar/today output uses **UTC game dates** and Total Battle reset-clock notation:
+`OZY Today` is not scheduled by civil midnight. It rolls automatically at the Total Battle reset:
 
-- `17:00 UTC = R+0`
-- `18:00 UTC = R+1`
-- `18:30 UTC = R+1.5`
-- `14:00 UTC = R-3`
-
-`SCHEDULE_TIMEZONE` still controls when the automatic daily posting job runs:
-
-```env
-SCHEDULE_TIMEZONE=America/Argentina/Buenos_Aires
+```text
+17:00 UTC = R+0
 ```
 
-Regular mini events are fetched from `https://akurier.pl/events` **once daily at 18:00 UTC (R+1)**. Its clock is interpreted using `Europe/Warsaw` so CET/CEST daylight-saving changes are converted correctly to UTC. The separate **for SK below** table is ignored until SK support is intentionally enabled.
+The current game day is the half-open interval:
 
-Members can run `/time` and choose a timezone such as Argentina. The response is ephemeral, so only the requesting member sees the converted local schedule. Discord does not expose a member's timezone/country automatically.
+```text
+[today R+0, tomorrow R+0)
+```
 
-If you prefer the daily post shortly after Total Battle reset, set `VOLTRON_TODAY_TIME` to the desired local time in `SCHEDULE_TIMEZONE`.
+So an event at exactly tomorrow's R+0 belongs to the next game day.
 
 ## Calendar channel behavior
 
-The calendar channel is intentionally low-noise.
-
 - Shows the next 30 days.
-- Lists tournament `STARTS` grouped by date.
-- Shows the **start only** using reset-clock notation; ending times are intentionally omitted.
-- Uses a small message series only when needed to stay below Discord's 2,000-character message limit.
+- Lists tournament starts and regular mini events.
+- Uses Total Battle reset-clock notation.
+- **Every day is its own triple-backtick code block** for clean copy/paste.
+- Uses multiple Discord messages only when necessary to stay below the 2,000-character limit.
 - Existing messages are edited in place.
 - Old extra chunks are removed when the calendar becomes shorter.
-- The rolling window advances automatically when the configured local date changes, even if Voltron's underlying snapshot did not change.
+
+Example structure:
+
+````text
+OZY Tournament Calendar - Next 30 Days
+
+```
+Sun 23 Aug
+- R+0 Ancients' Treasure
+- R+0 Ruthless Slaughter
+```
+
+```
+Mon 24 Aug
+- R+0 Clash for the Throne
+- R+0 Conquerors' Revival
+```
+````
 
 ## Today channel behavior
 
-One canonical post is created per day and contains:
+One canonical post is created for each Total Battle game day and contains:
 
-- tournaments starting today;
-- multi-day tournaments continuing today;
-- tournaments ending today;
-- mini tournaments scheduled today.
+- tournament starts in the reset-to-reset window;
+- multi-day tournament continue markers in the window;
+- tournament end markers in the window;
+- **all regular mini events from the current R+0 until the next R+0**.
 
-If Voltron changes the schedule later the same day, the existing daily post is edited rather than duplicated.
+Mini-event source times are already UTC and are parsed as UTC exactly as published. The parser ignores the dynamic `Time till start` column and keeps the `Bonus` column when present. The separate `for SK below` section remains ignored.
 
-## Failure behavior
-
-The bot is deliberately fail-safe:
-
-- A Voltron HTTP failure does not clear Discord messages.
-- A suspicious parse returning fewer than `VOLTRON_MIN_ACTIONS` is rejected.
-- The last in-memory good snapshot is retained when a refresh fails.
-- Calendar messages are recoverable from Discord history even when Render loses the ephemeral SQLite file.
-- Voltron receives only four lightweight metadata probes per UTC day while its real refresh cadence is being learned: 00:30, 06:30, 12:30 and 18:30 UTC.
-- Full Voltron content is fetched only on startup, when the source timestamp changes, or after an explicit leadership refresh.
-- Akurier receives one regular mini-event page fetch per UTC day at R+1.
-- Source timestamp changes are logged so the final Voltron schedule can be reduced to a single check 20-30 minutes after its normal update.
+If source data changes later in the same game day, the existing Today message is edited rather than duplicated.
 
 ## Commands
 
@@ -120,6 +115,7 @@ Everyone:
 ```text
 /calendar
 /today
+/time
 ```
 
 Leadership:
@@ -127,17 +123,17 @@ Leadership:
 ```text
 /calendar-refresh
 /calendar-status
+/event-create
 ```
-
-Use `/calendar-status` first after deployment. It should show cached actions and a recent successful fetch.
 
 ## First deployment test
 
-1. Deploy OZY Admin with the two channel IDs and Voltron variables.
-2. Run `/calendar-status`.
-3. Run `/calendar-refresh`.
-4. Confirm `#calendar` receives the rolling 30-day calendar.
-5. Run `/today` and compare it with Voltron's website.
-6. Run `/calendar-refresh` again and confirm it edits the existing calendar messages rather than creating duplicates.
-7. Restart the Render service.
-8. Run `/calendar-refresh` again and confirm the bot recovers the old calendar messages from Discord history.
+1. Deploy OZY Admin with `CALENDAR_BASE_URL`, `CALENDAR_CHANNEL_ID`, and `TODAY_CHANNEL_ID`.
+2. Confirm Render startup logs say `event-create` was included in the synchronized command list.
+3. Run `/calendar-status`.
+4. Run `/calendar-refresh`.
+5. Confirm `#calendar` uses one copyable code block per day.
+6. Run `/today`.
+7. Confirm mini events include post-midnight UTC events until the next R+0.
+8. Run `/event-create` and create a test Discord scheduled event.
+9. Restart the Render service and confirm the canonical calendar/Today messages are recovered and edited rather than duplicated.

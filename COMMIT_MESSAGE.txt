@@ -1,1 +1,1 @@
-refactor: rename calendar module for multi-source support
+fix: sync event creation and make calendar reset-aware

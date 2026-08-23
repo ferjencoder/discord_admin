@@ -167,14 +167,13 @@ class Settings:
     chest_report_chunk_size: int
     roster_access_sync_minutes: int
 
-    voltron_calendar_enabled: bool
-    voltron_base_url: str
-    voltron_realm: str
-    voltron_refresh_minutes: int
-    voltron_calendar_days: int
-    voltron_today_time: str
-    voltron_today_enabled: bool
-    voltron_min_actions: int
+    calendar_enabled: bool
+    calendar_base_url: str
+    calendar_realm: str
+    calendar_refresh_minutes: int
+    calendar_days: int
+    today_enabled: bool
+    calendar_min_actions: int
 
     trust_exact_display_name: bool
     auto_sync_nickname: bool
@@ -203,6 +202,10 @@ def load_settings() -> Settings:
         raise ConfigError(f"Unknown SCHEDULE_TIMEZONE: {timezone_name}") from exc
 
     render_external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip() or None
+    calendar_enabled = _env_bool("CALENDAR_ENABLED", True)
+    calendar_base_url = os.getenv("CALENDAR_BASE_URL", "").strip().rstrip("/")
+    if calendar_enabled and not calendar_base_url:
+        raise ConfigError("CALENDAR_BASE_URL is required when CALENDAR_ENABLED=true")
 
     return Settings(
         discord_token=token,
@@ -255,17 +258,13 @@ def load_settings() -> Settings:
         chest_report_chunk_size=_env_int("CHEST_REPORT_CHUNK_SIZE", 20, 1),
         roster_access_sync_minutes=_env_int("ROSTER_ACCESS_SYNC_MINUTES", 10, 1),
 
-        voltron_calendar_enabled=_env_bool("VOLTRON_CALENDAR_ENABLED", True),
-        voltron_base_url=os.getenv("VOLTRON_BASE_URL", "https://nexusportal.voltron.me").strip().rstrip("/"),
-        voltron_realm=os.getenv("VOLTRON_REALM", "Regular").strip() or "Regular",
-        voltron_refresh_minutes=_env_int("VOLTRON_REFRESH_MINUTES", 30, 5),
-        voltron_calendar_days=_env_int("VOLTRON_CALENDAR_DAYS", 30, 1),
-        voltron_today_time=_validate_hhmm(
-            "VOLTRON_TODAY_TIME",
-            os.getenv("VOLTRON_TODAY_TIME", "08:00").strip() or "08:00",
-        ),
-        voltron_today_enabled=_env_bool("VOLTRON_TODAY_ENABLED", True),
-        voltron_min_actions=_env_int("VOLTRON_MIN_ACTIONS", 10, 1),
+        calendar_enabled=calendar_enabled,
+        calendar_base_url=calendar_base_url,
+        calendar_realm=os.getenv("CALENDAR_REALM", "Regular").strip() or "Regular",
+        calendar_refresh_minutes=_env_int("CALENDAR_REFRESH_MINUTES", 30, 5),
+        calendar_days=_env_int("CALENDAR_DAYS", 30, 1),
+        today_enabled=_env_bool("TODAY_ENABLED", True),
+        calendar_min_actions=_env_int("CALENDAR_MIN_ACTIONS", 10, 1),
 
         trust_exact_display_name=_env_bool("TRUST_EXACT_DISPLAY_NAME", False),
         auto_sync_nickname=_env_bool("AUTO_SYNC_NICKNAME", False),
