@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import logging
+from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -18,13 +19,11 @@ from settings import ConfigError, Settings, load_settings
 from state import AdminState
 from utils import format_chat_directory, format_chest_ranking_blocks, format_schedule, safe_code_block, truncate
 from event_calendar import (
-    TournamentCalendarClient,
-    CalendarSourceError,
+    VoltronCalendarClient,
+    VoltronCalendarError,
     build_calendar_chunks,
     build_today_chunks,
     build_today_local_chunks,
-    game_day_bounds,
-    game_day_for_instant,
     reset_label,
 )
 
@@ -55,9 +54,9 @@ TIMEZONE_CHOICES = [
 ]
 
 # Minimal-impact source schedule. Public calendar metadata is checked only four
-# times per UTC day while we learn the tournament source's actual refresh cadence.
+# times per UTC day while we learn Voltron's actual source refresh cadence.
 # Akurier regular mini-events are fetched once daily at R+1 (18:00 UTC).
-CALENDAR_META_PROBE_TIMES_UTC = ((0, 30), (6, 30), (12, 30), (18, 30))
+VOLTRON_META_PROBE_TIMES_UTC = ((0, 30), (6, 30), (12, 30), (18, 30))
 AKURIER_REFRESH_TIME_UTC = (18, 0)
 
 
@@ -113,71 +112,251 @@ def _event_datetime_from_reset(date_value: str, reset_value: str, *, now_utc: da
     if abs(raw_minutes - rounded_minutes) > 0.001 or rounded_minutes % 15 != 0:
         raise ValueError("Reset time must use 15-minute steps, for example R+1, R+1.5, or R-3.25.")
 
-    # The entered date is the date of R+0. Add the reset offset to that reset
-    # instant so late offsets correctly cross UTC midnight (for example R+10
-    # becomes 03:00 UTC on the following calendar date).
+    # The entered date is the date of R+0 itself. Build the reset instant first
+    # and then apply the offset so R+10 on 24 Aug correctly becomes 25 Aug 03:00
+    # UTC, while R-3 remains 24 Aug 14:00 UTC.
     reset_start = datetime.combine(target_date, dt_time(17, 0), tzinfo=timezone.utc)
     start = reset_start + timedelta(minutes=rounded_minutes)
     return start, reset_label(start)
 
 
-class EventDetailsModal(discord.ui.Modal):
-    def __init__(
-        self,
-        bot: "OZYAdminBot",
-        *,
-        creator_id: int,
-        voice_channel_id: int,
-        category_name: str,
-    ):
+
+@dataclass(slots=True)
+class EventDraft:
+    creator_id: int
+    category_id: int
+    event_channel_id: int
+    publish_channel_id: int
+    name: str
+    notes: str
+
+
+def _selected_channel_id(select: discord.ui.ChannelSelect) -> int | None:
+    values = list(select.values)
+    if not values:
+        return None
+    return int(values[0].id)
+
+
+def _resolve_server_channel(guild: discord.Guild, channel_id: int):
+    return guild.get_channel_or_thread(channel_id)
+
+
+def _channel_is_visible_to(channel, member: discord.Member) -> bool:
+    try:
+        return bool(channel.permissions_for(member).view_channel)
+    except (AttributeError, TypeError):
+        return False
+
+
+def _channel_display(channel) -> str:
+    mention = getattr(channel, 'mention', None)
+    if mention:
+        return mention
+    name = getattr(channel, 'name', None)
+    return f"#{name}" if name else str(channel)
+
+
+EVENT_CHANNEL_TYPES = [
+    discord.ChannelType.text,
+    discord.ChannelType.voice,
+    discord.ChannelType.news,
+    discord.ChannelType.public_thread,
+    discord.ChannelType.private_thread,
+    discord.ChannelType.news_thread,
+    discord.ChannelType.stage_voice,
+    discord.ChannelType.forum,
+    discord.ChannelType.media,
+]
+
+PUBLISH_CHANNEL_TYPES = [
+    discord.ChannelType.text,
+    discord.ChannelType.news,
+    discord.ChannelType.public_thread,
+    discord.ChannelType.private_thread,
+    discord.ChannelType.news_thread,
+]
+
+
+class EventSetupModal(discord.ui.Modal):
+    """First step of the event wizard: audience/location/content."""
+
+    def __init__(self, bot: "OZYAdminBot", *, creator_id: int):
         super().__init__(title="Create OZY Event", timeout=300)
         self.bot = bot
         self.creator_id = creator_id
-        self.voice_channel_id = voice_channel_id
-        self.category_name = category_name
 
+        self.category_select = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.category],
+            placeholder="Select category",
+            min_values=1,
+            max_values=1,
+            required=True,
+        )
+        self.event_channel_select = discord.ui.ChannelSelect(
+            channel_types=EVENT_CHANNEL_TYPES,
+            placeholder="Select event channel / location",
+            min_values=1,
+            max_values=1,
+            required=True,
+        )
+        self.publish_channel_select = discord.ui.ChannelSelect(
+            channel_types=PUBLISH_CHANNEL_TYPES,
+            placeholder="Select where OZY Admin should publish it",
+            min_values=1,
+            max_values=1,
+            required=True,
+        )
         self.event_name = discord.ui.TextInput(
-            label="Event name",
             placeholder="Leadership Meeting",
             max_length=100,
         )
-        self.event_date = discord.ui.TextInput(
-            label="R+0 reset date",
-            placeholder="tomorrow or 2026-08-24",
-            max_length=20,
-        )
-        self.reset_time = discord.ui.TextInput(
-            label="Game reset time",
-            placeholder="R+4",
-            max_length=10,
-        )
-        self.duration = discord.ui.TextInput(
-            label="Duration in minutes",
-            default="60",
-            required=True,
-            max_length=4,
-        )
         self.notes = discord.ui.TextInput(
-            label="Description / notes (optional)",
-            placeholder="Leadership meeting in voice.",
+            placeholder="Previous notes, agenda, topics to discuss...",
             style=discord.TextStyle.paragraph,
             required=False,
             max_length=800,
         )
-        for item in (self.event_name, self.event_date, self.reset_time, self.duration, self.notes):
-            self.add_item(item)
+
+        self.add_item(discord.ui.Label(text="Category", component=self.category_select))
+        self.add_item(discord.ui.Label(text="Event channel / location", component=self.event_channel_select))
+        self.add_item(discord.ui.Label(text="Publish event in", component=self.publish_channel_select))
+        self.add_item(discord.ui.Label(text="Event name", component=self.event_name))
+        self.add_item(discord.ui.Label(text="Description / agenda / notes", component=self.notes))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.creator_id:
             await interaction.response.send_message("This event builder belongs to another member.", ephemeral=True)
             return
         guild = interaction.guild
-        if guild is None:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if guild is None or member is None:
             await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
             return
-        channel = guild.get_channel(self.voice_channel_id)
-        if not isinstance(channel, discord.VoiceChannel):
-            await interaction.response.send_message("The selected voice channel is no longer available.", ephemeral=True)
+
+        category_id = _selected_channel_id(self.category_select)
+        event_channel_id = _selected_channel_id(self.event_channel_select)
+        publish_channel_id = _selected_channel_id(self.publish_channel_select)
+        if not category_id or not event_channel_id or not publish_channel_id:
+            await interaction.response.send_message("Select a category, event channel, and publish channel.", ephemeral=True)
+            return
+
+        category = guild.get_channel(category_id)
+        event_channel = _resolve_server_channel(guild, event_channel_id)
+        publish_channel = _resolve_server_channel(guild, publish_channel_id)
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message("The selected category is no longer available.", ephemeral=True)
+            return
+        if not _channel_is_visible_to(category, member):
+            await interaction.response.send_message("You cannot use that category because you do not have access to it.", ephemeral=True)
+            return
+        if event_channel is None:
+            await interaction.response.send_message("The selected event channel is no longer available.", ephemeral=True)
+            return
+        if publish_channel is None or not hasattr(publish_channel, "send"):
+            await interaction.response.send_message("Choose a text channel or thread where OZY Admin can publish the event.", ephemeral=True)
+            return
+
+        # Members can only target places they themselves can see. They do not need
+        # Send Messages in a read-only announcement channel because the bot performs
+        # the publication on their behalf.
+        for label, channel in (("event", event_channel), ("publish", publish_channel)):
+            if not _channel_is_visible_to(channel, member):
+                await interaction.response.send_message(
+                    f"You cannot use that {label} channel because you do not have access to it.",
+                    ephemeral=True,
+                )
+                return
+
+        me = guild.me
+        if me is None or not _channel_is_visible_to(publish_channel, me):
+            await interaction.response.send_message("OZY Admin cannot view the selected publish channel.", ephemeral=True)
+            return
+
+        name = str(self.event_name.value).strip()
+        if not name:
+            await interaction.response.send_message("Event name is required.", ephemeral=True)
+            return
+
+        draft = EventDraft(
+            creator_id=self.creator_id,
+            category_id=category.id,
+            event_channel_id=event_channel_id,
+            publish_channel_id=publish_channel_id,
+            name=name,
+            notes=str(self.notes.value or "").strip(),
+        )
+        view = EventScheduleView(self.bot, draft)
+        await interaction.response.send_message(
+            "Event details saved. Click **Set date & time** to finish.\n"
+            f"Category: **{category.name}**\n"
+            f"Event channel: {_channel_display(event_channel)}\n"
+            f"Publish in: {_channel_display(publish_channel)}",
+            view=view,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Event setup modal failed", exc_info=error)
+        if interaction.response.is_done():
+            await interaction.followup.send("Event setup failed. Check the admin-bot logs.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Event setup failed. Check the admin-bot logs.", ephemeral=True)
+
+
+class EventScheduleModal(discord.ui.Modal):
+    """Second step: reset date/time and duration, then create + publish."""
+
+    def __init__(self, bot: "OZYAdminBot", draft: EventDraft):
+        super().__init__(title="Schedule OZY Event", timeout=300)
+        self.bot = bot
+        self.draft = draft
+
+        self.event_date = discord.ui.TextInput(
+            placeholder="tomorrow or 2026-08-24",
+            max_length=20,
+        )
+        self.reset_time = discord.ui.TextInput(
+            placeholder="R+4",
+            max_length=10,
+        )
+        self.duration = discord.ui.TextInput(
+            default="60",
+            required=True,
+            max_length=4,
+        )
+        self.add_item(discord.ui.Label(
+            text="R+0 reset date",
+            description="The calendar date on which this game day starts at R+0.",
+            component=self.event_date,
+        ))
+        self.add_item(discord.ui.Label(text="Game reset time", component=self.reset_time))
+        self.add_item(discord.ui.Label(text="Duration in minutes", component=self.duration))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.draft.creator_id:
+            await interaction.response.send_message("This event builder belongs to another member.", ephemeral=True)
+            return
+        guild = interaction.guild
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if guild is None or member is None:
+            await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
+            return
+        if not await self.bot._require_event_creator(interaction):
+            return
+
+        category = guild.get_channel(self.draft.category_id)
+        event_channel = _resolve_server_channel(guild, self.draft.event_channel_id)
+        publish_channel = _resolve_server_channel(guild, self.draft.publish_channel_id)
+        if not isinstance(category, discord.CategoryChannel) or event_channel is None or publish_channel is None:
+            await interaction.response.send_message("A selected channel was removed. Run `/event-create` again.", ephemeral=True)
+            return
+        if not hasattr(publish_channel, "send"):
+            await interaction.response.send_message("The selected publish destination is not messageable.", ephemeral=True)
+            return
+        if not _channel_is_visible_to(event_channel, member) or not _channel_is_visible_to(publish_channel, member):
+            await interaction.response.send_message("Your access to one of the selected channels has changed.", ephemeral=True)
             return
 
         try:
@@ -191,42 +370,80 @@ class EventDetailsModal(discord.ui.Modal):
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
-        name = str(self.event_name.value).strip()
-        notes = str(self.notes.value or "").strip()
-        description_lines = [f"OZY time: {reset_text}"]
-        if notes:
-            description_lines.append(notes)
-        description = "\n\n".join(description_lines)[:1000]
-
         await interaction.response.defer(ephemeral=True, thinking=True)
+
+        description = self.draft.notes[:1000] or None
+        event_kwargs = dict(
+            name=self.draft.name,
+            start_time=start_time,
+            end_time=start_time + timedelta(minutes=duration_minutes),
+            privacy_level=discord.PrivacyLevel.guild_only,
+            description=description,
+            reason=f"OZY event created by {interaction.user}",
+        )
+        if isinstance(event_channel, (discord.VoiceChannel, discord.StageChannel)):
+            event_kwargs["channel"] = event_channel
+        else:
+            # Discord Scheduled Events only attach natively to voice/stage channels.
+            # Text/forum/thread/media selections are represented as an external
+            # location while still linking the selected channel in our announcement.
+            event_kwargs["location"] = f"#{getattr(event_channel, 'name', 'Discord channel')}"[:100]
+
         try:
-            event = await guild.create_scheduled_event(
-                name=name,
-                start_time=start_time,
-                end_time=start_time + timedelta(minutes=duration_minutes),
-                channel=channel,
-                privacy_level=discord.PrivacyLevel.guild_only,
-                description=description,
-                reason=f"OZY event created by {interaction.user}",
-            )
+            event = await guild.create_scheduled_event(**event_kwargs)
         except discord.Forbidden:
             await interaction.followup.send(
-                "I cannot create the Discord event. Give OZY Admin **Create Events**, plus **View Channel** and **Connect** on the selected voice channel.",
+                "I cannot create the Discord Scheduled Event. OZY Admin needs **Create Events / Manage Events** and access to the selected location.",
+                ephemeral=True,
+            )
+            return
+        except (discord.HTTPException, TypeError, ValueError) as exc:
+            await interaction.followup.send(f"Discord could not create the event: {exc}", ephemeral=True)
+            return
+
+        event_url = event.url
+        start_ts = int(start_time.timestamp())
+        embed = discord.Embed(
+            title=self.draft.name,
+            description=self.draft.notes or "No agenda or notes provided.",
+            color=0x5865F2,
+        )
+        embed.add_field(name="Game time", value=reset_text, inline=True)
+        embed.add_field(name="Starts", value=f"<t:{start_ts}:F>\n<t:{start_ts}:R>", inline=True)
+        embed.add_field(name="Duration", value=f"{duration_minutes} min", inline=True)
+        embed.add_field(name="Category", value=category.name, inline=True)
+        embed.add_field(name="Event channel", value=_channel_display(event_channel), inline=True)
+        embed.add_field(name="Created by", value=interaction.user.mention, inline=True)
+        embed.set_footer(text="OZY Event")
+
+        link_view = discord.ui.View(timeout=None)
+        link_view.add_item(discord.ui.Button(label="Open Discord Event", style=discord.ButtonStyle.link, url=event_url))
+
+        try:
+            published = await publish_channel.send(
+                embed=embed,
+                view=link_view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden:
+            # Keep the scheduled event and report only the publication failure.
+            await interaction.followup.send(
+                "The Discord event was created, but I cannot post in the selected publish channel. "
+                f"Event: {event_url}",
                 ephemeral=True,
             )
             return
         except discord.HTTPException as exc:
-            await interaction.followup.send(f"Discord could not create the event: {exc}", ephemeral=True)
+            await interaction.followup.send(
+                f"The Discord event was created, but publishing failed: {exc}\n{event_url}",
+                ephemeral=True,
+            )
             return
 
-        event_url = f"https://discord.com/events/{guild.id}/{event.id}"
         await interaction.followup.send(
-            "Event created.\n"
-            f"**{name}**\n"
-            f"Category: **{self.category_name}**\n"
-            f"Voice: {channel.mention}\n"
-            f"Game time: **{reset_text}**\n"
-            f"UTC: **{start_time.strftime('%Y-%m-%d %H:%M')}**\n"
+            "Event created and published.\n"
+            f"**{self.draft.name}** - **{reset_text}**\n"
+            f"Published in {_channel_display(publish_channel)}\n"
             f"{event_url}",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -234,98 +451,34 @@ class EventDetailsModal(discord.ui.Modal):
         await self.bot._audit(
             "Discord event created",
             str(interaction.user),
-            f"{name}\nCategory: {self.category_name}\nVoice: #{channel.name}\nStart: {start_time.isoformat()} ({reset_text})",
+            f"{self.draft.name}\n"
+            f"Category: {category.name}\n"
+            f"Event channel: #{getattr(event_channel, 'name', event_channel.id)}\n"
+            f"Published: #{getattr(publish_channel, 'name', publish_channel.id)} ({published.id})\n"
+            f"Start: {start_time.isoformat()} ({reset_text})",
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        log.exception("Event details modal failed", exc_info=error)
+        log.exception("Event schedule modal failed", exc_info=error)
         if interaction.response.is_done():
             await interaction.followup.send("Event creation failed. Check the admin-bot logs.", ephemeral=True)
         else:
             await interaction.response.send_message("Event creation failed. Check the admin-bot logs.", ephemeral=True)
 
 
-class EventVoiceSelect(discord.ui.Select):
-    def __init__(self, view: "EventLocationView", channels: list[discord.VoiceChannel]):
-        self.builder_view = view
-        options = [
-            discord.SelectOption(label=channel.name[:100], value=str(channel.id))
-            for channel in channels[:25]
-        ]
-        super().__init__(placeholder="2. Select voice channel", min_values=1, max_values=1, options=options)
+class EventScheduleButton(discord.ui.Button):
+    def __init__(self, parent_view: "EventScheduleView"):
+        super().__init__(label="Set date & time", style=discord.ButtonStyle.primary)
+        self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        self.builder_view.voice_channel_id = int(self.values[0])
-        self.builder_view.details_button.disabled = False
-        await interaction.response.edit_message(content=self.builder_view.content(), view=self.builder_view)
-
-
-class EventCategorySelect(discord.ui.Select):
-    def __init__(self, view: "EventLocationView", categories: list[discord.CategoryChannel]):
-        self.builder_view = view
-        options = []
-        for category in categories[:25]:
-            count = len([ch for ch in category.channels if isinstance(ch, discord.VoiceChannel)])
-            options.append(
-                discord.SelectOption(
-                    label=category.name[:100],
-                    value=str(category.id),
-                    description=f"{count} voice channel{'s' if count != 1 else ''}",
-                )
-            )
-        super().__init__(placeholder="1. Select category", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Guild unavailable.", ephemeral=True)
+        if interaction.user.id != self.parent_view.draft.creator_id:
+            await interaction.response.send_message("This event builder belongs to another member.", ephemeral=True)
             return
-        category = guild.get_channel(int(self.values[0]))
-        if not isinstance(category, discord.CategoryChannel):
-            await interaction.response.send_message("Category unavailable.", ephemeral=True)
-            return
-
-        me = guild.me
-        channels = [
-            ch for ch in category.channels
-            if isinstance(ch, discord.VoiceChannel)
-            and (me is None or (ch.permissions_for(me).view_channel and ch.permissions_for(me).connect))
-        ]
-        if not channels:
-            await interaction.response.send_message("That category has no voice channel OZY Admin can view and connect to.", ephemeral=True)
-            return
-
-        self.builder_view.category_id = category.id
-        self.builder_view.category_name = category.name
-        self.builder_view.voice_channel_id = None
-        self.builder_view.details_button.disabled = True
-        if self.builder_view.voice_select is not None:
-            self.builder_view.remove_item(self.builder_view.voice_select)
-        self.builder_view.voice_select = EventVoiceSelect(self.builder_view, channels)
-        self.builder_view.add_item(self.builder_view.voice_select)
-        await interaction.response.edit_message(content=self.builder_view.content(), view=self.builder_view)
+        await interaction.response.send_modal(EventScheduleModal(self.parent_view.bot, self.parent_view.draft))
 
 
-class EventDetailsButton(discord.ui.Button):
-    def __init__(self, view: "EventLocationView"):
-        super().__init__(label="Event details", style=discord.ButtonStyle.primary, disabled=True)
-        self.builder_view = view
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if not self.builder_view.voice_channel_id or not self.builder_view.category_name:
-            await interaction.response.send_message("Select a category and voice channel first.", ephemeral=True)
-            return
-        await interaction.response.send_modal(
-            EventDetailsModal(
-                self.builder_view.bot,
-                creator_id=self.builder_view.creator_id,
-                voice_channel_id=self.builder_view.voice_channel_id,
-                category_name=self.builder_view.category_name,
-            )
-        )
-
-
-class EventCancelButton(discord.ui.Button):
+class EventWizardCancelButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="Cancel", style=discord.ButtonStyle.secondary)
 
@@ -333,50 +486,16 @@ class EventCancelButton(discord.ui.Button):
         await interaction.response.edit_message(content="Event creation cancelled.", view=None)
 
 
-class EventLocationView(discord.ui.View):
-    def __init__(self, bot: "OZYAdminBot", interaction: discord.Interaction):
+class EventScheduleView(discord.ui.View):
+    def __init__(self, bot: "OZYAdminBot", draft: EventDraft):
         super().__init__(timeout=300)
         self.bot = bot
-        self.creator_id = interaction.user.id
-        self.category_id: int | None = None
-        self.category_name: str | None = None
-        self.voice_channel_id: int | None = None
-        self.voice_select: EventVoiceSelect | None = None
-
-        guild = interaction.guild
-        categories: list[discord.CategoryChannel] = []
-        if guild is not None:
-            me = guild.me
-            for category in guild.categories:
-                usable = [
-                    ch for ch in category.channels
-                    if isinstance(ch, discord.VoiceChannel)
-                    and (me is None or (ch.permissions_for(me).view_channel and ch.permissions_for(me).connect))
-                ]
-                if usable:
-                    categories.append(category)
-
-        self.category_select: EventCategorySelect | None = EventCategorySelect(self, categories) if categories else None
-        self.details_button = EventDetailsButton(self)
-        if self.category_select is not None:
-            self.add_item(self.category_select)
-        self.add_item(self.details_button)
-        self.add_item(EventCancelButton())
-
-    def content(self) -> str:
-        lines = [
-            "### Create Discord Event",
-            "Choose the category, then the voice channel inside it.",
-        ]
-        if self.category_name:
-            lines.append(f"Category: **{self.category_name}**")
-        if self.voice_channel_id:
-            lines.append(f"Voice: <#{self.voice_channel_id}>")
-        lines.append("Then click **Event details**. The date is the date of R+0; for example `tomorrow` + `R+4`.")
-        return "\n".join(lines)
+        self.draft = draft
+        self.add_item(EventScheduleButton(self))
+        self.add_item(EventWizardCancelButton())
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.creator_id:
+        if interaction.user.id == self.draft.creator_id:
             return True
         await interaction.response.send_message("This event builder belongs to another member.", ephemeral=True)
         return False
@@ -440,7 +559,7 @@ class OZYAdminBot(discord.Client):
 
         self.http_session: aiohttp.ClientSession | None = None
         self.data: DataProvider | None = None
-        self.calendar_client: TournamentCalendarClient | None = None
+        self.voltron: VoltronCalendarClient | None = None
         self.health_runner: web.AppRunner | None = None
         self.background_tasks: list[asyncio.Task] = []
         self._guild_validated = False
@@ -456,26 +575,14 @@ class OZYAdminBot(discord.Client):
         # in outbound read-only source requests.
         self.http_session = aiohttp.ClientSession()
         self.data = DataProvider(self.settings, self.http_session)
-        self.calendar_client = TournamentCalendarClient(self.settings, self.http_session)
+        self.voltron = VoltronCalendarClient(self.settings, self.http_session)
 
         await self._start_health_server()
 
         guild = discord.Object(id=self.settings.server_id)
         self.tree.copy_global_to(guild=guild)
         synced = await self.tree.sync(guild=guild)
-        synced_names = {command.name for command in synced}
-        required_commands = {"event-create", "calendar", "today", "time"}
-        missing_commands = sorted(required_commands - synced_names)
-        if missing_commands:
-            raise RuntimeError(
-                "Discord command sync is incomplete; missing: " + ", ".join(missing_commands)
-            )
-        log.info(
-            "Synced %d application commands to guild %s: %s",
-            len(synced),
-            self.settings.server_id,
-            ", ".join(sorted(synced_names)),
-        )
+        log.info("Synced %d application commands to guild %s", len(synced), self.settings.server_id)
 
         self.background_tasks.append(asyncio.create_task(self._daily_schedule_loop(), name="daily-schedule"))
         self.background_tasks.append(asyncio.create_task(self._away_expiry_loop(), name="away-expiry"))
@@ -488,11 +595,11 @@ class OZYAdminBot(discord.Client):
             or self.settings.special_access_role_id
         ):
             self.background_tasks.append(asyncio.create_task(self._roster_access_sync_loop(), name="roster-access-sync"))
-        if self.settings.calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
-            self.background_tasks.append(asyncio.create_task(self._calendar_refresh_loop(), name="calendar-refresh"))
+        if self.settings.voltron_calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
+            self.background_tasks.append(asyncio.create_task(self._voltron_refresh_loop(), name="voltron-refresh"))
             self.background_tasks.append(asyncio.create_task(self._akurier_refresh_loop(), name="akurier-refresh"))
-            if self.settings.today_enabled and self.settings.today_channel_id:
-                self.background_tasks.append(asyncio.create_task(self._today_loop(), name="ozy-today"))
+            if self.settings.voltron_today_enabled and self.settings.today_channel_id:
+                self.background_tasks.append(asyncio.create_task(self._voltron_today_loop(), name="voltron-today"))
 
         if self.settings.self_ping_enabled and self.settings.render_external_url:
             self.background_tasks.append(asyncio.create_task(self._self_ping_loop(), name="self-ping"))
@@ -677,6 +784,37 @@ class OZYAdminBot(discord.Client):
             await interaction.followup.send("Leadership only.", ephemeral=True)
         else:
             await interaction.response.send_message("Leadership only.", ephemeral=True)
+        return False
+
+    def _can_create_events(self, member: discord.Member | None) -> bool:
+        """Allow normal roster-gated members plus leadership/special-access users."""
+        if member is None:
+            return False
+        if self._is_leadership(member):
+            return True
+
+        role_ids = {role.id for role in member.roles}
+        if self.settings.special_access_role_id and self.settings.special_access_role_id in role_ids:
+            return True
+        if self.settings.verified_role_id:
+            return self.settings.verified_role_id in role_ids
+        if self.settings.unverified_role_id and self.settings.unverified_role_id in role_ids:
+            return False
+
+        # Backward-compatible fallback for servers that have not configured the
+        # roster access roles yet. Once VERIFIED_ROLE_ID is configured, that role
+        # becomes the normal-member gate for self-service event creation.
+        return True
+
+    async def _require_event_creator(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if self._can_create_events(member):
+            return True
+        message = "Verify your OZY membership before creating events."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
         return False
 
     async def _audit(self, action: str, actor: str, details: str) -> None:
@@ -1186,7 +1324,7 @@ class OZYAdminBot(discord.Client):
                 log.exception("Automatic R+0 chest ranking post failed")
 
     # ------------------------------------------------------------------
-    # Tournament calendar
+    # Voltron tournament calendar
     # ------------------------------------------------------------------
     def _state_message_ids(self, key: str) -> list[int]:
         raw = self.state.get_value(key)
@@ -1261,36 +1399,36 @@ class OZYAdminBot(discord.Client):
             self._save_message_ids(state_key, ids)
             return ids
 
-    async def _refresh_calendar(self, *, force: bool, actor: str, refresh_akurier: bool = False) -> tuple[bool, str]:
-        if not self.settings.calendar_enabled:
-            return False, "Tournament calendar integration is disabled"
-        if self.calendar_client is None:
-            return False, "Tournament calendar client is unavailable"
+    async def _refresh_voltron(self, *, force: bool, actor: str, refresh_akurier: bool = False) -> tuple[bool, str]:
+        if not self.settings.voltron_calendar_enabled:
+            return False, "Voltron calendar integration is disabled"
+        if self.voltron is None:
+            return False, "Voltron calendar client is unavailable"
 
         try:
-            result = await self.calendar_client.refresh(force=force, refresh_akurier=refresh_akurier)
-        except CalendarSourceError as exc:
-            await self._audit("Tournament calendar refresh failed", actor, str(exc))
+            result = await self.voltron.refresh(force=force, refresh_akurier=refresh_akurier)
+        except VoltronCalendarError as exc:
+            await self._audit("Voltron calendar refresh failed", actor, str(exc))
             return False, str(exc)
 
         snapshot = result.snapshot
 
         # Record the public source timestamp only when it changes. This lets us
-        # learn the source's real refresh cadence and later reduce the four daily
+        # learn Voltron's real refresh cadence and later reduce the four daily
         # metadata probes to one check 20-30 minutes after its normal update.
         if result.source_last_synced_utc is not None:
             source_iso = result.source_last_synced_utc.isoformat()
-            previous_source_iso = self.state.get_value("calendar_source_last_synced_utc")
+            previous_source_iso = self.state.get_value("voltron_source_last_synced_utc")
             if previous_source_iso != source_iso:
-                self.state.set_value("calendar_source_last_synced_utc", source_iso)
+                self.state.set_value("voltron_source_last_synced_utc", source_iso)
                 observed = datetime.now(timezone.utc).isoformat()
                 log.info(
-                    "Tournament source timestamp observed: source=%s observed=%s previous=%s",
+                    "Voltron source timestamp observed: source=%s observed=%s previous=%s",
                     source_iso, observed, previous_source_iso or "none",
                 )
                 if previous_source_iso:
                     await self._audit(
-                        "Tournament source refresh observed",
+                        "Voltron source refresh observed",
                         actor,
                         f"Previous source sync: {previous_source_iso}\n"
                         f"New source sync: {source_iso}\n"
@@ -1298,9 +1436,8 @@ class OZYAdminBot(discord.Client):
                     )
 
         today = datetime.now(timezone.utc).date()
-        game_day = game_day_for_instant()
 
-        rendered_start = self.state.get_value("calendar_start_date")
+        rendered_start = self.state.get_value("voltron_calendar_start_date")
         window_rolled = rendered_start != today.isoformat()
         if self.settings.calendar_channel_id and (result.changed or force or window_rolled):
             channel = self.get_channel(self.settings.calendar_channel_id)
@@ -1308,26 +1445,26 @@ class OZYAdminBot(discord.Client):
                 chunks = build_calendar_chunks(
                     snapshot,
                     start_date=today,
-                    days=self.settings.calendar_days,
+                    days=self.settings.voltron_calendar_days,
                     timezone_info=timezone.utc,
                 )
                 await self._upsert_message_series(
                     channel,
-                    state_key="calendar_message_ids",
+                    state_key="voltron_calendar_message_ids",
                     recovery_prefix="OZY Tournament Calendar - Next 30 Days",
                     chunks=chunks,
                 )
-                self.state.set_value("calendar_start_date", today.isoformat())
+                self.state.set_value("voltron_calendar_start_date", today.isoformat())
 
         # If today's post already exists, silently keep it current after source changes.
         if self.settings.today_channel_id and result.changed:
-            today_key = f"today_message_ids:{game_day.isoformat()}"
+            today_key = f"voltron_today_message_ids:{today.isoformat()}"
             if self._state_message_ids(today_key):
-                await self._post_today(game_day, force=True, actor="calendar refresh")
+                await self._post_voltron_today(today, force=True, actor="calendar refresh")
 
         if result.changed:
             await self._audit(
-                "Tournament calendar updated",
+                "Voltron calendar updated",
                 actor,
                 f"Actions: {len(snapshot.actions)}\nMini tournaments: {len(snapshot.mini_tournaments)}\n"
                 f"Hash: {snapshot.semantic_hash[:12]}",
@@ -1335,42 +1472,41 @@ class OZYAdminBot(discord.Client):
         return result.changed, "ok"
 
     async def _refresh_akurier(self, *, actor: str) -> tuple[bool, str]:
-        if not self.settings.calendar_enabled or self.calendar_client is None:
+        if not self.settings.voltron_calendar_enabled or self.voltron is None:
             return False, "Calendar integration is unavailable"
-        if self.calendar_client.snapshot is None:
-            return False, "No tournament calendar snapshot is available"
+        if self.voltron.snapshot is None:
+            return False, "No Voltron snapshot is available"
 
         try:
-            result = await self.calendar_client.refresh_akurier()
-        except CalendarSourceError as exc:
+            result = await self.voltron.refresh_akurier()
+        except VoltronCalendarError as exc:
             log.warning("Akurier mini-event refresh skipped: %s", exc)
             return False, str(exc)
 
         if result.changed:
             today = datetime.now(timezone.utc).date()
-            game_day = game_day_for_instant()
 
             # Akurier mini-events belong in both public schedule surfaces. Update
-            # from the cache only; do not make another tournament-source request here.
+            # from the cache only; do not make another Voltron request here.
             if self.settings.calendar_channel_id:
                 channel = self.get_channel(self.settings.calendar_channel_id)
                 if isinstance(channel, discord.TextChannel):
                     chunks = build_calendar_chunks(
                         result.snapshot,
                         start_date=today,
-                        days=self.settings.calendar_days,
+                        days=self.settings.voltron_calendar_days,
                         timezone_info=timezone.utc,
                     )
                     await self._upsert_message_series(
                         channel,
-                        state_key="calendar_message_ids",
+                        state_key="voltron_calendar_message_ids",
                         recovery_prefix="OZY Tournament Calendar - Next 30 Days",
                         chunks=chunks,
                     )
-                    self.state.set_value("calendar_start_date", today.isoformat())
+                    self.state.set_value("voltron_calendar_start_date", today.isoformat())
 
             if self.settings.today_channel_id:
-                await self._post_today(game_day, force=True, actor="mini-event refresh")
+                await self._post_voltron_today(today, force=True, actor="mini-event refresh")
 
             await self._audit(
                 "Mini events updated",
@@ -1379,26 +1515,26 @@ class OZYAdminBot(discord.Client):
             )
         return result.changed, "ok"
 
-    async def _post_today(self, target_date, *, force: bool, actor: str) -> bool:
-        if not self.settings.today_channel_id or self.calendar_client is None:
+    async def _post_voltron_today(self, target_date, *, force: bool, actor: str) -> bool:
+        if not self.settings.today_channel_id or self.voltron is None:
             return False
         channel = self.get_channel(self.settings.today_channel_id)
         if not isinstance(channel, discord.TextChannel):
             return False
 
         try:
-            # Discord rendering uses the in-memory cache. Only contact the source if
+            # Discord rendering uses the in-memory cache. Only contact Voltron if
             # startup has not populated a snapshot yet.
-            if self.calendar_client.snapshot is None:
-                await self.calendar_client.refresh(force=True)
-        except CalendarSourceError as exc:
-            log.warning("Today's tournament post skipped: %s", exc)
+            if self.voltron.snapshot is None:
+                await self.voltron.refresh(force=True)
+        except VoltronCalendarError as exc:
+            log.warning("Today's Voltron post skipped: %s", exc)
             return False
-        snapshot = self.calendar_client.snapshot
+        snapshot = self.voltron.snapshot
         if snapshot is None:
             return False
 
-        state_key = f"today_message_ids:{target_date.isoformat()}"
+        state_key = f"voltron_today_message_ids:{target_date.isoformat()}"
         if not force and self._state_message_ids(state_key):
             return False
 
@@ -1419,40 +1555,40 @@ class OZYAdminBot(discord.Client):
             chunks=chunks,
         )
         await self._audit(
-            "OZY Today posted" if not existing else "OZY Today updated",
+            "Voltron today posted" if not existing else "Voltron today updated",
             actor,
             f"Date: {target_date.isoformat()}\nChannel: #{channel.name}",
         )
         return True
 
-    async def _calendar_refresh_loop(self) -> None:
+    async def _voltron_refresh_loop(self) -> None:
         await self.wait_until_ready()
 
         # One startup read is needed to populate the in-memory cache. After that,
         # only lightweight metadata probes run at the fixed times below. Full
         # calendar content is downloaded only when metadata reports a change.
         try:
-            await self._refresh_calendar(
-                force=self.calendar_client.snapshot is None if self.calendar_client else True,
+            await self._refresh_voltron(
+                force=self.voltron.snapshot is None if self.voltron else True,
                 actor="startup calendar refresh",
                 refresh_akurier=False,
             )
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Startup tournament calendar refresh failed")
+            log.exception("Startup Voltron calendar refresh failed")
 
         while not self.is_closed():
             now = datetime.now(timezone.utc)
-            target = _next_utc_slot(now, CALENDAR_META_PROBE_TIMES_UTC)
+            target = _next_utc_slot(now, VOLTRON_META_PROBE_TIMES_UTC)
             try:
                 await asyncio.sleep(max(1.0, (target - now).total_seconds()))
             except asyncio.CancelledError:
                 raise
 
             try:
-                log.info("Running lightweight tournament metadata probe at %s", target.isoformat())
-                await self._refresh_calendar(
+                log.info("Running lightweight Voltron metadata probe at %s", target.isoformat())
+                await self._refresh_voltron(
                     force=False,
                     actor="automatic metadata probe",
                     refresh_akurier=False,
@@ -1460,7 +1596,7 @@ class OZYAdminBot(discord.Client):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Automatic tournament metadata probe failed")
+                log.exception("Automatic Voltron metadata probe failed")
 
     async def _akurier_refresh_loop(self) -> None:
         await self.wait_until_ready()
@@ -1475,10 +1611,10 @@ class OZYAdminBot(discord.Client):
             # Akurier fetch has not yet been attempted. A failed attempt is not
             # hammered with retries; the existing cached/fallback data remains.
             if now >= today_target and last_attempt != now.date().isoformat():
-                # On a fresh deploy the tournament startup read may still be running.
+                # On a fresh deploy the Voltron startup read may still be running.
                 # Wait briefly rather than consuming today's single Akurier attempt
                 # before there is a snapshot to attach the mini-events to.
-                if self.calendar_client is None or self.calendar_client.snapshot is None:
+                if self.voltron is None or self.voltron.snapshot is None:
                     try:
                         await asyncio.sleep(10)
                     except asyncio.CancelledError:
@@ -1501,35 +1637,35 @@ class OZYAdminBot(discord.Client):
             except asyncio.CancelledError:
                 raise
 
-    async def _today_loop(self) -> None:
+    async def _voltron_today_loop(self) -> None:
         await self.wait_until_ready()
-        # "Today" is a Total Battle game day, not a midnight-to-midnight civil
-        # day. Roll the canonical post at R+0 (17:00 UTC) and keep that same
-        # message updated until the next reset.
+        hour, minute = [int(x) for x in self.settings.voltron_today_time.split(":", 1)]
+        tz = self.settings.timezone
+
         while not self.is_closed():
-            now = datetime.now(timezone.utc)
-            game_day = game_day_for_instant(now)
-            current_reset, next_reset = game_day_bounds(game_day)
+            now = datetime.now(tz)
+            target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
 
-            # Catch up after a restart without duplicating the current game day.
-            if now >= current_reset:
+            # Catch up after a restart without duplicating the day's canonical post.
+            if now >= target:
                 try:
-                    await self._post_today(game_day, force=False, actor="automatic today scheduler")
+                    await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
                 except Exception:
-                    log.exception("Catch-up OZY Today post failed")
+                    log.exception("Catch-up Voltron today post failed")
 
-            now = datetime.now(timezone.utc)
-            game_day = game_day_for_instant(now)
-            _, next_target = game_day_bounds(game_day)
+            now = datetime.now(tz)
+            next_target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
+            if next_target <= now:
+                next_target += timedelta(days=1)
             try:
                 await asyncio.sleep(max(1.0, (next_target - now).total_seconds()))
             except asyncio.CancelledError:
                 raise
 
             try:
-                await self._post_today(game_day_for_instant(), force=False, actor="automatic today scheduler")
+                await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
             except Exception:
-                log.exception("Automatic OZY Today post failed")
+                log.exception("Automatic Voltron today post failed")
 
     # ------------------------------------------------------------------
     # Authoritative roster/access synchronization
@@ -2287,26 +2423,26 @@ class OZYAdminBot(discord.Client):
                     ephemeral=True,
                 )
 
-        @self.tree.command(name="calendar", description="Show the next 30 days of OZY tournament starts")
+        @self.tree.command(name="calendar", description="Show the next 30 days of Voltron tournament starts")
         @app_commands.describe(public="Post publicly instead of only showing it to you")
         async def calendar(interaction: discord.Interaction, public: bool = False) -> None:
             if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
                 await interaction.response.send_message("Only leadership can post the calendar publicly.", ephemeral=True)
                 return
-            if self.calendar_client is None:
-                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
+            if self.voltron is None:
+                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=not public, thinking=True)
             try:
-                if self.calendar_client.snapshot is None:
-                    await self.calendar_client.refresh(force=True)
-                snapshot = self.calendar_client.snapshot
+                if self.voltron.snapshot is None:
+                    await self.voltron.refresh(force=True)
+                snapshot = self.voltron.snapshot
                 if snapshot is None:
-                    raise CalendarSourceError("No calendar snapshot is available")
+                    raise VoltronCalendarError("No calendar snapshot is available")
                 chunks = build_calendar_chunks(
                     snapshot,
                     start_date=datetime.now(timezone.utc).date(),
-                    days=self.settings.calendar_days,
+                    days=self.settings.voltron_calendar_days,
                     timezone_info=timezone.utc,
                 )
                 for chunk in chunks:
@@ -2315,26 +2451,26 @@ class OZYAdminBot(discord.Client):
                         ephemeral=not public,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-            except CalendarSourceError as exc:
+            except VoltronCalendarError as exc:
                 await interaction.followup.send(f"Calendar unavailable: {exc}", ephemeral=True)
 
-        @self.tree.command(name="today", description="Show the current reset-to-reset OZY game day")
+        @self.tree.command(name="today", description="Show today's Voltron tournament activity")
         @app_commands.describe(public="Post publicly instead of only showing it to you")
         async def today(interaction: discord.Interaction, public: bool = False) -> None:
             if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
                 await interaction.response.send_message("Only leadership can post today's schedule publicly.", ephemeral=True)
                 return
-            if self.calendar_client is None:
-                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
+            if self.voltron is None:
+                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=not public, thinking=True)
             try:
-                if self.calendar_client.snapshot is None:
-                    await self.calendar_client.refresh(force=True)
-                snapshot = self.calendar_client.snapshot
+                if self.voltron.snapshot is None:
+                    await self.voltron.refresh(force=True)
+                snapshot = self.voltron.snapshot
                 if snapshot is None:
-                    raise CalendarSourceError("No calendar snapshot is available")
-                target_date = game_day_for_instant()
+                    raise VoltronCalendarError("No calendar snapshot is available")
+                target_date = datetime.now(timezone.utc).date()
                 chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=timezone.utc)
                 for chunk in chunks:
                     await interaction.followup.send(
@@ -2342,24 +2478,24 @@ class OZYAdminBot(discord.Client):
                         ephemeral=not public,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-            except CalendarSourceError as exc:
+            except VoltronCalendarError as exc:
                 await interaction.followup.send(f"Today's calendar is unavailable: {exc}", ephemeral=True)
 
         @self.tree.command(name="time", description="Show today's OZY events in your chosen local timezone")
         @app_commands.describe(zone="Timezone to convert the current game-day schedule to")
         @app_commands.choices(zone=TIMEZONE_CHOICES)
         async def time_converter(interaction: discord.Interaction, zone: app_commands.Choice[str]) -> None:
-            if self.calendar_client is None:
-                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
+            if self.voltron is None:
+                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                if self.calendar_client.snapshot is None:
-                    await self.calendar_client.refresh(force=True)
-                snapshot = self.calendar_client.snapshot
+                if self.voltron.snapshot is None:
+                    await self.voltron.refresh(force=True)
+                snapshot = self.voltron.snapshot
                 if snapshot is None:
-                    raise CalendarSourceError("No calendar snapshot is available")
-                target_date = game_day_for_instant()
+                    raise VoltronCalendarError("No calendar snapshot is available")
+                target_date = datetime.now(timezone.utc).date()
                 chunks = build_today_local_chunks(
                     snapshot,
                     target_date=target_date,
@@ -2375,12 +2511,12 @@ class OZYAdminBot(discord.Client):
             except Exception as exc:
                 await interaction.followup.send(f"Time conversion unavailable: {exc}", ephemeral=True)
 
-        @self.tree.command(name="calendar-refresh", description="Leadership: refresh tournament data and update the calendar")
+        @self.tree.command(name="calendar-refresh", description="Leadership: refresh Voltron and update the calendar channel")
         async def calendar_refresh(interaction: discord.Interaction) -> None:
             if not await self._require_leadership(interaction):
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
-            changed, status = await self._refresh_calendar(
+            changed, status = await self._refresh_voltron(
                 force=True,
                 actor=str(interaction.user),
                 refresh_akurier=True,
@@ -2389,48 +2525,43 @@ class OZYAdminBot(discord.Client):
                 await interaction.followup.send(f"Refresh failed: {status}", ephemeral=True)
             else:
                 await interaction.followup.send(
-                    "Tournament calendar refreshed. " + ("Discord calendar updated." if changed else "No event changes detected."),
+                    "Voltron calendar refreshed. " + ("Discord calendar updated." if changed else "No event changes detected."),
                     ephemeral=True,
                 )
 
-        @self.tree.command(name="calendar-status", description="Leadership: show tournament calendar integration status")
+        @self.tree.command(name="calendar-status", description="Leadership: show Voltron calendar integration status")
         async def calendar_status(interaction: discord.Interaction) -> None:
             if not await self._require_leadership(interaction):
                 return
-            snapshot = self.calendar_client.snapshot if self.calendar_client else None
-            last_success = self.calendar_client.last_success_utc if self.calendar_client else None
-            last_error = self.calendar_client.last_error if self.calendar_client else "client unavailable"
+            snapshot = self.voltron.snapshot if self.voltron else None
+            last_success = self.voltron.last_success_utc if self.voltron else None
+            last_error = self.voltron.last_error if self.voltron else "client unavailable"
             lines = [
-                f"Enabled: **{self.settings.calendar_enabled}**",
-                f"Realm: **{self.settings.calendar_realm}**",
-                "Tournament-source probes: **00:30, 06:30, 12:30, 18:30 UTC**",
-                "Mini-event source: **18:00 UTC / R+1, once daily**",
+                f"Enabled: **{self.settings.voltron_calendar_enabled}**",
+                f"Realm: **{self.settings.voltron_realm}**",
+                "Voltron probes: **00:30, 06:30, 12:30, 18:30 UTC**",
+                "Akurier mini-events: **18:00 UTC / R+1, once daily**",
                 f"Cached actions: **{len(snapshot.actions) if snapshot else 0}**",
                 f"Cached mini tournaments: **{len(snapshot.mini_tournaments) if snapshot else 0}**",
-                f"Source last synced: **{self.calendar_client.last_meta_utc.isoformat() if self.calendar_client and self.calendar_client.last_meta_utc else 'unknown'}**",
-                f"Last metadata check: **{self.calendar_client.last_meta_checked_utc.isoformat() if self.calendar_client and self.calendar_client.last_meta_checked_utc else 'never'}**",
-                f"Last mini-event refresh: **{self.calendar_client.last_akurier_success_utc.isoformat() if self.calendar_client and self.calendar_client.last_akurier_success_utc else 'never'}**",
+                f"Source last synced: **{self.voltron.last_meta_utc.isoformat() if self.voltron and self.voltron.last_meta_utc else 'unknown'}**",
+                f"Last metadata check: **{self.voltron.last_meta_checked_utc.isoformat() if self.voltron and self.voltron.last_meta_checked_utc else 'never'}**",
+                f"Last Akurier success: **{self.voltron.last_akurier_success_utc.isoformat() if self.voltron and self.voltron.last_akurier_success_utc else 'never'}**",
                 f"Last successful calendar fetch/probe: **{last_success.isoformat() if last_success else 'never'}**",
                 f"Last error: **{last_error or 'none'}**",
             ]
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-        @self.tree.command(name="event-create", description="Leadership: create a Discord scheduled event in an OZY voice channel")
+        @self.tree.command(name="event-create", description="Create and publish an OZY scheduled event")
         async def event_create(interaction: discord.Interaction) -> None:
-            if not await self._require_leadership(interaction):
+            if not await self._require_event_creator(interaction):
                 return
             if interaction.guild is None:
                 await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
                 return
-            view = EventLocationView(self, interaction)
-            if view.category_select is None:
-                await interaction.response.send_message(
-                    "I cannot find any category containing a voice channel I can view and connect to.",
-                    ephemeral=True,
-                )
-                return
-            await interaction.response.send_message(view.content(), view=view, ephemeral=True)
+            # Open the native form immediately. Discord now supports ChannelSelect
+            # components inside modals, so no preliminary selector message is needed.
+            await interaction.response.send_modal(EventSetupModal(self, creator_id=interaction.user.id))
 
         @self.tree.command(name="announce", description="Leadership: open the OZY announcement popup")
         @app_commands.describe(ping="Ping the configured announcement notification role")

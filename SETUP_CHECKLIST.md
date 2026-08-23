@@ -107,21 +107,23 @@ DAILY_SCHEDULE_TIME=08:00
 
 CALENDAR_CHANNEL_ID=...
 TODAY_CHANNEL_ID=...
-CALENDAR_ENABLED=true
-CALENDAR_BASE_URL=...
-CALENDAR_REALM=Regular
-CALENDAR_DAYS=30
-TODAY_ENABLED=true
+VOLTRON_CALENDAR_ENABLED=true
+VOLTRON_REALM=Regular
+VOLTRON_CALENDAR_DAYS=30
+VOLTRON_TODAY_ENABLED=true
+VOLTRON_TODAY_TIME=08:00
 
 TRUST_EXACT_DISPLAY_NAME=false
 AUTO_SYNC_NICKNAME=false
 ```
 
-The tournament integration does not require a source-site login, cookie, websocket connection,
-or personal account token. Automatic traffic is intentionally sparse: four lightweight metadata
-probes per UTC day, full content only when metadata changes, and one regular mini-event refresh
-per day at 18:00 UTC (R+1). The 30-day calendar uses copyable day blocks. `OZY Today` runs
-reset-to-reset from 17:00 UTC through the next 17:00 UTC and includes every mini event in that window.
+The Voltron integration does not require a Voltron login, cookie, SignalR connection,
+or personal account token. It uses the public calendar endpoints exposed by the site.
+Automatic source traffic is intentionally sparse: four lightweight metadata probes per UTC
+day while the source cadence is learned, full content only when metadata changes, and one
+Akurier mini-event fetch per day at 18:00 UTC (R+1).
+The 30-day calendar lists tournament STARTS; the daily post includes starts, continues,
+ends, and the mini-tournament schedule for that day.
 
 Start command:
 
@@ -154,13 +156,14 @@ Test in this order:
 13. `/today`
 14. `/calendar-refresh`
 15. confirm the calendar channel is edited in place rather than spammed
-16. `/event-create` - select a restricted category + voice channel and create a test event
-17. confirm only members who can view that voice channel can access the scheduled event
-18. `/sync-roles apply:false`
-19. inspect the preview
-20. `/sync-roles apply:true`
-21. `/announce ping:false`
-22. only after that, test `/announce ping:true`
+16. `/event-create` - the modal should open immediately; select category, event channel/location, and publish channel
+17. finish the second date/time step and confirm the Discord Scheduled Event is created and the event card is posted in the selected publish channel
+18. confirm a verified normal member can create an event, while an unverified outsider cannot target hidden channels
+19. `/sync-roles apply:false`
+20. inspect the preview
+21. `/sync-roles apply:true`
+22. `/announce ping:false`
+23. only after that, test `/announce ping:true`
 
 ## 9. Test a new member
 
