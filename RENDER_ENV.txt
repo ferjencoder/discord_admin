@@ -10,3 +10,9 @@ CALENDAR_MIN_ACTIONS=10
 
 OZY Today now rolls automatically at R+0 = 17:00 UTC.
 There is no separate Today posting-time variable anymore.
+
+Persistent member/admin state for launch:
+STATE_DATABASE_URL=<Render Postgres internal connection URL>
+VERIFICATION_CHANNEL_ID=<private leadership verification channel ID>
+
+Verify /healthz reports "state_backend": "postgres" after deployment.

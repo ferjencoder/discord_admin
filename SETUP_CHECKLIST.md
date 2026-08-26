@@ -52,6 +52,7 @@ Recommended channels:
 - Daily tournament summary -> `TODAY_CHANNEL_ID`
 - Absence log -> `AWAY_CHANNEL_ID`
 - Private bot audit log -> `AUDIT_CHANNEL_ID`
+- Private leadership roster-verification queue -> `VERIFICATION_CHANNEL_ID`
 
 One channel can technically serve more than one purpose, but separate announcement/audit channels are cleaner.
 
@@ -113,6 +114,8 @@ SERVER_ID=...
 
 Then add the channel/role/data variables above.
 
+For persistent production state, create/connect a PostgreSQL database and set its internal connection URL as `STATE_DATABASE_URL`. Create a private leadership text channel such as `#verification` and set `VERIFICATION_CHANNEL_ID` to that channel ID. See `STATE_STORAGE.md`.
+
 Recommended schedule/calendar defaults:
 
 ```env
@@ -160,29 +163,32 @@ Test in this order:
 2. `/chat`
 3. `/verify` - confirm it creates a pending request rather than granting a rank role
 4. `/pending-verifications` as leadership
-5. `/member-link` to approve the test member
-6. `/member`
-7. `/chests`
-8. `/away days:1 reason:Test`
-9. `/back`
-10. `/schedule`
-11. `/calendar-status`
-12. `/calendar`
-13. `/today`
-14. `/calendar-refresh`
-15. confirm the calendar channel is edited in place rather than spammed
-16. `/event-create` - the modal should open immediately; select category, event channel/location, and publish channel
-17. finish the second date/time step and confirm the Discord Scheduled Event is created and the event card is posted in the selected publish channel
-18. confirm a verified normal member can create an event, while an unverified outsider cannot target hidden channels
-19. Join with a test account and confirm it initially receives Unverified access.
-20. Click **Verify OZY membership** and deliberately enter a misspelled game name; confirm the bot rejects it and asks for the precise roster name.
-21. Enter an exact active-roster name; with `TRUST_EXACT_DISPLAY_NAME=false`, confirm it becomes a pending verification instead of instantly granting rank access.
-22. Confirm the troop level selected in Discord Onboarding appears in `/member` after `TROOP_LEVEL_ROLE_MAP` is configured.
-23. `/sync-roles apply:false`
-24. inspect the preview
-25. `/sync-roles apply:true`
-26. `/announce ping:false`
-27. only after that, test `/announce ping:true`
+5. Confirm the claim appears in the private verification queue with **Approve / Reject** buttons
+6. Approve one test claim from the button and reject another with a reason
+7. `/verification-history` and confirm both decisions are recorded
+8. `/member-link` as the manual fallback/override
+9. `/member`
+10. `/chests`
+11. `/away days:1 reason:Test`
+12. `/back`
+13. `/schedule`
+14. `/calendar-status`
+15. `/calendar`
+16. `/today`
+17. `/calendar-refresh`
+18. confirm the calendar channel is edited in place rather than spammed
+19. `/event-create` - the modal should open immediately; select category, event channel/location, and publish channel
+20. finish the second date/time step and confirm the Discord Scheduled Event is created and the event card is posted in the selected publish channel
+21. confirm a verified normal member can create an event, while an unverified outsider cannot target hidden channels
+22. Join with a test account and confirm it initially receives Unverified access.
+23. Click **Verify OZY membership** and deliberately enter a misspelled game name; confirm the bot rejects it and asks for the precise roster name.
+24. Enter an exact active-roster name; with `TRUST_EXACT_DISPLAY_NAME=false`, confirm it becomes a pending verification instead of instantly granting rank access.
+25. Confirm the troop level selected in Discord Onboarding appears in `/member` after `TROOP_LEVEL_ROLE_MAP` is configured.
+26. `/sync-roles apply:false`
+27. inspect the preview
+28. `/sync-roles apply:true`
+29. `/announce ping:false`
+30. only after that, test `/announce ping:true`
 
 ## 9. Test a new member
 
@@ -193,7 +199,7 @@ Expected behavior:
 - the member receives Unverified access first;
 - the welcome post includes **Verify OZY membership**;
 - if the Discord server display name exactly matches an active roster name, the bot identifies it but keeps the link pending by default;
-- leadership approves the identity with `/member-link` before a roster rank role is assigned;
+- leadership approves the identity from the private verification queue; `/member-link` remains the manual fallback;
 - if the name is not an exact active-roster match, the verification form rejects it and asks for the precise Total Battle name, with close roster suggestions when available;
 - if `TROOP_LEVEL_ROLE_MAP` is configured, the required Onboarding troop-level role is captured into the member profile and follows later role changes;
 - an already-approved Discord account that leaves and rejoins keeps its stable Total Battle identity link; access is restored only if that identity is still in the active roster;

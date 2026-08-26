@@ -98,3 +98,39 @@ def test_link_updates_member_profile_identity_without_losing_troop_level(tmp_pat
     assert profile.game_name == "PeekABoo Death"
     assert profile.game_user_id == "tb:90741542"
     assert profile.troop_level == "G8"
+
+
+def test_verification_request_records_queue_message_and_history(tmp_path):
+    state = AdminState(tmp_path / "state.sqlite3")
+    request = state.set_verification_request(
+        123,
+        "PeekABoo Death",
+        "verification-modal",
+        game_user_id="tb:90741542",
+    )
+    assert request.requested_game_user_id == "tb:90741542"
+    state.set_verification_message(123, 456, 789)
+    request = state.get_verification_request_record(123)
+    assert request is not None
+    assert request.queue_channel_id == 456
+    assert request.queue_message_id == 789
+
+    resolved = state.resolve_verification_request(
+        123,
+        decision="approved",
+        reviewed_by_user_id=999,
+        reason="matched in game",
+    )
+    assert resolved is not None
+    assert state.get_verification_request_record(123) is None
+    history = state.verification_history()
+    assert len(history) == 1
+    assert history[0].decision == "approved"
+    assert history[0].reviewed_by_user_id == 999
+    assert history[0].requested_game_user_id == "tb:90741542"
+
+
+def test_state_storage_label_for_sqlite(tmp_path):
+    state = AdminState(tmp_path / "state.sqlite3")
+    assert state.backend == "sqlite"
+    assert "SQLite" in state.storage_label

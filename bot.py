@@ -504,6 +504,79 @@ class EventScheduleView(discord.ui.View):
         return False
 
 
+
+class VerificationApproveButton(discord.ui.Button):
+    def __init__(self, bot: "OZYAdminBot", target_user_id: int):
+        super().__init__(
+            label="Approve",
+            style=discord.ButtonStyle.success,
+            custom_id=f"ozy:verification:approve:{target_user_id}",
+        )
+        self.bot = bot
+        self.target_user_id = target_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.bot._require_leadership(interaction):
+            return
+        await self.bot._review_verification_request(
+            interaction,
+            target_user_id=self.target_user_id,
+            decision="approved",
+            reason="Approved from verification queue",
+        )
+
+
+class VerificationRejectModal(discord.ui.Modal):
+    def __init__(self, bot: "OZYAdminBot", target_user_id: int):
+        super().__init__(title="Reject roster verification", timeout=300)
+        self.bot = bot
+        self.target_user_id = target_user_id
+        self.reason = discord.ui.TextInput(
+            label="Reason",
+            placeholder="Example: Wrong Total Battle name - please submit your exact OZY name.",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await self.bot._require_leadership(interaction):
+            return
+        await self.bot._review_verification_request(
+            interaction,
+            target_user_id=self.target_user_id,
+            decision="rejected",
+            reason=str(self.reason.value or "").strip() or "Rejected by leadership",
+        )
+
+
+class VerificationRejectButton(discord.ui.Button):
+    def __init__(self, bot: "OZYAdminBot", target_user_id: int):
+        super().__init__(
+            label="Reject",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"ozy:verification:reject:{target_user_id}",
+        )
+        self.bot = bot
+        self.target_user_id = target_user_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.bot._require_leadership(interaction):
+            return
+        await interaction.response.send_modal(VerificationRejectModal(self.bot, self.target_user_id))
+
+
+class VerificationReviewView(discord.ui.View):
+    """Persistent approve/reject controls for one pending roster claim."""
+
+    def __init__(self, bot: "OZYAdminBot", target_user_id: int):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.target_user_id = target_user_id
+        self.add_item(VerificationApproveButton(bot, target_user_id))
+        self.add_item(VerificationRejectButton(bot, target_user_id))
+
 class MembershipVerificationModal(discord.ui.Modal):
     """Collect the exact Total Battle name and member-entered troop level."""
 
@@ -645,7 +718,8 @@ class OZYAdminBot(discord.Client):
         super().__init__(intents=intents)
         self.settings = settings
         self.tree = app_commands.CommandTree(self)
-        self.state = AdminState(settings.state_db)
+        self.state = AdminState(settings.state_db, settings.state_database_url)
+        self._registered_verification_review_ids: set[int] = set()
 
         self.http_session: aiohttp.ClientSession | None = None
         self.data: DataProvider | None = None
@@ -672,6 +746,11 @@ class OZYAdminBot(discord.Client):
         # Persistent welcome verification button. Register it before command
         # sync so old welcome messages keep working after a restart/redeploy.
         self.add_view(MembershipVerificationView(self))
+
+        # Re-register persistent leadership approve/reject controls for every
+        # pending claim so buttons posted before a restart keep working.
+        for request in self.state.all_verification_request_records():
+            self._ensure_verification_review_view(request.discord_user_id)
 
         guild = discord.Object(id=self.settings.server_id)
         self.tree.copy_global_to(guild=guild)
@@ -719,6 +798,7 @@ class OZYAdminBot(discord.Client):
         if self.http_session is not None and not self.http_session.closed:
             await self.http_session.close()
 
+        self.state.close()
         await super().close()
 
     async def on_ready(self) -> None:
@@ -740,6 +820,7 @@ class OZYAdminBot(discord.Client):
                     "status": "ok",
                     "discord_ready": self.is_ready(),
                     "guild": self.settings.server_id,
+                    "state_backend": self.state.backend,
                     "utc": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -792,6 +873,7 @@ class OZYAdminBot(discord.Client):
             "AWAY_CHANNEL_ID": self.settings.away_channel_id,
             "AUDIT_CHANNEL_ID": self.settings.audit_channel_id,
             "CHEST_CHANNEL_ID": self.settings.chest_channel_id,
+            "VERIFICATION_CHANNEL_ID": self.settings.verification_channel_id,
         }
         for label, channel_id in configured_channels.items():
             if channel_id is None:
@@ -867,6 +949,7 @@ class OZYAdminBot(discord.Client):
             log.warning("CHEST_RESET_POST_ENABLED=true but CHEST_CHANNEL_ID is not configured")
 
         log.info("Validated OZY Admin configuration for guild %s", guild.name)
+        log.info("OZY Admin state storage: %s", self.state.storage_label)
 
     # ------------------------------------------------------------------
     # Permissions / utility helpers
@@ -932,6 +1015,280 @@ class OZYAdminBot(discord.Client):
             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as exc:
             log.warning("Audit log send failed: %s", exc)
+
+
+    def _ensure_verification_review_view(self, discord_user_id: int) -> None:
+        if discord_user_id in self._registered_verification_review_ids:
+            return
+        self.add_view(VerificationReviewView(self, discord_user_id))
+        self._registered_verification_review_ids.add(discord_user_id)
+
+    async def _queue_verification_request(
+        self,
+        member: discord.Member,
+        game_name: str,
+        *,
+        source: str,
+        game_user_id: str | None = None,
+    ) -> None:
+        previous = self.state.get_verification_request_record(member.id)
+        self.state.set_verification_request(
+            member.id,
+            game_name,
+            source,
+            game_user_id=game_user_id,
+        )
+        if (
+            previous
+            and previous.requested_game_name.casefold() == game_name.casefold()
+            and previous.queue_channel_id
+            and previous.queue_message_id
+        ):
+            self.state.set_verification_message(
+                member.id, previous.queue_channel_id, previous.queue_message_id
+            )
+        self._ensure_verification_review_view(member.id)
+        await self._publish_verification_request(member.id)
+
+    async def _publish_verification_request(self, discord_user_id: int) -> None:
+        if not self.settings.verification_channel_id:
+            return
+        guild = self.get_guild(self.settings.server_id)
+        if guild is None:
+            return
+        request = self.state.get_verification_request_record(discord_user_id)
+        if request is None:
+            return
+        channel = guild.get_channel(self.settings.verification_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        member = guild.get_member(discord_user_id)
+        profile = self.state.get_member_profile(discord_user_id)
+
+        embed = discord.Embed(
+            title="Roster verification pending",
+            color=0xF59E0B,
+            timestamp=request.requested_at_utc,
+        )
+        embed.add_field(
+            name="Discord member",
+            value=(member.mention if member else f"Discord ID `{discord_user_id}`"),
+            inline=False,
+        )
+        embed.add_field(name="Claimed OZY name", value=request.requested_game_name, inline=True)
+        if profile and profile.troop_level:
+            embed.add_field(name="Troop level", value=profile.troop_level, inline=True)
+        embed.add_field(name="Source", value=request.source, inline=True)
+        if request.requested_game_user_id:
+            embed.set_footer(text=f"TB user ID: {request.requested_game_user_id}")
+
+        view = VerificationReviewView(self, discord_user_id)
+        self._ensure_verification_review_view(discord_user_id)
+
+        # If a request was refreshed, update its existing queue message when possible.
+        if request.queue_channel_id == channel.id and request.queue_message_id:
+            try:
+                message = await channel.fetch_message(request.queue_message_id)
+                await message.edit(embed=embed, view=view)
+                return
+            except discord.HTTPException:
+                pass
+
+        try:
+            message = await channel.send(
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException as exc:
+            log.warning("Verification queue post failed: %s", exc)
+            return
+        self.state.set_verification_message(discord_user_id, channel.id, message.id)
+
+    async def _mark_verification_queue_resolved(
+        self,
+        request,
+        *,
+        decision: str,
+        reviewer: discord.Member,
+        reason: str,
+        role_result: str | None = None,
+    ) -> None:
+        if not request.queue_channel_id or not request.queue_message_id:
+            return
+        guild = self.get_guild(self.settings.server_id)
+        if guild is None:
+            return
+        channel = guild.get_channel(request.queue_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        color = 0x10B981 if decision == "approved" else 0xEF4444
+        title = "Roster verification approved" if decision == "approved" else "Roster verification rejected"
+        member = guild.get_member(request.discord_user_id)
+        embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
+        embed.add_field(
+            name="Discord member",
+            value=(member.mention if member else f"Discord ID `{request.discord_user_id}`"),
+            inline=False,
+        )
+        embed.add_field(name="Claimed OZY name", value=request.requested_game_name, inline=True)
+        embed.add_field(name="Reviewed by", value=reviewer.mention, inline=True)
+        if role_result:
+            embed.add_field(name="Role sync", value=truncate(role_result, 1000), inline=False)
+        if reason:
+            embed.add_field(name="Decision note", value=truncate(reason, 1000), inline=False)
+        try:
+            message = await channel.fetch_message(request.queue_message_id)
+            await message.edit(embed=embed, view=None)
+        except discord.HTTPException:
+            pass
+
+    async def _review_verification_request(
+        self,
+        interaction: discord.Interaction,
+        *,
+        target_user_id: int,
+        decision: str,
+        reason: str,
+    ) -> None:
+        guild = interaction.guild
+        reviewer = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if guild is None or reviewer is None:
+            if interaction.response.is_done():
+                await interaction.followup.send("Guild unavailable.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Guild unavailable.", ephemeral=True)
+            return
+
+        request = self.state.get_verification_request_record(target_user_id)
+        if request is None:
+            message = "This verification request is no longer pending."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+
+        target = guild.get_member(target_user_id)
+        if decision == "rejected":
+            resolved = self.state.resolve_verification_request(
+                target_user_id,
+                decision="rejected",
+                reviewed_by_user_id=reviewer.id,
+                reason=reason,
+            )
+            if target:
+                await self._sync_access_roles(target, active_roster_member=False)
+                try:
+                    await target.send(
+                        f"Your OZY roster verification for **{request.requested_game_name}** was rejected.\n"
+                        f"Reason: {reason}\n\nRun `/verify` again with your precise Total Battle name if needed."
+                    )
+                except discord.HTTPException:
+                    pass
+            if resolved:
+                await self._mark_verification_queue_resolved(
+                    resolved,
+                    decision="rejected",
+                    reviewer=reviewer,
+                    reason=reason,
+                )
+            await self._audit(
+                "Roster verification rejected",
+                str(reviewer),
+                f"Discord ID: {target_user_id}\nClaimed name: {request.requested_game_name}\nReason: {reason}",
+            )
+            if interaction.response.is_done():
+                await interaction.followup.send("Verification rejected.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Verification rejected.", ephemeral=True)
+            return
+
+        if target is None:
+            message = "That Discord member is no longer in the server. Reject the claim or wait for them to rejoin."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+
+        assert self.data is not None
+        try:
+            canonical = await self.data.exact_roster_name(request.requested_game_name)
+            if canonical is None:
+                raise DataUnavailable("claimed name is no longer in the active OZY roster")
+            info = await self.data.member_info(canonical)
+            stable_id = str((info or {}).get("user_id", "")).strip() or None
+            if request.requested_game_user_id and stable_id and request.requested_game_user_id != stable_id:
+                message = "The roster identity changed since this claim was submitted. Ask the member to submit verification again."
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+                return
+            linked_user = self.state.linked_user_for_identity(canonical, stable_id)
+            if linked_user not in (None, target.id):
+                other = guild.get_member(linked_user)
+                other_name = other.display_name if other else f"Discord ID {linked_user}"
+                message = f"**{canonical}** is already linked to **{other_name}**. Resolve that link first."
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+                return
+
+            self.state.set_link(
+                target.id,
+                canonical,
+                f"verification-approved:{reviewer.id}",
+                game_user_id=stable_id,
+            )
+            role_result = await self._sync_rank_role(target, canonical)
+        except DataUnavailable as exc:
+            message = f"Cannot approve right now: {exc}"
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+
+        resolved = self.state.resolve_verification_request(
+            target.id,
+            decision="approved",
+            reviewed_by_user_id=reviewer.id,
+            reason=reason,
+        )
+        if resolved:
+            await self._mark_verification_queue_resolved(
+                resolved,
+                decision="approved",
+                reviewer=reviewer,
+                reason=reason,
+                role_result=role_result,
+            )
+        try:
+            await target.send(
+                f"Your OZY membership was approved as **{canonical}**.\nRole sync: {role_result}."
+            )
+        except discord.HTTPException:
+            pass
+        await self._audit(
+            "Roster verification approved",
+            str(reviewer),
+            f"Discord member: {target} ({target.id})\nGame name: {canonical}\nRole sync: {role_result}",
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"Approved {target.mention} as **{canonical}**. {role_result}",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                f"Approved {target.mention} as **{canonical}**. {role_result}",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     def _troop_level_from_roles(self, member: discord.Member) -> tuple[str | None, list[str]]:
         """Resolve the single troop level assigned by Discord Onboarding roles."""
@@ -1031,7 +1388,12 @@ class OZYAdminBot(discord.Client):
 
         linked_user = self.state.linked_user_for_identity(canonical, stable_id)
         if linked_user not in (None, member.id):
-            self.state.set_verification_request(member.id, canonical, source + "-name-already-linked")
+            await self._queue_verification_request(
+                member,
+                canonical,
+                source=source + "-name-already-linked",
+                game_user_id=stable_id,
+            )
             return (
                 canonical,
                 f"The roster name **{canonical}** is already linked to another Discord account. "
@@ -1050,7 +1412,12 @@ class OZYAdminBot(discord.Client):
             role_result = await self._sync_rank_role(member, canonical)
             return canonical, f"Linked to **{canonical}**. Role sync: {role_result}.", f"auto-approved; {role_result}"
 
-        self.state.set_verification_request(member.id, canonical, source)
+        await self._queue_verification_request(
+            member,
+            canonical,
+            source=source,
+            game_user_id=stable_id,
+        )
         return (
             canonical,
             f"Exact roster name found: **{canonical}**. Your request is waiting for leadership approval. "
@@ -1320,9 +1687,9 @@ class OZYAdminBot(discord.Client):
                 matched_name = await self.data.exact_roster_name(member.display_name)
 
             if matched_name and not linked_info:
+                info = await self.data.member_info(matched_name)
+                stable_id = str((info or {}).get("user_id", "")).strip() or None
                 if self.settings.trust_exact_display_name:
-                    info = await self.data.member_info(matched_name)
-                    stable_id = str((info or {}).get("user_id", "")).strip() or None
                     linked_user = self.state.linked_user_for_identity(matched_name, stable_id)
                     if linked_user in (None, member.id):
                         self.state.set_link(
@@ -1333,10 +1700,20 @@ class OZYAdminBot(discord.Client):
                         )
                         role_result = await self._sync_rank_role(member, matched_name)
                     else:
-                        self.state.set_verification_request(member.id, matched_name, "join-name-already-linked")
+                        await self._queue_verification_request(
+                            member,
+                            matched_name,
+                            source="join-name-already-linked",
+                            game_user_id=stable_id,
+                        )
                         role_result = "pending leadership verification; roster name is already linked"
                 else:
-                    self.state.set_verification_request(member.id, matched_name, "join-exact-display-name")
+                    await self._queue_verification_request(
+                        member,
+                        matched_name,
+                        source="join-exact-display-name",
+                        game_user_id=stable_id,
+                    )
                     role_result = "pending leadership verification"
             elif not matched_name:
                 matches = await self.data.roster_suggestions(member.display_name, limit=3)
@@ -1415,7 +1792,23 @@ class OZYAdminBot(discord.Client):
         # Preserve an approved Discord -> Total Battle link for safe rejoins, but
         # clear join-session state so the full onboarding flow runs again later.
         self.state.clear_welcomed(member.id)
-        self.state.clear_verification_request(member.id)
+        pending_request = self.state.get_verification_request_record(member.id)
+        if pending_request:
+            reviewer = member.guild.me
+            reviewer_id = reviewer.id if reviewer else (self.user.id if self.user else 0)
+            resolved = self.state.resolve_verification_request(
+                member.id,
+                decision="cancelled",
+                reviewed_by_user_id=reviewer_id,
+                reason="Member left the Discord server before verification completed",
+            )
+            if resolved and reviewer:
+                await self._mark_verification_queue_resolved(
+                    resolved,
+                    decision="cancelled",
+                    reviewer=reviewer,
+                    reason="Member left the Discord server before verification completed",
+                )
         self.state.clear_away(member.id)
         await self._audit(
             "Member left Discord",
@@ -1443,12 +1836,14 @@ class OZYAdminBot(discord.Client):
         except DataUnavailable:
             return
         if exact:
+            info = await self.data.member_info(exact)
+            stable_id = str((info or {}).get("user_id", "")).strip() or None
             if self.settings.trust_exact_display_name:
-                info = await self.data.member_info(exact)
-                stable_id = str((info or {}).get("user_id", "")).strip() or None
                 linked_user = self.state.linked_user_for_identity(exact, stable_id)
                 if linked_user not in (None, after.id):
-                    self.state.set_verification_request(after.id, exact, "nickname-name-already-linked")
+                    await self._queue_verification_request(
+                        after, exact, source="nickname-name-already-linked", game_user_id=stable_id
+                    )
                     await self._audit(
                         "Roster verification requested",
                         str(after),
@@ -1465,7 +1860,9 @@ class OZYAdminBot(discord.Client):
                 action = "Roster auto-link"
                 details = f"Matched changed Discord name to {exact}; role sync: {result}"
             else:
-                self.state.set_verification_request(after.id, exact, "nickname-exact-match")
+                await self._queue_verification_request(
+                    after, exact, source="nickname-exact-match", game_user_id=stable_id
+                )
                 action = "Roster verification requested"
                 details = f"Changed Discord name matches {exact}; awaiting leadership approval"
             await self._audit(action, str(after), details)
@@ -2294,14 +2691,29 @@ class OZYAdminBot(discord.Client):
                         ephemeral=True,
                     )
                     return
+                pending_request = self.state.get_verification_request_record(member.id)
                 self.state.set_link(
                     member.id,
                     canonical,
                     f"leadership:{interaction.user.id}",
                     game_user_id=stable_id,
                 )
-                self.state.clear_verification_request(member.id)
                 role_result = await self._sync_rank_role(member, canonical)
+                if pending_request:
+                    resolved = self.state.resolve_verification_request(
+                        member.id,
+                        decision="approved",
+                        reviewed_by_user_id=interaction.user.id,
+                        reason="Approved via /member-link",
+                    )
+                    if resolved and isinstance(interaction.user, discord.Member):
+                        await self._mark_verification_queue_resolved(
+                            resolved,
+                            decision="approved",
+                            reviewer=interaction.user,
+                            reason="Approved via /member-link",
+                            role_result=role_result,
+                        )
             except DataUnavailable as exc:
                 await interaction.response.send_message(f"Roster unavailable: {exc}", ephemeral=True)
                 return
@@ -2323,20 +2735,53 @@ class OZYAdminBot(discord.Client):
             if interaction.guild is None:
                 await interaction.response.send_message("Guild unavailable.", ephemeral=True)
                 return
-            pending = self.state.all_verification_requests()
+            pending = self.state.all_verification_request_records()
             if not pending:
                 await interaction.response.send_message("No pending roster verification requests.", ephemeral=True)
                 return
             lines: list[str] = []
-            for user_id, game_name in list(pending.items())[:30]:
-                member = interaction.guild.get_member(user_id)
-                discord_name = member.display_name if member else f"Discord ID {user_id}"
-                lines.append(f"- **{discord_name}** -> `{game_name}`")
+            for request in pending[:25]:
+                member = interaction.guild.get_member(request.discord_user_id)
+                discord_name = member.display_name if member else f"Discord ID {request.discord_user_id}"
+                age = discord.utils.format_dt(request.requested_at_utc, style="R")
+                lines.append(f"- **{discord_name}** -> `{request.requested_game_name}` - {age}")
             text = "## Pending roster verifications\n" + "\n".join(lines)
-            if len(pending) > 30:
-                text += f"\n- ...and {len(pending) - 30} more"
-            text += "\n\nApprove with `/member-link`."
+            if len(pending) > 25:
+                text += f"\n- ...and {len(pending) - 25} more"
+            if self.settings.verification_channel_id:
+                channel = interaction.guild.get_channel(self.settings.verification_channel_id)
+                if isinstance(channel, discord.TextChannel):
+                    text += f"\n\nUse the **Approve / Reject** buttons in {channel.mention}."
+            else:
+                text += "\n\n`VERIFICATION_CHANNEL_ID` is not configured. Leadership can still approve with `/member-link`."
             await interaction.response.send_message(truncate(text, 1900), ephemeral=True)
+
+        @self.tree.command(name="verification-history", description="Leadership: show recent roster verification decisions")
+        async def verification_history(interaction: discord.Interaction) -> None:
+            if not await self._require_leadership(interaction):
+                return
+            if interaction.guild is None:
+                await interaction.response.send_message("Guild unavailable.", ephemeral=True)
+                return
+            history = self.state.verification_history(20)
+            if not history:
+                await interaction.response.send_message("No verification decisions recorded yet.", ephemeral=True)
+                return
+            lines: list[str] = []
+            for item in history:
+                member = interaction.guild.get_member(item.discord_user_id)
+                member_name = member.display_name if member else f"Discord ID {item.discord_user_id}"
+                reviewer = interaction.guild.get_member(item.reviewed_by_user_id)
+                reviewer_name = reviewer.display_name if reviewer else f"ID {item.reviewed_by_user_id}"
+                marker = "APPROVED" if item.decision == "approved" else item.decision.upper()
+                lines.append(
+                    f"- **{marker}** - {member_name} -> `{item.requested_game_name}` "
+                    f"by **{reviewer_name}** {discord.utils.format_dt(item.reviewed_at_utc, style='R')}"
+                )
+            await interaction.response.send_message(
+                truncate("## Verification history\n" + "\n".join(lines), 1900),
+                ephemeral=True,
+            )
 
         @member_link.autocomplete("game_name")
         async def member_link_autocomplete(interaction: discord.Interaction, current: str):

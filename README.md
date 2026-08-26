@@ -28,6 +28,8 @@ It is intentionally separate from `OZY Translator`. The translator only translat
   - suggests close roster names when the fuzzy score is above `ROSTER_MATCH_THRESHOLD`;
   - tells the member to use `/verify` with their exact Total Battle name.
 - `/verify` is a request, not proof of identity. It does not grant rank roles under the safe default.
+- Pending claims can be posted to a private leadership verification queue using `VERIFICATION_CHANNEL_ID`. Each claim has persistent **Approve** and **Reject** buttons.
+- Approval re-checks the current authoritative roster before creating the Discord-to-TB link; rejection can include a reason. Both outcomes are stored in verification history.
 - After leadership approves the link, the configured roster rank role is synchronized.
 - Nickname synchronization is optional and only runs after an approved link exists.
 - If an unlinked member later changes their server nickname to an exact roster name, the safe default creates/updates a pending verification request; it does not grant the rank role until leadership approves the link.
@@ -41,6 +43,14 @@ Example:
 ```env
 TROOP_LEVEL_ROLE_MAP=G1:111111111111111111,G2:222222222222222222,G3:333333333333333333,G4:444444444444444444,G5:555555555555555555,G6:666666666666666666,G7:777777777777777777,G8:888888888888888888,G9:999999999999999999
 ```
+
+For the leadership review queue, create a private text channel such as `LEADERSHIP / #verification` and set:
+
+```env
+VERIFICATION_CHANNEL_ID=123456789012345678
+```
+
+Leadership can review claims from the buttons in that channel, list them with `/pending-verifications`, and inspect recent decisions with `/verification-history`. `/member-link` remains the manual override/recovery command.
 
 Troop level is stored in the bot state database together with the Discord ID and, once approved, the canonical Total Battle name/stable `user_id`. A JSON file should be treated only as a generated/read-model export if the website needs it, not as the mutable source of truth.
 
@@ -125,7 +135,7 @@ The schedule can come from `SCHEDULE_URL` or `SCHEDULE_FILE`.
 OZY Admin can consume the public Total Battle tournament calendar directly:
 
 ```text
-https://nexusportal.voltron.me/api/calendar/content?realm=Regular
+https://<calendar-source>/api/calendar/content?realm=Regular
 ```
 
 No source login, cookie, personal account token, browser automation, or SignalR client is required. Automatic checks use the source's lightweight `snapshot-meta` endpoint first. Once a good snapshot exists, a temporary metadata failure keeps the cache instead of triggering an unnecessary full-content download.
@@ -252,6 +262,8 @@ AWAY_ROLE_ID=...
 ROSTER_URL=...
 CHEST_DATA_URL=...
 SCHEDULE_URL=...
+VERIFICATION_CHANNEL_ID=...
+STATE_DATABASE_URL=...
 CALENDAR_ENABLED=true
 CALENDAR_BASE_URL=...
 CALENDAR_REALM=Regular
@@ -354,7 +366,9 @@ The service exposes:
 
 on Render's `PORT`.
 
-`STATE_DB` stores Discord-to-game links, member profile metadata (including troop level), absences, verification requests, and daily-post dedupe in SQLite. A free/ephemeral filesystem can lose this state during redeploy/restart. For production, use persistent storage or migrate this state layer to Postgres. Do not make a writable JSON file the primary member-profile database on Render.
+OZY Admin now supports PostgreSQL for durable state. Set `STATE_DATABASE_URL` (or `DATABASE_URL`) and the bot automatically creates/migrates its state tables and uses a small PostgreSQL connection pool. This stores Discord-to-game links, member profiles, troop levels, absences, pending verification claims, verification decision history, welcome state, and post dedupe.
+
+Without a database URL, `STATE_DB` remains the SQLite fallback for local development. Do not use SQLite on an ephemeral Render filesystem for production identity state. See `STATE_STORAGE.md`. Do not make a writable JSON file the primary member-profile database.
 
 ## Safe rollout
 

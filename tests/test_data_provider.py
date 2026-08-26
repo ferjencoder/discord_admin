@@ -31,6 +31,7 @@ def make_settings(tmp_path: Path) -> Settings:
         away_channel_id=None,
         audit_channel_id=None,
         chest_channel_id=None,
+        verification_channel_id=None,
         roster_url=None,
         roster_file=tmp_path / "roster.json",
         chest_data_url=None,
@@ -59,6 +60,7 @@ def make_settings(tmp_path: Path) -> Settings:
         auto_sync_nickname=False,
         roster_match_threshold=0.78,
         state_db=tmp_path / "state.sqlite3",
+        state_database_url=None,
     )
 
 

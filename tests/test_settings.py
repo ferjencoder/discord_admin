@@ -16,6 +16,7 @@ def base_env(monkeypatch):
         "VERIFIED_ROLE_ID", "UNVERIFIED_ROLE_ID", "SPECIAL_ACCESS_ROLE_ID",
         "CHEST_CHANNEL_ID", "CHEST_RESET_POST_ENABLED", "CHEST_RESET_POST_TIME_UTC",
         "CHEST_REPORT_CHUNK_SIZE", "ROSTER_ACCESS_SYNC_MINUTES", "OZY_DATA_API_TOKEN",
+        "VERIFICATION_CHANNEL_ID", "STATE_DATABASE_URL", "DATABASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -32,6 +33,8 @@ def test_load_minimal_settings(monkeypatch):
     assert settings.chest_report_chunk_size == 20
     assert settings.roster_access_sync_minutes == 10
     assert settings.ozy_data_api_token is None
+    assert settings.verification_channel_id is None
+    assert settings.state_database_url is None
 
 
 def test_rank_role_map(monkeypatch):
@@ -94,3 +97,12 @@ def test_access_and_chest_settings(monkeypatch):
     assert settings.chest_report_chunk_size == 20
     assert settings.roster_access_sync_minutes == 5
     assert settings.ozy_data_api_token == "service-secret"
+
+
+def test_persistent_state_settings(monkeypatch):
+    base_env(monkeypatch)
+    monkeypatch.setenv("VERIFICATION_CHANNEL_ID", "3001")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@db.example/ozy")
+    settings = load_settings()
+    assert settings.verification_channel_id == 3001
+    assert settings.state_database_url == "postgresql://user:pass@db.example/ozy"

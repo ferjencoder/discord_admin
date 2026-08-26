@@ -11,3 +11,4 @@ data/*.sqlite3-*
 data/roster.json
 data/chest_data.json
 data/schedule.json
+.env.example
