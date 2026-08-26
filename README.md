@@ -366,9 +366,9 @@ The service exposes:
 
 on Render's `PORT`.
 
-OZY Admin now supports PostgreSQL for durable state. Set `STATE_DATABASE_URL` (or `DATABASE_URL`) and the bot automatically creates/migrates its state tables and uses a small PostgreSQL connection pool. This stores Discord-to-game links, member profiles, troop levels, absences, pending verification claims, verification decision history, welcome state, and post dedupe.
+For durable state while keeping the OZY stack free, use the authenticated OZY website snapshot endpoint. Set `STATE_REMOTE_URL=https://ozy.com.ar/api/ozy-admin/state` and `STATE_REMOTE_TOKEN`; OZY Admin restores its small SQLite working database from Netlify Blobs at startup and uploads a consistent snapshot after state mutations. This stores Discord-to-game links, member profiles, troop levels, absences, pending verification claims, verification decision history, welcome state, and post dedupe without a separate hosted database.
 
-Without a database URL, `STATE_DB` remains the SQLite fallback for local development. Do not use SQLite on an ephemeral Render filesystem for production identity state. See `STATE_STORAGE.md`. Do not make a writable JSON file the primary member-profile database.
+Without `STATE_REMOTE_URL`, `STATE_DB` remains the SQLite fallback for local development. Do not rely on Render's ephemeral filesystem alone for production identity state. See `STATE_STORAGE.md`. Private Discord/admin state must not be exposed as public JSON.
 
 ## Safe rollout
 

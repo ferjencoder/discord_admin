@@ -12,7 +12,9 @@ OZY Today now rolls automatically at R+0 = 17:00 UTC.
 There is no separate Today posting-time variable anymore.
 
 Persistent member/admin state for launch:
-STATE_DATABASE_URL=<Render Postgres internal connection URL>
+STATE_REMOTE_URL=https://ozy.com.ar/api/ozy-admin/state
+STATE_REMOTE_TOKEN=<same secret as Netlify OZY_ADMIN_STATE_TOKEN>
+STATE_REMOTE_TIMEOUT_SECONDS=10
 VERIFICATION_CHANNEL_ID=<private leadership verification channel ID>
 
 Verify /healthz reports "state_backend": "postgres" after deployment.

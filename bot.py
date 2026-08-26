@@ -718,7 +718,13 @@ class OZYAdminBot(discord.Client):
         super().__init__(intents=intents)
         self.settings = settings
         self.tree = app_commands.CommandTree(self)
-        self.state = AdminState(settings.state_db, settings.state_database_url)
+        self.state = AdminState(
+            settings.state_db,
+            settings.state_database_url,
+            remote_url=settings.state_remote_url,
+            remote_token=settings.state_remote_token,
+            remote_timeout_seconds=settings.state_remote_timeout_seconds,
+        )
         self._registered_verification_review_ids: set[int] = set()
 
         self.http_session: aiohttp.ClientSession | None = None

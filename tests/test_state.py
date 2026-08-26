@@ -134,3 +134,44 @@ def test_state_storage_label_for_sqlite(tmp_path):
     state = AdminState(tmp_path / "state.sqlite3")
     assert state.backend == "sqlite"
     assert "SQLite" in state.storage_label
+
+
+def test_web_snapshot_roundtrip_across_fresh_local_files(tmp_path, monkeypatch):
+    remote = {"payload": None}
+
+    def fake_remote_request(self, method, body=None):
+        if method == "GET":
+            return remote["payload"]
+        if method == "PUT":
+            remote["payload"] = bytes(body or b"")
+            return b'{"ok":true}'
+        raise AssertionError(method)
+
+    monkeypatch.setattr(AdminState, "_remote_request", fake_remote_request)
+
+    first = AdminState(
+        tmp_path / "first.sqlite3",
+        remote_url="https://ozy.com.ar/api/ozy-admin/state",
+        remote_token="x" * 32,
+    )
+    assert first.backend == "web-snapshot"
+    first.set_link(123, "PeekABoo Death", "test", game_user_id="tb:90741542")
+    first.set_troop_level(123, "G9", "onboarding-role")
+    assert remote["payload"] is not None
+    assert remote["payload"].startswith(AdminState.SQLITE_HEADER)
+    first.close()
+
+    second = AdminState(
+        tmp_path / "second.sqlite3",
+        remote_url="https://ozy.com.ar/api/ozy-admin/state",
+        remote_token="x" * 32,
+    )
+    record = second.get_link_record(123)
+    assert record is not None
+    assert record.game_name == "PeekABoo Death"
+    assert record.game_user_id == "tb:90741542"
+    profile = second.get_member_profile(123)
+    assert profile is not None
+    assert profile.troop_level == "G9"
+    assert "OZY Web snapshot" in second.storage_label
+    second.close()

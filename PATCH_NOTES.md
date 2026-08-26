@@ -1,44 +1,31 @@
-# OZY Admin - Onboarding / Roster / Member Profile Patch
+# OZY Admin - OZY website state persistence
 
-## What changed
+## Production architecture
 
-- New-member access starts locked until an active OZY roster identity is approved or Special Access is granted.
-- Exact Total Battle name is validated against the authoritative roster API/data layer.
-- Invalid names get a retry flow asking for the precise current clan name.
-- Stable Total Battle `user_id` is preserved as the durable roster identity when available.
-- Existing approved links are revalidated against the active roster on rejoin before access is restored.
-- Discord Community Onboarding troop-level roles (`G1`-`G9`) can be mapped with `TROOP_LEVEL_ROLE_MAP`.
-- Troop level is stored in `member_profiles` and updated when mapped Discord roles change.
-- `/verify` without arguments opens the verification modal; `/verify game_name:<name>` still works.
-- `/member` shows troop level when available.
-- Startup command sync validation was restored.
-- Calendar runtime naming/settings regressions were corrected and Today remains R+0-to-R+0 at 17:00 UTC.
+- Local working state: `data/ozy_admin.sqlite3`
+- Durable state: authenticated snapshot stored by `ozy.com.ar` in Netlify Blobs
+- No separate hosted database required
+- PostgreSQL support remains only as an unused compatibility option
 
-## Required environment addition
-
-Example only - replace with your real Discord role IDs:
+## New Render variables
 
 ```env
-TROOP_LEVEL_ROLE_MAP=G1:111111111111111111,G2:222222222222222222,G3:333333333333333333,G4:444444444444444444,G5:555555555555555555,G6:666666666666666666,G7:777777777777777777,G8:888888888888888888,G9:999999999999999999
+STATE_REMOTE_URL=https://ozy.com.ar/api/ozy-admin/state
+STATE_REMOTE_TOKEN=<same secret configured on Netlify>
+STATE_REMOTE_TIMEOUT_SECONDS=10
+STATE_DB=data/ozy_admin.sqlite3
 ```
 
-## Recommended Discord Onboarding question
+Do not configure `STATE_DATABASE_URL` or `DATABASE_URL` when `STATE_REMOTE_URL` is used.
 
-Question: `What is your highest troop level?`
+## Safety behavior
 
-- Required: Yes
-- Multiple answers: No
-- Answers: G1, G2, G3, G4, G5, G6, G7, G8, G9
-- Each answer assigns exactly one matching troop-level role.
+- Startup GET 404 means first run and initializes new state.
+- Authentication errors, network failures, or server errors fail startup rather than overwriting durable state with an empty DB.
+- Remote payloads must have a valid SQLite file header.
+- Local database snapshots are generated with SQLite's backup API before upload.
+- State endpoint token is separate from public/browser credentials.
 
-Do not use Community Onboarding as the exact Total Battle-name authority. OZY Admin's verification modal collects the free-text exact name and checks it against the active roster.
+## Verification/onboarding state persisted
 
-## Persistence
-
-The patch stores operational member profile data in the existing SQLite state database. Do not make a writable JSON file the canonical profile store. On an ephemeral Render filesystem, migrate this state to persistent storage/Postgres before relying on it as permanent member metadata. A JSON profile file can be generated later as a read model/export if the website needs it.
-
-## Validation
-
-- `pytest -q`: 40 passed
-- Python compile checks: passed
-- `git diff --check`: passed
+The snapshot includes all existing OZY Admin state tables, including member identity links, stable TB IDs, troop profiles, pending verification claims/history, Away state, welcome state, and calendar/chest/schedule dedupe state.

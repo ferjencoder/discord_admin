@@ -61,6 +61,9 @@ def make_settings(tmp_path: Path) -> Settings:
         roster_match_threshold=0.78,
         state_db=tmp_path / "state.sqlite3",
         state_database_url=None,
+        state_remote_url=None,
+        state_remote_token=None,
+        state_remote_timeout_seconds=10.0,
     )
 
 

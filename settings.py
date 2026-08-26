@@ -204,6 +204,9 @@ class Settings:
     roster_match_threshold: float
     state_db: Path
     state_database_url: str | None
+    state_remote_url: str | None
+    state_remote_token: str | None
+    state_remote_timeout_seconds: float
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -231,6 +234,14 @@ def load_settings() -> Settings:
     calendar_base_url = os.getenv("CALENDAR_BASE_URL", "").strip().rstrip("/")
     if calendar_enabled and not calendar_base_url:
         raise ConfigError("CALENDAR_BASE_URL is required when CALENDAR_ENABLED=true")
+
+    state_database_url = (os.getenv("STATE_DATABASE_URL", "").strip() or os.getenv("DATABASE_URL", "").strip() or None)
+    state_remote_url = os.getenv("STATE_REMOTE_URL", "").strip() or None
+    state_remote_token = os.getenv("STATE_REMOTE_TOKEN", "").strip() or None
+    if state_remote_url and not state_remote_token:
+        raise ConfigError("STATE_REMOTE_TOKEN is required when STATE_REMOTE_URL is configured")
+    if state_remote_url and state_database_url:
+        raise ConfigError("Use either STATE_REMOTE_URL or STATE_DATABASE_URL/DATABASE_URL, not both")
 
     return Settings(
         discord_token=token,
@@ -297,5 +308,8 @@ def load_settings() -> Settings:
         auto_sync_nickname=_env_bool("AUTO_SYNC_NICKNAME", False),
         roster_match_threshold=_env_float("ROSTER_MATCH_THRESHOLD", 0.78, 0.0),
         state_db=Path(os.getenv("STATE_DB", "data/ozy_admin.sqlite3")).expanduser(),
-        state_database_url=(os.getenv("STATE_DATABASE_URL", "").strip() or os.getenv("DATABASE_URL", "").strip() or None),
+        state_database_url=state_database_url,
+        state_remote_url=state_remote_url,
+        state_remote_token=state_remote_token,
+        state_remote_timeout_seconds=_env_float("STATE_REMOTE_TIMEOUT_SECONDS", 10.0, 1.0),
     )

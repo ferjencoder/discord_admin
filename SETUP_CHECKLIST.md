@@ -114,7 +114,7 @@ SERVER_ID=...
 
 Then add the channel/role/data variables above.
 
-For persistent production state, create/connect a PostgreSQL database and set its internal connection URL as `STATE_DATABASE_URL`. Create a private leadership text channel such as `#verification` and set `VERIFICATION_CHANNEL_ID` to that channel ID. See `STATE_STORAGE.md`.
+For persistent production state, configure the authenticated `https://ozy.com.ar/api/ozy-admin/state` Netlify Blob endpoint and set `STATE_REMOTE_URL` plus `STATE_REMOTE_TOKEN` in Render. Create a private leadership text channel such as `#verification` and set `VERIFICATION_CHANNEL_ID` to that channel ID. See `STATE_STORAGE.md`.
 
 Recommended schedule/calendar defaults:
 

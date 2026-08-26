@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
+import tempfile
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -8,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any
+
+log = logging.getLogger("ozy-admin.state")
 
 try:
     import psycopg
@@ -84,25 +91,46 @@ class _ConnectionAdapter:
 class AdminState:
     """Persistent OZY Admin state.
 
-    PostgreSQL is preferred for Render/production when STATE_DATABASE_URL or
-    DATABASE_URL is configured. SQLite remains supported for local development
-    and for paid Render services with a persistent disk mounted under STATE_DB.
+    The preferred free-production mode keeps SQLite as the bot's local working
+    database and mirrors a consistent SQLite snapshot to an authenticated
+    endpoint hosted by ozy.com.ar. On every restart, the remote snapshot is
+    restored before the schema is opened. This avoids depending on Render's
+    ephemeral filesystem without requiring a separate hosted database.
+
+    PostgreSQL remains supported as an optional compatibility backend.
     """
 
-    def __init__(self, path: Path, database_url: str | None = None):
+    SQLITE_HEADER = b"SQLite format 3\x00"
+
+    def __init__(
+        self,
+        path: Path,
+        database_url: str | None = None,
+        *,
+        remote_url: str | None = None,
+        remote_token: str | None = None,
+        remote_timeout_seconds: float = 10.0,
+    ):
         self.path = path
         self.database_url = (database_url or "").strip() or None
-        self.backend = "postgres" if self.database_url else "sqlite"
+        self.remote_url = (remote_url or "").strip() or None
+        self.remote_token = (remote_token or "").strip() or None
+        self.remote_timeout_seconds = max(1.0, float(remote_timeout_seconds))
+        if self.database_url and self.remote_url:
+            raise RuntimeError("Use either PostgreSQL state or OZY web snapshot state, not both")
+        if self.remote_url and not self.remote_token:
+            raise RuntimeError("remote_token is required when remote_url is configured")
+
+        self.backend = "web-snapshot" if self.remote_url else ("postgres" if self.database_url else "sqlite")
         self._lock = RLock()
-        if self.backend == "sqlite":
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-        elif psycopg is None or ConnectionPool is None:
-            raise RuntimeError(
-                "STATE_DATABASE_URL/DATABASE_URL is configured but psycopg is not installed. "
-                "Install requirements.txt before starting OZY Admin."
-            )
         self._pool = None
+
         if self.backend == "postgres":
+            if psycopg is None or ConnectionPool is None:
+                raise RuntimeError(
+                    "STATE_DATABASE_URL/DATABASE_URL is configured but psycopg is not installed. "
+                    "Install requirements.txt before starting OZY Admin."
+                )
             assert self.database_url is not None and ConnectionPool is not None
             self._pool = ConnectionPool(
                 conninfo=self.database_url,
@@ -111,11 +139,95 @@ class AdminState:
                 kwargs={"row_factory": dict_row},
                 open=True,
             )
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.remote_url:
+                self._restore_remote_snapshot()
+
         self._init_db()
+        if self.remote_url:
+            # Persist schema migrations/new empty state immediately. The remote
+            # GET is fail-closed, so this cannot overwrite an unreachable copy.
+            self._push_remote_snapshot()
 
     @property
     def storage_label(self) -> str:
-        return "PostgreSQL" if self.backend == "postgres" else f"SQLite ({self.path})"
+        if self.backend == "postgres":
+            return "PostgreSQL"
+        if self.backend == "web-snapshot":
+            return f"OZY Web snapshot + SQLite cache ({self.path})"
+        return f"SQLite ({self.path})"
+
+    def _remote_request(self, method: str, body: bytes | None = None) -> bytes | None:
+        assert self.remote_url is not None and self.remote_token is not None
+        headers = {
+            "X-OZY-State-Token": self.remote_token,
+            "Accept": "application/octet-stream",
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/octet-stream"
+        request = urllib.request.Request(
+            self.remote_url,
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.remote_timeout_seconds) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if method == "GET" and exc.code == 404:
+                return None
+            detail = ""
+            try:
+                detail = exc.read(300).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"OZY web state endpoint returned HTTP {exc.code}" + (f": {detail}" if detail else "")
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(f"OZY web state endpoint is unavailable: {exc}") from exc
+
+    def _restore_remote_snapshot(self) -> None:
+        payload = self._remote_request("GET")
+        if payload is None:
+            log.info("No OZY web state snapshot exists yet; starting with a new state database")
+            return
+        if len(payload) < len(self.SQLITE_HEADER) or not payload.startswith(self.SQLITE_HEADER):
+            raise RuntimeError("OZY web state endpoint returned an invalid SQLite snapshot")
+
+        tmp = self.path.with_suffix(self.path.suffix + ".restore")
+        tmp.write_bytes(payload)
+        os.replace(tmp, self.path)
+        log.info("Restored OZY Admin state snapshot from ozy.com.ar (%d bytes)", len(payload))
+
+    def _snapshot_bytes(self) -> bytes:
+        if not self.path.exists():
+            return b""
+        fd, tmp_name = tempfile.mkstemp(prefix="ozy-admin-state-", suffix=".sqlite3")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            source = sqlite3.connect(self.path)
+            destination = sqlite3.connect(tmp_path)
+            try:
+                source.backup(destination)
+                destination.commit()
+            finally:
+                destination.close()
+                source.close()
+            return tmp_path.read_bytes()
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def _push_remote_snapshot(self) -> None:
+        if not self.remote_url:
+            return
+        payload = self._snapshot_bytes()
+        if not payload.startswith(self.SQLITE_HEADER):
+            raise RuntimeError("Refusing to upload an invalid local SQLite state snapshot")
+        self._remote_request("PUT", payload)
 
     @contextmanager
     def _conn(self):
@@ -135,15 +247,19 @@ class AdminState:
             raw = sqlite3.connect(self.path)
             raw.row_factory = sqlite3.Row
             conn = _ConnectionAdapter(raw, self.backend)
+            changed = False
             try:
                 yield conn
                 raw.commit()
+                changed = raw.total_changes > 0
             except Exception:
                 raw.rollback()
                 raise
             finally:
                 raw.close()
 
+            if changed and self.remote_url:
+                self._push_remote_snapshot()
 
     def close(self) -> None:
         if self._pool is not None:
