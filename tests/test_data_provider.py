@@ -17,6 +17,7 @@ def make_settings(tmp_path: Path) -> Settings:
         self_ping_interval_seconds=600,
         leadership_role_ids=frozenset(),
         rank_role_map={},
+        troop_level_role_map={},
         away_role_id=None,
         verified_role_id=None,
         unverified_role_id=None,

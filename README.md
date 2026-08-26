@@ -1,6 +1,6 @@
 # OZY Admin Bot
 
-See `CALENDAR_SETUP.md` for the Voltron/Discord calendar deployment walkthrough.
+See `CALENDAR_SETUP.md` for the tournament-calendar / Discord deployment walkthrough.
 
 A separate, least-privilege Discord operations bot for the OZY Total Battle clan.
 
@@ -11,7 +11,15 @@ It is intentionally separate from `OZY Translator`. The translator only translat
 ### Member onboarding and roster verification
 
 - Greets new Discord members in `WELCOME_CHANNEL_ID`.
-- Compares their Discord server display name/nickname to the active Total Battle roster.
+- New arrivals start with the configured Unverified access role until an approved roster link exists.
+- Compares their Discord server display name/nickname to the active Total Battle roster only as a convenience hint.
+- Every welcome message includes a persistent **Verify OZY membership** button.
+- The verification form asks for:
+  - the member's exact current Total Battle name in OZY;
+  - highest troop level (`G1` through `G9`).
+- If the entered game name is not an exact active-roster match, the bot rejects it, suggests close roster names, and offers a retry button.
+- With the safe default `TRUST_EXACT_DISPLAY_NAME=false`, an exact claimed roster name creates a pending verification request. Leadership still approves the Discord-account -> roster-identity link before normal access/rank roles are granted.
+- Existing approved links are preserved by stable Total Battle `user_id`, so a legitimate rename or Discord rejoin can restore the correct identity without creating a new account binding.
 - Exact display-name match:
   - identifies the likely Total Battle player;
   - with the safe default `TRUST_EXACT_DISPLAY_NAME=false`, creates a pending verification request only;
@@ -24,7 +32,17 @@ It is intentionally separate from `OZY Translator`. The translator only translat
 - Nickname synchronization is optional and only runs after an approved link exists.
 - If an unlinked member later changes their server nickname to an exact roster name, the safe default creates/updates a pending verification request; it does not grant the rank role until leadership approves the link.
 
-Important: Discord Onboarding does not provide this bot with a free-text "Total Battle name" answer. The candidate name is the member's Discord server display name. `/verify` is the explicit correction/link mechanism.
+Important: Discord Community Onboarding customization questions are option-based role/channel selectors, not a free-text identity field. Do **not** use Community Onboarding as the authoritative source for the Total Battle player name. Use the OZY Admin verification form for the exact game name.
+
+For troop level, Community Onboarding is useful because the answer is categorical. Create one required, single-select question such as **"What is your highest troop level?"** with answers `G1` ... `G9`, and assign one Discord role to each answer. Map those role IDs with `TROOP_LEVEL_ROLE_MAP`. OZY Admin reads the assigned role after onboarding and updates the member profile whenever the role changes.
+
+Example:
+
+```env
+TROOP_LEVEL_ROLE_MAP=G1:111111111111111111,G2:222222222222222222,G3:333333333333333333,G4:444444444444444444,G5:555555555555555555,G6:666666666666666666,G7:777777777777777777,G8:888888888888888888,G9:999999999999999999
+```
+
+Troop level is stored in the bot state database together with the Discord ID and, once approved, the canonical Total Battle name/stable `user_id`. A JSON file should be treated only as a generated/read-model export if the website needs it, not as the mutable source of truth.
 
 ### Roster roles
 
@@ -102,15 +120,15 @@ The Discord announcement is posted to `ANNOUNCEMENT_CHANNEL_ID`. If TB text is s
 
 The schedule can come from `SCHEDULE_URL` or `SCHEDULE_FILE`.
 
-### Voltron tournament calendar
+### Tournament calendar
 
-OZY Admin can consume Voltron's public Total Battle calendar directly:
+OZY Admin can consume the public Total Battle tournament calendar directly:
 
 ```text
 https://nexusportal.voltron.me/api/calendar/content?realm=Regular
 ```
 
-No Voltron login, cookie, personal account token, browser automation, or SignalR client is required. Automatic checks use Voltron's lightweight `snapshot-meta` endpoint first. Once a good snapshot exists, a temporary metadata failure keeps the cache instead of triggering an unnecessary full-content download.
+No source login, cookie, personal account token, browser automation, or SignalR client is required. Automatic checks use the source's lightweight `snapshot-meta` endpoint first. Once a good snapshot exists, a temporary metadata failure keeps the cache instead of triggering an unnecessary full-content download.
 
 Behavior:
 
@@ -119,13 +137,13 @@ Behavior:
 - The 30-day view lists tournament **STARTS** only so the channel remains readable.
 - `TODAY_CHANNEL_ID` gets one canonical daily post.
 - Today's post includes **starts, active/continues, ends, and regular mini events** for that UTC game date.
-- If Voltron changes after today's message was posted, OZY Admin edits the existing message instead of adding another one.
+- If the calendar source changes after today's message was posted, OZY Admin edits the existing message instead of adding another one.
 - Repeated reactions/restarts are irrelevant; canonical message IDs are stored in SQLite and can also be recovered by scanning recent bot messages if Render loses the local database.
 - Tournament source times are parsed as UTC. Public calendar/today posts use the Total Battle reset clock: **17:00 UTC = R+0**. Fractional offsets such as `R+1.5` are supported.
 - Regular mini events are read from `https://akurier.pl/events` **once per UTC day at 18:00 (R+1)**; the separate **for SK below** table is intentionally ignored. Akurier clock values are interpreted as `Europe/Warsaw` and converted to UTC before reset-clock formatting.
 - `/time` gives the requesting member an **ephemeral** local-time version of today's schedule for a selected timezone. Discord does not expose a member's country/timezone to the bot, so this is user-selected.
 - The parser rejects suspiciously empty snapshots instead of wiping the existing Discord calendar.
-- If Voltron is temporarily unavailable, the last good Discord calendar remains untouched.
+- If the calendar source is temporarily unavailable, the last good Discord calendar remains untouched.
 
 Commands:
 
@@ -135,7 +153,7 @@ Commands:
 - `/calendar-status` - leadership diagnostics.
 - `/time` - private local-time conversion of today's game schedule.
 
-Automatic Voltron traffic is deliberately sparse while the source cadence is being learned: lightweight metadata probes run at **00:30, 06:30, 12:30 and 18:30 UTC**. Full calendar content is downloaded only on startup, when `snapshot-meta` changes, or when leadership explicitly runs `/calendar-refresh`. Source timestamp changes are logged so the probe schedule can later be reduced to one check roughly 20-30 minutes after Voltron's normal refresh.
+Automatic calendar-source traffic is deliberately sparse while the source cadence is being learned: lightweight metadata probes run at **00:30, 06:30, 12:30 and 18:30 UTC**. Full calendar content is downloaded only on startup, when `snapshot-meta` changes, or when leadership explicitly runs `/calendar-refresh`. Source timestamp changes are logged so the probe schedule can later be reduced to one check roughly 20-30 minutes after the source's normal refresh.
 
 ### Audit log
 
@@ -160,13 +178,13 @@ Administrative actions can be written to `AUDIT_CHANNEL_ID`, including:
 | `/away` | Everyone | Register absence |
 | `/back` | Everyone | Clear absence |
 | `/schedule` | Everyone | View today's OZY-specific schedule |
-| `/calendar` | Everyone | View the next 30 days of Voltron tournament starts |
-| `/today` | Everyone | View today's Voltron tournament activity |
+| `/calendar` | Everyone | View the next 30 days of tournament starts |
+| `/today` | Everyone | View today's tournament activity |
 | `/event-create` | Verified members | Open the event form, choose category/location/publish channel, then set reset date/time and duration |
 | `/announce` | Leadership | Open announcement modal |
 | `/schedule-post` | Leadership | Force-post today's OZY-specific schedule |
-| `/calendar-refresh` | Leadership | Force Voltron refresh and update Discord |
-| `/calendar-status` | Leadership | Show Voltron source/cache health |
+| `/calendar-refresh` | Leadership | Force tournament-calendar refresh and update Discord |
+| `/calendar-status` | Leadership | Show tournament source/cache health |
 | `/member-link` | Leadership | Approve/link a Discord member to roster |
 | `/pending-verifications` | Leadership | Review pending roster-link requests |
 | `/sync-roles` | Leadership | Preview/apply rank role sync for approved links |
@@ -229,15 +247,16 @@ AUDIT_CHANNEL_ID=...
 ANNOUNCEMENT_PING_ROLE_ID=...
 LEADERSHIP_ROLE_IDS=...
 RANK_ROLE_MAP=...
+TROOP_LEVEL_ROLE_MAP=...
 AWAY_ROLE_ID=...
 ROSTER_URL=...
 CHEST_DATA_URL=...
 SCHEDULE_URL=...
-VOLTRON_CALENDAR_ENABLED=true
-VOLTRON_REALM=Regular
-VOLTRON_CALENDAR_DAYS=30
-VOLTRON_TODAY_ENABLED=true
-VOLTRON_TODAY_TIME=08:00
+CALENDAR_ENABLED=true
+CALENDAR_BASE_URL=...
+CALENDAR_REALM=Regular
+CALENDAR_DAYS=30
+TODAY_ENABLED=true
 ```
 
 ## Roster data
@@ -335,7 +354,7 @@ The service exposes:
 
 on Render's `PORT`.
 
-`STATE_DB` stores Discord-to-game links, absences, and daily-post dedupe in SQLite. A free/ephemeral filesystem can lose this state during redeploy/restart. For durable production state, use persistent storage or migrate the small state layer to Postgres.
+`STATE_DB` stores Discord-to-game links, member profile metadata (including troop level), absences, verification requests, and daily-post dedupe in SQLite. A free/ephemeral filesystem can lose this state during redeploy/restart. For production, use persistent storage or migrate this state layer to Postgres. Do not make a writable JSON file the primary member-profile database on Render.
 
 ## Safe rollout
 

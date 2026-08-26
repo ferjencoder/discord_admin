@@ -108,6 +108,28 @@ def _rank_role_map() -> dict[str, int]:
     return result
 
 
+def _troop_level_role_map() -> dict[str, int]:
+    raw = os.getenv("TROOP_LEVEL_ROLE_MAP", "").strip()
+    if not raw:
+        return {}
+    result: dict[str, int] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            raise ConfigError("TROOP_LEVEL_ROLE_MAP entries must look like G8:ROLE_ID")
+        level, role_id = pair.rsplit(":", 1)
+        level = level.strip().upper()
+        role_id = role_id.strip()
+        if not level or not role_id.isdigit():
+            raise ConfigError(f"Invalid TROOP_LEVEL_ROLE_MAP entry: {pair!r}")
+        if not level.startswith("G") or not level[1:].isdigit():
+            raise ConfigError(f"Invalid troop level {level!r}; expected values like G8 or G9")
+        result[level] = int(role_id)
+    return result
+
+
 def _validate_hhmm(name: str, value: str) -> str:
     parts = value.split(":")
     if len(parts) != 2:
@@ -132,6 +154,7 @@ class Settings:
 
     leadership_role_ids: frozenset[int]
     rank_role_map: dict[str, int]
+    troop_level_role_map: dict[str, int]
     away_role_id: int | None
     verified_role_id: int | None
     unverified_role_id: int | None
@@ -217,6 +240,7 @@ def load_settings() -> Settings:
 
         leadership_role_ids=_id_set("LEADERSHIP_ROLE_IDS"),
         rank_role_map=_rank_role_map(),
+        troop_level_role_map=_troop_level_role_map(),
         away_role_id=_optional_id("AWAY_ROLE_ID"),
         verified_role_id=_optional_id("VERIFIED_ROLE_ID"),
         unverified_role_id=_optional_id("UNVERIFIED_ROLE_ID"),

@@ -19,11 +19,12 @@ from settings import ConfigError, Settings, load_settings
 from state import AdminState
 from utils import format_chat_directory, format_chest_ranking_blocks, format_schedule, safe_code_block, truncate
 from event_calendar import (
-    VoltronCalendarClient,
-    VoltronCalendarError,
+    TournamentCalendarClient,
+    CalendarSourceError,
     build_calendar_chunks,
     build_today_chunks,
     build_today_local_chunks,
+    game_day_for_instant,
     reset_label,
 )
 
@@ -53,10 +54,12 @@ TIMEZONE_CHOICES = [
     app_commands.Choice(name="South Africa", value="Africa/Johannesburg"),
 ]
 
+TROOP_LEVELS = tuple(f"G{i}" for i in range(1, 10))
+
 # Minimal-impact source schedule. Public calendar metadata is checked only four
-# times per UTC day while we learn Voltron's actual source refresh cadence.
+# times per UTC day while we learn the calendar source refresh cadence.
 # Akurier regular mini-events are fetched once daily at R+1 (18:00 UTC).
-VOLTRON_META_PROBE_TIMES_UTC = ((0, 30), (6, 30), (12, 30), (18, 30))
+CALENDAR_META_PROBE_TIMES_UTC = ((0, 30), (6, 30), (12, 30), (18, 30))
 AKURIER_REFRESH_TIME_UTC = (18, 0)
 
 
@@ -501,6 +504,93 @@ class EventScheduleView(discord.ui.View):
         return False
 
 
+class MembershipVerificationModal(discord.ui.Modal):
+    """Collect the exact Total Battle name and member-entered troop level."""
+
+    def __init__(
+        self,
+        bot: "OZYAdminBot",
+        *,
+        member: discord.Member,
+        current_troop_level: str | None = None,
+    ):
+        super().__init__(title="Verify OZY Membership", timeout=300)
+        self.bot = bot
+        self.member_id = member.id
+
+        self.game_name = discord.ui.TextInput(
+            placeholder="Exact Total Battle name used in OZY",
+            default=member.display_name[:100],
+            max_length=100,
+        )
+        options = [
+            discord.SelectOption(
+                label=level,
+                value=level,
+                default=(level == current_troop_level),
+            )
+            for level in TROOP_LEVELS
+        ]
+        self.troop_level = discord.ui.Select(
+            placeholder="Select your highest troop level",
+            options=options,
+            min_values=1,
+            max_values=1,
+            required=True,
+        )
+
+        self.add_item(discord.ui.Label(text="Exact Total Battle name", component=self.game_name))
+        self.add_item(discord.ui.Label(text="Highest troop level", component=self.troop_level))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message("This verification form belongs to another member.", ephemeral=True)
+            return
+        level = self.troop_level.values[0] if self.troop_level.values else None
+        await self.bot._submit_membership_verification(
+            interaction,
+            game_name=str(self.game_name.value),
+            troop_level=level,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Membership verification modal failed", exc_info=error)
+        if interaction.response.is_done():
+            await interaction.followup.send("Verification failed. Try `/verify` or contact leadership.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Verification failed. Try `/verify` or contact leadership.", ephemeral=True)
+
+
+class MembershipVerificationView(discord.ui.View):
+    """Persistent welcome-button entry point for roster verification."""
+
+    def __init__(self, bot: "OZYAdminBot"):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="Verify OZY membership",
+        style=discord.ButtonStyle.primary,
+        custom_id="ozy:membership:verify",
+    )
+    async def verify_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.bot._open_membership_verification(interaction)
+
+
+class MembershipVerificationRetryView(discord.ui.View):
+    def __init__(self, bot: "OZYAdminBot", member_id: int):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.member_id = member_id
+
+    @discord.ui.button(label="Enter exact name again", style=discord.ButtonStyle.primary)
+    async def retry_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message("This verification belongs to another member.", ephemeral=True)
+            return
+        await self.bot._open_membership_verification(interaction)
+
+
 class AnnouncementModal(discord.ui.Modal):
     def __init__(self, bot: "OZYAdminBot", ping: bool):
         super().__init__(title="OZY Announcement", timeout=300)
@@ -559,7 +649,7 @@ class OZYAdminBot(discord.Client):
 
         self.http_session: aiohttp.ClientSession | None = None
         self.data: DataProvider | None = None
-        self.voltron: VoltronCalendarClient | None = None
+        self.calendar_client: TournamentCalendarClient | None = None
         self.health_runner: web.AppRunner | None = None
         self.background_tasks: list[asyncio.Task] = []
         self._guild_validated = False
@@ -575,14 +665,25 @@ class OZYAdminBot(discord.Client):
         # in outbound read-only source requests.
         self.http_session = aiohttp.ClientSession()
         self.data = DataProvider(self.settings, self.http_session)
-        self.voltron = VoltronCalendarClient(self.settings, self.http_session)
+        self.calendar_client = TournamentCalendarClient(self.settings, self.http_session)
 
         await self._start_health_server()
+
+        # Persistent welcome verification button. Register it before command
+        # sync so old welcome messages keep working after a restart/redeploy.
+        self.add_view(MembershipVerificationView(self))
 
         guild = discord.Object(id=self.settings.server_id)
         self.tree.copy_global_to(guild=guild)
         synced = await self.tree.sync(guild=guild)
         log.info("Synced %d application commands to guild %s", len(synced), self.settings.server_id)
+        synced_names = {command.name for command in synced}
+        required_commands = {"event-create", "calendar", "today", "time"}
+        missing_commands = sorted(required_commands - synced_names)
+        if missing_commands:
+            raise ConfigError(
+                "Discord command sync is incomplete; missing: " + ", ".join(missing_commands)
+            )
 
         self.background_tasks.append(asyncio.create_task(self._daily_schedule_loop(), name="daily-schedule"))
         self.background_tasks.append(asyncio.create_task(self._away_expiry_loop(), name="away-expiry"))
@@ -595,11 +696,11 @@ class OZYAdminBot(discord.Client):
             or self.settings.special_access_role_id
         ):
             self.background_tasks.append(asyncio.create_task(self._roster_access_sync_loop(), name="roster-access-sync"))
-        if self.settings.voltron_calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
-            self.background_tasks.append(asyncio.create_task(self._voltron_refresh_loop(), name="voltron-refresh"))
+        if self.settings.calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
+            self.background_tasks.append(asyncio.create_task(self._calendar_refresh_loop(), name="calendar-refresh"))
             self.background_tasks.append(asyncio.create_task(self._akurier_refresh_loop(), name="akurier-refresh"))
-            if self.settings.voltron_today_enabled and self.settings.today_channel_id:
-                self.background_tasks.append(asyncio.create_task(self._voltron_today_loop(), name="voltron-today"))
+            if self.settings.today_enabled and self.settings.today_channel_id:
+                self.background_tasks.append(asyncio.create_task(self._calendar_today_loop(), name="calendar-today"))
 
         if self.settings.self_ping_enabled and self.settings.render_external_url:
             self.background_tasks.append(asyncio.create_task(self._self_ping_loop(), name="self-ping"))
@@ -708,6 +809,7 @@ class OZYAdminBot(discord.Client):
                 )
 
         role_ids = set(self.settings.rank_role_map.values())
+        role_ids.update(self.settings.troop_level_role_map.values())
         if self.settings.away_role_id:
             role_ids.add(self.settings.away_role_id)
         if self.settings.verified_role_id:
@@ -831,6 +933,205 @@ class OZYAdminBot(discord.Client):
         except discord.HTTPException as exc:
             log.warning("Audit log send failed: %s", exc)
 
+    def _troop_level_from_roles(self, member: discord.Member) -> tuple[str | None, list[str]]:
+        """Resolve the single troop level assigned by Discord Onboarding roles."""
+        if not self.settings.troop_level_role_map:
+            return None, []
+        role_ids = {role.id for role in member.roles}
+        matches = [
+            level
+            for level, role_id in self.settings.troop_level_role_map.items()
+            if role_id in role_ids
+        ]
+        matches.sort(key=lambda value: int(value[1:]) if value[1:].isdigit() else 999)
+        return (matches[0] if len(matches) == 1 else None), matches
+
+    async def _sync_troop_profile_from_roles(self, member: discord.Member, *, source: str) -> str | None:
+        level, matches = self._troop_level_from_roles(member)
+        if len(matches) > 1:
+            await self._audit(
+                "Troop level conflict",
+                str(member),
+                "Multiple onboarding troop roles are assigned: " + ", ".join(matches),
+            )
+            return None
+        if level:
+            link = self.state.get_link_record(member.id)
+            self.state.set_troop_level(
+                member.id,
+                level,
+                source,
+                game_name=link.game_name if link else None,
+                game_user_id=link.game_user_id if link else None,
+            )
+        elif self.settings.troop_level_role_map:
+            profile = self.state.get_member_profile(member.id)
+            if profile and (profile.troop_level_source or "").startswith("onboarding-role"):
+                self.state.set_troop_level(member.id, None, source)
+        return level
+
+    async def _open_membership_verification(self, interaction: discord.Interaction) -> None:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None or member.guild.id != self.settings.server_id:
+            await interaction.response.send_message("This verification only works inside the OZY server.", ephemeral=True)
+            return
+        profile = self.state.get_member_profile(member.id)
+        role_level, _ = self._troop_level_from_roles(member)
+        current_level = role_level or (profile.troop_level if profile else None)
+        await interaction.response.send_modal(
+            MembershipVerificationModal(
+                self,
+                member=member,
+                current_troop_level=current_level,
+            )
+        )
+
+    async def _process_verification_claim(
+        self,
+        member: discord.Member,
+        game_name: str,
+        *,
+        source: str,
+    ) -> tuple[str | None, str, str]:
+        """Validate a claimed roster identity and return canonical/message/outcome."""
+        assert self.data is not None
+        canonical = await self.data.exact_roster_name(game_name)
+        if canonical is None:
+            suggestions = await self.data.roster_suggestions(game_name, 3)
+            text = (
+                "That name is not an exact match in the active OZY roster. "
+                "Enter the precise Total Battle name you currently use in the clan."
+            )
+            if suggestions:
+                text += "\n\nClosest roster names: " + ", ".join(f"**{m.name}**" for m in suggestions)
+            return None, text, "invalid exact roster name"
+
+        info = await self.data.member_info(canonical)
+        stable_id = str((info or {}).get("user_id", "")).strip() or None
+        self.state.set_member_profile_identity(
+            member.id,
+            game_name=canonical,
+            game_user_id=stable_id,
+        )
+
+        existing = self.state.get_link_record(member.id)
+        if existing and (
+            (stable_id and existing.game_user_id == stable_id)
+            or existing.game_name.casefold() == canonical.casefold()
+        ):
+            self.state.set_link(
+                member.id,
+                canonical,
+                source + "-refresh",
+                game_user_id=stable_id,
+            )
+            self.state.clear_verification_request(member.id)
+            role_result = await self._sync_rank_role(member, canonical)
+            return canonical, f"You are already linked to **{canonical}**. Role sync: {role_result}.", "already linked"
+
+        linked_user = self.state.linked_user_for_identity(canonical, stable_id)
+        if linked_user not in (None, member.id):
+            self.state.set_verification_request(member.id, canonical, source + "-name-already-linked")
+            return (
+                canonical,
+                f"The roster name **{canonical}** is already linked to another Discord account. "
+                "Leadership must resolve this before access can be granted.",
+                f"pending conflict with Discord ID {linked_user}",
+            )
+
+        if self.settings.trust_exact_display_name and member.display_name.casefold() == canonical.casefold():
+            self.state.set_link(
+                member.id,
+                canonical,
+                source + "-trusted",
+                game_user_id=stable_id,
+            )
+            self.state.clear_verification_request(member.id)
+            role_result = await self._sync_rank_role(member, canonical)
+            return canonical, f"Linked to **{canonical}**. Role sync: {role_result}.", f"auto-approved; {role_result}"
+
+        self.state.set_verification_request(member.id, canonical, source)
+        return (
+            canonical,
+            f"Exact roster name found: **{canonical}**. Your request is waiting for leadership approval. "
+            "Normal server access stays locked until the Discord account is linked to that roster identity.",
+            "pending leadership approval",
+        )
+
+    async def _submit_membership_verification(
+        self,
+        interaction: discord.Interaction,
+        *,
+        game_name: str,
+        troop_level: str | None,
+    ) -> None:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None or member.guild.id != self.settings.server_id:
+            await interaction.response.send_message("This verification only works inside the OZY server.", ephemeral=True)
+            return
+
+        normalized_level = (troop_level or "").strip().upper()
+        if normalized_level not in TROOP_LEVELS:
+            await interaction.response.send_message("Select a valid troop level from G1 to G9.", ephemeral=True)
+            return
+
+        role_level, role_matches = self._troop_level_from_roles(member)
+        if len(role_matches) > 1:
+            await interaction.response.send_message(
+                "Your Discord onboarding currently assigned multiple troop-level roles: "
+                + ", ".join(role_matches)
+                + ". Fix the onboarding answer or ask leadership to correct the roles.",
+                ephemeral=True,
+            )
+            return
+
+        effective_level = role_level or normalized_level
+        level_source = "onboarding-role" if role_level else "verification-modal"
+        self.state.set_troop_level(member.id, effective_level, level_source)
+
+        assert self.data is not None
+        try:
+            canonical, response, outcome = await self._process_verification_claim(
+                member,
+                game_name,
+                source="verification-modal",
+            )
+        except DataUnavailable as exc:
+            await interaction.response.send_message(
+                f"The OZY roster is temporarily unavailable. Your troop level was saved, but membership was not verified: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        profile_link = self.state.get_link_record(member.id)
+        if canonical:
+            self.state.set_troop_level(
+                member.id,
+                effective_level,
+                level_source,
+                game_name=canonical,
+                game_user_id=profile_link.game_user_id if profile_link else None,
+            )
+
+        await self._audit(
+            "Roster verification request",
+            str(member),
+            f"Game name: {canonical or game_name.strip()}\nTroop level: {effective_level}\nOutcome: {outcome}",
+        )
+
+        if canonical is None:
+            await interaction.response.send_message(
+                response,
+                ephemeral=True,
+                view=MembershipVerificationRetryView(self, member.id),
+            )
+            return
+
+        await interaction.response.send_message(
+            response + f"\nTroop level saved: **{effective_level}**.",
+            ephemeral=True,
+        )
+
     async def _resolve_member_game_name(self, member: discord.Member) -> str | None:
         assert self.data is not None
         link = self.state.get_link_record(member.id)
@@ -849,6 +1150,11 @@ class OZYAdminBot(discord.Client):
                         "canonicalized",
                         game_user_id=stable_id,
                     )
+                self.state.set_member_profile_identity(
+                    member.id,
+                    game_name=canonical,
+                    game_user_id=stable_id,
+                )
                 return canonical
 
         # A Discord nickname is not proof of Total Battle identity. Exact-name
@@ -933,6 +1239,12 @@ class OZYAdminBot(discord.Client):
             access_result = await self._sync_access_roles(member, active_roster_member=False)
             return f"roster member not found; {access_result}"
 
+        self.state.set_member_profile_identity(
+            member.id,
+            game_name=str(info.get("name") or game_name),
+            game_user_id=str(info.get("user_id", "")).strip() or None,
+        )
+
         access_result = await self._sync_access_roles(member, active_roster_member=True)
         rank = str(info.get("rank", "")).strip()
         if not rank:
@@ -974,20 +1286,40 @@ class OZYAdminBot(discord.Client):
     async def _process_new_member(self, member: discord.Member) -> None:
         if member.guild.id != self.settings.server_id or member.bot:
             return
-        if self.state.was_welcomed(member.id):
-            return
         assert self.data is not None
 
         # New arrivals start without normal clan access until roster verification
         # succeeds or leadership grants the separate Special Access role.
         await self._sync_access_roles(member, active_roster_member=False)
+        troop_level = await self._sync_troop_profile_from_roles(member, source="onboarding-role")
 
         matched_name: str | None = None
         suggestions: list[str] = []
         role_result: str | None = None
         try:
-            matched_name = await self.data.exact_roster_name(member.display_name)
-            if matched_name:
+            existing_link = self.state.get_link_record(member.id)
+            if existing_link:
+                linked_info = await self.data.resolve_roster_member(
+                    game_name=existing_link.game_name,
+                    game_user_id=existing_link.game_user_id,
+                )
+            else:
+                linked_info = None
+
+            if linked_info:
+                matched_name = str(linked_info["name"])
+                stable_id = str(linked_info.get("user_id", "")).strip() or None
+                self.state.set_link(
+                    member.id,
+                    matched_name,
+                    "rejoin-existing-link",
+                    game_user_id=stable_id,
+                )
+                role_result = await self._sync_rank_role(member, matched_name)
+            else:
+                matched_name = await self.data.exact_roster_name(member.display_name)
+
+            if matched_name and not linked_info:
                 if self.settings.trust_exact_display_name:
                     info = await self.data.member_info(matched_name)
                     stable_id = str((info or {}).get("user_id", "")).strip() or None
@@ -1006,7 +1338,7 @@ class OZYAdminBot(discord.Client):
                 else:
                     self.state.set_verification_request(member.id, matched_name, "join-exact-display-name")
                     role_result = "pending leadership verification"
-            else:
+            elif not matched_name:
                 matches = await self.data.roster_suggestions(member.display_name, limit=3)
                 suggestions = [m.name for m in matches if m.score >= self.settings.roster_match_threshold]
         except DataUnavailable as exc:
@@ -1021,7 +1353,9 @@ class OZYAdminBot(discord.Client):
                     color=0xF59E0B,
                 )
                 if matched_name:
-                    if self.settings.trust_exact_display_name:
+                    if self.state.get_link(member.id):
+                        match_text = f"Linked roster identity: **{matched_name}**.\nRole sync: {role_result}"
+                    elif self.settings.trust_exact_display_name:
                         match_text = f"Matched your Discord name to **{matched_name}**.\nRole sync: {role_result}"
                     else:
                         match_text = (
@@ -1031,12 +1365,20 @@ class OZYAdminBot(discord.Client):
                     embed.add_field(name="Roster match", value=match_text, inline=False)
                 else:
                     text = (
-                        "I could not match your Discord server name exactly to the current OZY game roster. "
-                        "Use `/verify` with your exact Total Battle name so I can link you and set the correct roster role."
+                        "Your Discord server name is not an exact match in the current OZY roster. "
+                        "Click **Verify OZY membership** below and enter the precise Total Battle name you currently use in the clan."
                     )
                     if suggestions:
                         text += "\n\nPossible match: " + ", ".join(f"**{name}**" for name in suggestions)
                     embed.add_field(name="Game name check", value=text, inline=False)
+                if troop_level:
+                    embed.add_field(name="Troop level", value=f"Detected from onboarding: **{troop_level}**", inline=False)
+                elif self.settings.troop_level_role_map:
+                    embed.add_field(
+                        name="Troop level",
+                        value="No single onboarding troop level was detected. You can select it in the verification form.",
+                        inline=False,
+                    )
                 embed.add_field(
                     name="Useful commands",
                     value="`/chests` - your chest status\n`/chats` - copy TB clan chat names\n`/away` - register an absence",
@@ -1045,6 +1387,7 @@ class OZYAdminBot(discord.Client):
                 await channel.send(
                     content=member.mention,
                     embed=embed,
+                    view=MembershipVerificationView(self),
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                 )
 
@@ -1052,7 +1395,8 @@ class OZYAdminBot(discord.Client):
         await self._audit(
             "Member joined",
             str(member),
-            f"Discord ID: {member.id}\nRoster match: {matched_name or 'none'}\nSuggestions: {', '.join(suggestions) or 'none'}",
+            f"Discord ID: {member.id}\nRoster match: {matched_name or 'none'}\n"
+            f"Troop level: {troop_level or 'not captured'}\nSuggestions: {', '.join(suggestions) or 'none'}",
         )
 
     async def on_member_join(self, member: discord.Member) -> None:
@@ -1065,12 +1409,29 @@ class OZYAdminBot(discord.Client):
             return
         await self._process_new_member(member)
 
+    async def on_member_remove(self, member: discord.Member) -> None:
+        if member.guild.id != self.settings.server_id or member.bot:
+            return
+        # Preserve an approved Discord -> Total Battle link for safe rejoins, but
+        # clear join-session state so the full onboarding flow runs again later.
+        self.state.clear_welcomed(member.id)
+        self.state.clear_verification_request(member.id)
+        self.state.clear_away(member.id)
+        await self._audit(
+            "Member left Discord",
+            str(member),
+            f"Discord ID: {member.id}\nApproved roster link preserved: {self.state.get_link(member.id) or 'none'}",
+        )
+
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         if after.guild.id != self.settings.server_id or after.bot:
             return
 
         if before.pending and not after.pending:
             await self._process_new_member(after)
+
+        if {role.id for role in before.roles} != {role.id for role in after.roles}:
+            await self._sync_troop_profile_from_roles(after, source="onboarding-role-update")
 
         if before.display_name == after.display_name:
             return
@@ -1324,7 +1685,7 @@ class OZYAdminBot(discord.Client):
                 log.exception("Automatic R+0 chest ranking post failed")
 
     # ------------------------------------------------------------------
-    # Voltron tournament calendar
+    # Tournament calendar
     # ------------------------------------------------------------------
     def _state_message_ids(self, key: str) -> list[int]:
         raw = self.state.get_value(key)
@@ -1399,36 +1760,36 @@ class OZYAdminBot(discord.Client):
             self._save_message_ids(state_key, ids)
             return ids
 
-    async def _refresh_voltron(self, *, force: bool, actor: str, refresh_akurier: bool = False) -> tuple[bool, str]:
-        if not self.settings.voltron_calendar_enabled:
-            return False, "Voltron calendar integration is disabled"
-        if self.voltron is None:
-            return False, "Voltron calendar client is unavailable"
+    async def _refresh_calendar(self, *, force: bool, actor: str, refresh_akurier: bool = False) -> tuple[bool, str]:
+        if not self.settings.calendar_enabled:
+            return False, "Tournament calendar integration is disabled"
+        if self.calendar_client is None:
+            return False, "Tournament calendar client is unavailable"
 
         try:
-            result = await self.voltron.refresh(force=force, refresh_akurier=refresh_akurier)
-        except VoltronCalendarError as exc:
-            await self._audit("Voltron calendar refresh failed", actor, str(exc))
+            result = await self.calendar_client.refresh(force=force, refresh_akurier=refresh_akurier)
+        except CalendarSourceError as exc:
+            await self._audit("Tournament calendar refresh failed", actor, str(exc))
             return False, str(exc)
 
         snapshot = result.snapshot
 
         # Record the public source timestamp only when it changes. This lets us
-        # learn Voltron's real refresh cadence and later reduce the four daily
+        # learn the calendar source refresh cadence and later reduce the four daily
         # metadata probes to one check 20-30 minutes after its normal update.
         if result.source_last_synced_utc is not None:
             source_iso = result.source_last_synced_utc.isoformat()
-            previous_source_iso = self.state.get_value("voltron_source_last_synced_utc")
+            previous_source_iso = self.state.get_value("calendar_source_last_synced_utc")
             if previous_source_iso != source_iso:
-                self.state.set_value("voltron_source_last_synced_utc", source_iso)
+                self.state.set_value("calendar_source_last_synced_utc", source_iso)
                 observed = datetime.now(timezone.utc).isoformat()
                 log.info(
-                    "Voltron source timestamp observed: source=%s observed=%s previous=%s",
+                    "Calendar source timestamp observed: source=%s observed=%s previous=%s",
                     source_iso, observed, previous_source_iso or "none",
                 )
                 if previous_source_iso:
                     await self._audit(
-                        "Voltron source refresh observed",
+                        "Calendar source refresh observed",
                         actor,
                         f"Previous source sync: {previous_source_iso}\n"
                         f"New source sync: {source_iso}\n"
@@ -1437,7 +1798,7 @@ class OZYAdminBot(discord.Client):
 
         today = datetime.now(timezone.utc).date()
 
-        rendered_start = self.state.get_value("voltron_calendar_start_date")
+        rendered_start = self.state.get_value("calendar_start_date")
         window_rolled = rendered_start != today.isoformat()
         if self.settings.calendar_channel_id and (result.changed or force or window_rolled):
             channel = self.get_channel(self.settings.calendar_channel_id)
@@ -1445,26 +1806,26 @@ class OZYAdminBot(discord.Client):
                 chunks = build_calendar_chunks(
                     snapshot,
                     start_date=today,
-                    days=self.settings.voltron_calendar_days,
+                    days=self.settings.calendar_days,
                     timezone_info=timezone.utc,
                 )
                 await self._upsert_message_series(
                     channel,
-                    state_key="voltron_calendar_message_ids",
+                    state_key="calendar_message_ids",
                     recovery_prefix="OZY Tournament Calendar - Next 30 Days",
                     chunks=chunks,
                 )
-                self.state.set_value("voltron_calendar_start_date", today.isoformat())
+                self.state.set_value("calendar_start_date", today.isoformat())
 
         # If today's post already exists, silently keep it current after source changes.
         if self.settings.today_channel_id and result.changed:
-            today_key = f"voltron_today_message_ids:{today.isoformat()}"
+            today_key = f"calendar_today_message_ids:{today.isoformat()}"
             if self._state_message_ids(today_key):
-                await self._post_voltron_today(today, force=True, actor="calendar refresh")
+                await self._post_calendar_today(today, force=True, actor="calendar refresh")
 
         if result.changed:
             await self._audit(
-                "Voltron calendar updated",
+                "Tournament calendar updated",
                 actor,
                 f"Actions: {len(snapshot.actions)}\nMini tournaments: {len(snapshot.mini_tournaments)}\n"
                 f"Hash: {snapshot.semantic_hash[:12]}",
@@ -1472,14 +1833,14 @@ class OZYAdminBot(discord.Client):
         return result.changed, "ok"
 
     async def _refresh_akurier(self, *, actor: str) -> tuple[bool, str]:
-        if not self.settings.voltron_calendar_enabled or self.voltron is None:
+        if not self.settings.calendar_enabled or self.calendar_client is None:
             return False, "Calendar integration is unavailable"
-        if self.voltron.snapshot is None:
-            return False, "No Voltron snapshot is available"
+        if self.calendar_client.snapshot is None:
+            return False, "No tournament calendar snapshot is available"
 
         try:
-            result = await self.voltron.refresh_akurier()
-        except VoltronCalendarError as exc:
+            result = await self.calendar_client.refresh_akurier()
+        except CalendarSourceError as exc:
             log.warning("Akurier mini-event refresh skipped: %s", exc)
             return False, str(exc)
 
@@ -1487,26 +1848,26 @@ class OZYAdminBot(discord.Client):
             today = datetime.now(timezone.utc).date()
 
             # Akurier mini-events belong in both public schedule surfaces. Update
-            # from the cache only; do not make another Voltron request here.
+            # from the cache only; do not make another calendar-source request here.
             if self.settings.calendar_channel_id:
                 channel = self.get_channel(self.settings.calendar_channel_id)
                 if isinstance(channel, discord.TextChannel):
                     chunks = build_calendar_chunks(
                         result.snapshot,
                         start_date=today,
-                        days=self.settings.voltron_calendar_days,
+                        days=self.settings.calendar_days,
                         timezone_info=timezone.utc,
                     )
                     await self._upsert_message_series(
                         channel,
-                        state_key="voltron_calendar_message_ids",
+                        state_key="calendar_message_ids",
                         recovery_prefix="OZY Tournament Calendar - Next 30 Days",
                         chunks=chunks,
                     )
-                    self.state.set_value("voltron_calendar_start_date", today.isoformat())
+                    self.state.set_value("calendar_start_date", today.isoformat())
 
             if self.settings.today_channel_id:
-                await self._post_voltron_today(today, force=True, actor="mini-event refresh")
+                await self._post_calendar_today(today, force=True, actor="mini-event refresh")
 
             await self._audit(
                 "Mini events updated",
@@ -1515,26 +1876,26 @@ class OZYAdminBot(discord.Client):
             )
         return result.changed, "ok"
 
-    async def _post_voltron_today(self, target_date, *, force: bool, actor: str) -> bool:
-        if not self.settings.today_channel_id or self.voltron is None:
+    async def _post_calendar_today(self, target_date, *, force: bool, actor: str) -> bool:
+        if not self.settings.today_channel_id or self.calendar_client is None:
             return False
         channel = self.get_channel(self.settings.today_channel_id)
         if not isinstance(channel, discord.TextChannel):
             return False
 
         try:
-            # Discord rendering uses the in-memory cache. Only contact Voltron if
+            # Discord rendering uses the in-memory cache. Only contact the calendar source if
             # startup has not populated a snapshot yet.
-            if self.voltron.snapshot is None:
-                await self.voltron.refresh(force=True)
-        except VoltronCalendarError as exc:
-            log.warning("Today's Voltron post skipped: %s", exc)
+            if self.calendar_client.snapshot is None:
+                await self.calendar_client.refresh(force=True)
+        except CalendarSourceError as exc:
+            log.warning("Today's tournament post skipped: %s", exc)
             return False
-        snapshot = self.voltron.snapshot
+        snapshot = self.calendar_client.snapshot
         if snapshot is None:
             return False
 
-        state_key = f"voltron_today_message_ids:{target_date.isoformat()}"
+        state_key = f"calendar_today_message_ids:{target_date.isoformat()}"
         if not force and self._state_message_ids(state_key):
             return False
 
@@ -1555,40 +1916,40 @@ class OZYAdminBot(discord.Client):
             chunks=chunks,
         )
         await self._audit(
-            "Voltron today posted" if not existing else "Voltron today updated",
+            "Tournament today posted" if not existing else "Tournament today updated",
             actor,
             f"Date: {target_date.isoformat()}\nChannel: #{channel.name}",
         )
         return True
 
-    async def _voltron_refresh_loop(self) -> None:
+    async def _calendar_refresh_loop(self) -> None:
         await self.wait_until_ready()
 
         # One startup read is needed to populate the in-memory cache. After that,
         # only lightweight metadata probes run at the fixed times below. Full
         # calendar content is downloaded only when metadata reports a change.
         try:
-            await self._refresh_voltron(
-                force=self.voltron.snapshot is None if self.voltron else True,
+            await self._refresh_calendar(
+                force=self.calendar_client.snapshot is None if self.calendar_client else True,
                 actor="startup calendar refresh",
                 refresh_akurier=False,
             )
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Startup Voltron calendar refresh failed")
+            log.exception("Startup Tournament calendar refresh failed")
 
         while not self.is_closed():
             now = datetime.now(timezone.utc)
-            target = _next_utc_slot(now, VOLTRON_META_PROBE_TIMES_UTC)
+            target = _next_utc_slot(now, CALENDAR_META_PROBE_TIMES_UTC)
             try:
                 await asyncio.sleep(max(1.0, (target - now).total_seconds()))
             except asyncio.CancelledError:
                 raise
 
             try:
-                log.info("Running lightweight Voltron metadata probe at %s", target.isoformat())
-                await self._refresh_voltron(
+                log.info("Running lightweight calendar metadata probe at %s", target.isoformat())
+                await self._refresh_calendar(
                     force=False,
                     actor="automatic metadata probe",
                     refresh_akurier=False,
@@ -1596,7 +1957,7 @@ class OZYAdminBot(discord.Client):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Automatic Voltron metadata probe failed")
+                log.exception("Automatic calendar metadata probe failed")
 
     async def _akurier_refresh_loop(self) -> None:
         await self.wait_until_ready()
@@ -1611,10 +1972,10 @@ class OZYAdminBot(discord.Client):
             # Akurier fetch has not yet been attempted. A failed attempt is not
             # hammered with retries; the existing cached/fallback data remains.
             if now >= today_target and last_attempt != now.date().isoformat():
-                # On a fresh deploy the Voltron startup read may still be running.
+                # On a fresh deploy the calendar startup read may still be running.
                 # Wait briefly rather than consuming today's single Akurier attempt
                 # before there is a snapshot to attach the mini-events to.
-                if self.voltron is None or self.voltron.snapshot is None:
+                if self.calendar_client is None or self.calendar_client.snapshot is None:
                     try:
                         await asyncio.sleep(10)
                     except asyncio.CancelledError:
@@ -1637,21 +1998,24 @@ class OZYAdminBot(discord.Client):
             except asyncio.CancelledError:
                 raise
 
-    async def _voltron_today_loop(self) -> None:
+    async def _calendar_today_loop(self) -> None:
         await self.wait_until_ready()
-        hour, minute = [int(x) for x in self.settings.voltron_today_time.split(":", 1)]
-        tz = self.settings.timezone
+        hour, minute = 17, 0
+        tz = timezone.utc
 
         while not self.is_closed():
             now = datetime.now(tz)
             target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
 
             # Catch up after a restart without duplicating the day's canonical post.
-            if now >= target:
-                try:
-                    await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
-                except Exception:
-                    log.exception("Catch-up Voltron today post failed")
+            try:
+                await self._post_calendar_today(
+                    game_day_for_instant(datetime.now(timezone.utc)),
+                    force=False,
+                    actor="automatic today scheduler",
+                )
+            except Exception:
+                log.exception("Catch-up tournament today post failed")
 
             now = datetime.now(tz)
             next_target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
@@ -1663,9 +2027,13 @@ class OZYAdminBot(discord.Client):
                 raise
 
             try:
-                await self._post_voltron_today(datetime.now(timezone.utc).date(), force=False, actor="automatic today scheduler")
+                await self._post_calendar_today(
+                    game_day_for_instant(datetime.now(timezone.utc)),
+                    force=False,
+                    actor="automatic today scheduler",
+                )
             except Exception:
-                log.exception("Automatic Voltron today post failed")
+                log.exception("Automatic tournament today post failed")
 
     # ------------------------------------------------------------------
     # Authoritative roster/access synchronization
@@ -1850,69 +2218,22 @@ class OZYAdminBot(discord.Client):
             matches = [x for x in items if not q or q in x["label"].casefold() or q in x["key"].casefold()]
             return [app_commands.Choice(name=x["label"], value=x["key"]) for x in matches[:25]]
 
-        @self.tree.command(name="verify", description="Link your Discord account to your exact Total Battle roster name")
-        @app_commands.describe(game_name="Your exact current Total Battle name")
-        async def verify(interaction: discord.Interaction, game_name: str) -> None:
+        @self.tree.command(name="verify", description="Verify your OZY roster identity and troop level")
+        @app_commands.describe(game_name="Optional exact Total Battle name; leave blank to open the verification form")
+        async def verify(interaction: discord.Interaction, game_name: Optional[str] = None) -> None:
             if not isinstance(interaction.user, discord.Member):
                 await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
                 return
+            if not game_name:
+                await self._open_membership_verification(interaction)
+                return
             assert self.data is not None
             try:
-                canonical = await self.data.exact_roster_name(game_name)
-                if canonical is None:
-                    suggestions = await self.data.roster_suggestions(game_name, 3)
-                    text = "That exact name is not in the active roster."
-                    if suggestions:
-                        text += " Did you mean: " + ", ".join(f"**{m.name}**" for m in suggestions)
-                    await interaction.response.send_message(text, ephemeral=True)
-                    return
-                info = await self.data.member_info(canonical)
-                stable_id = str((info or {}).get("user_id", "")).strip() or None
-                existing = self.state.get_link_record(interaction.user.id)
-                if existing and (
-                    (stable_id and existing.game_user_id == stable_id)
-                    or existing.game_name.casefold() == canonical.casefold()
-                ):
-                    self.state.set_link(
-                        interaction.user.id,
-                        canonical,
-                        "self-verify-refresh",
-                        game_user_id=stable_id,
-                    )
-                    role_result = await self._sync_rank_role(interaction.user, canonical)
-                    await interaction.response.send_message(
-                        f"You are already linked to **{canonical}**. Role sync: {role_result}.",
-                        ephemeral=True,
-                    )
-                    return
-
-                if self.settings.trust_exact_display_name and interaction.user.display_name.casefold() == canonical.casefold():
-                    linked_user = self.state.linked_user_for_identity(canonical, stable_id)
-                    if linked_user in (None, interaction.user.id):
-                        self.state.set_link(
-                            interaction.user.id,
-                            canonical,
-                            "trusted-self-verify",
-                            game_user_id=stable_id,
-                        )
-                        self.state.clear_verification_request(interaction.user.id)
-                        role_result = await self._sync_rank_role(interaction.user, canonical)
-                        outcome = f"auto-approved; role sync: {role_result}"
-                        response = f"Linked to **{canonical}**. Role sync: {role_result}."
-                    else:
-                        self.state.set_verification_request(interaction.user.id, canonical, "self-verify-name-already-linked")
-                        outcome = f"pending leadership approval; already linked to Discord ID {linked_user}"
-                        response = (
-                            f"Verification request recorded for **{canonical}**. "
-                            "That roster name is already linked to another Discord account, so leadership must resolve it."
-                        )
-                else:
-                    self.state.set_verification_request(interaction.user.id, canonical, "self-verify")
-                    outcome = "pending leadership approval"
-                    response = (
-                        f"Verification request recorded for **{canonical}**. "
-                        "A leadership member must approve the Discord-to-game link before rank roles are changed."
-                    )
+                canonical, response, outcome = await self._process_verification_claim(
+                    interaction.user,
+                    game_name,
+                    source="self-verify",
+                )
             except DataUnavailable as exc:
                 await interaction.response.send_message(f"Roster unavailable: {exc}", ephemeral=True)
                 return
@@ -1920,9 +2241,16 @@ class OZYAdminBot(discord.Client):
             await self._audit(
                 "Roster verification request",
                 str(interaction.user),
-                f"Game name: {canonical}\nOutcome: {outcome}",
+                f"Game name: {canonical or game_name.strip()}\nOutcome: {outcome}",
             )
-            await interaction.response.send_message(response, ephemeral=True)
+            if canonical is None:
+                await interaction.response.send_message(
+                    response,
+                    ephemeral=True,
+                    view=MembershipVerificationRetryView(self, interaction.user.id),
+                )
+            else:
+                await interaction.response.send_message(response, ephemeral=True)
 
         @verify.autocomplete("game_name")
         async def verify_autocomplete(interaction: discord.Interaction, current: str):
@@ -2035,6 +2363,7 @@ class OZYAdminBot(discord.Client):
             if target.id != interaction.user.id and not self._is_leadership(requester):
                 await interaction.response.send_message("Leadership only for other members.", ephemeral=True)
                 return
+            profile = self.state.get_member_profile(target.id)
             assert self.data is not None
             try:
                 game_name = await self._resolve_member_game_name(target)
@@ -2046,6 +2375,8 @@ class OZYAdminBot(discord.Client):
                         text += f" Pending verification: **{pending}**."
                     elif suggestions:
                         text += " Possible matches: " + ", ".join(m.name for m in suggestions)
+                    if profile and profile.troop_level:
+                        text += f" Troop level: **{profile.troop_level}**."
                     await interaction.response.send_message(text, ephemeral=True)
                     return
                 info = await self.data.member_info(game_name)
@@ -2058,6 +2389,8 @@ class OZYAdminBot(discord.Client):
 
             embed = discord.Embed(title=game_name, color=0xF59E0B)
             embed.add_field(name="Discord", value=target.mention, inline=False)
+            if profile and profile.troop_level:
+                embed.add_field(name="Troop level", value=profile.troop_level, inline=True)
             for label, key in (("Rank", "rank"), ("Hero level", "level"), ("Might", "might"), ("Location", "location"), ("Last seen", "last_seen")):
                 value = info.get(key)
                 if value not in (None, ""):
@@ -2423,26 +2756,26 @@ class OZYAdminBot(discord.Client):
                     ephemeral=True,
                 )
 
-        @self.tree.command(name="calendar", description="Show the next 30 days of Voltron tournament starts")
+        @self.tree.command(name="calendar", description="Show the next 30 days of tournament starts")
         @app_commands.describe(public="Post publicly instead of only showing it to you")
         async def calendar(interaction: discord.Interaction, public: bool = False) -> None:
             if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
                 await interaction.response.send_message("Only leadership can post the calendar publicly.", ephemeral=True)
                 return
-            if self.voltron is None:
-                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=not public, thinking=True)
             try:
-                if self.voltron.snapshot is None:
-                    await self.voltron.refresh(force=True)
-                snapshot = self.voltron.snapshot
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
                 if snapshot is None:
-                    raise VoltronCalendarError("No calendar snapshot is available")
+                    raise CalendarSourceError("No calendar snapshot is available")
                 chunks = build_calendar_chunks(
                     snapshot,
                     start_date=datetime.now(timezone.utc).date(),
-                    days=self.settings.voltron_calendar_days,
+                    days=self.settings.calendar_days,
                     timezone_info=timezone.utc,
                 )
                 for chunk in chunks:
@@ -2451,25 +2784,25 @@ class OZYAdminBot(discord.Client):
                         ephemeral=not public,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-            except VoltronCalendarError as exc:
+            except CalendarSourceError as exc:
                 await interaction.followup.send(f"Calendar unavailable: {exc}", ephemeral=True)
 
-        @self.tree.command(name="today", description="Show today's Voltron tournament activity")
+        @self.tree.command(name="today", description="Show today's tournament activity")
         @app_commands.describe(public="Post publicly instead of only showing it to you")
         async def today(interaction: discord.Interaction, public: bool = False) -> None:
             if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
                 await interaction.response.send_message("Only leadership can post today's schedule publicly.", ephemeral=True)
                 return
-            if self.voltron is None:
-                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=not public, thinking=True)
             try:
-                if self.voltron.snapshot is None:
-                    await self.voltron.refresh(force=True)
-                snapshot = self.voltron.snapshot
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
                 if snapshot is None:
-                    raise VoltronCalendarError("No calendar snapshot is available")
+                    raise CalendarSourceError("No calendar snapshot is available")
                 target_date = datetime.now(timezone.utc).date()
                 chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=timezone.utc)
                 for chunk in chunks:
@@ -2478,23 +2811,23 @@ class OZYAdminBot(discord.Client):
                         ephemeral=not public,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-            except VoltronCalendarError as exc:
+            except CalendarSourceError as exc:
                 await interaction.followup.send(f"Today's calendar is unavailable: {exc}", ephemeral=True)
 
         @self.tree.command(name="time", description="Show today's OZY events in your chosen local timezone")
         @app_commands.describe(zone="Timezone to convert the current game-day schedule to")
         @app_commands.choices(zone=TIMEZONE_CHOICES)
         async def time_converter(interaction: discord.Interaction, zone: app_commands.Choice[str]) -> None:
-            if self.voltron is None:
-                await interaction.response.send_message("Voltron calendar integration is unavailable.", ephemeral=True)
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                if self.voltron.snapshot is None:
-                    await self.voltron.refresh(force=True)
-                snapshot = self.voltron.snapshot
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
                 if snapshot is None:
-                    raise VoltronCalendarError("No calendar snapshot is available")
+                    raise CalendarSourceError("No calendar snapshot is available")
                 target_date = datetime.now(timezone.utc).date()
                 chunks = build_today_local_chunks(
                     snapshot,
@@ -2511,12 +2844,12 @@ class OZYAdminBot(discord.Client):
             except Exception as exc:
                 await interaction.followup.send(f"Time conversion unavailable: {exc}", ephemeral=True)
 
-        @self.tree.command(name="calendar-refresh", description="Leadership: refresh Voltron and update the calendar channel")
+        @self.tree.command(name="calendar-refresh", description="Leadership: refresh the tournament calendar and update Discord")
         async def calendar_refresh(interaction: discord.Interaction) -> None:
             if not await self._require_leadership(interaction):
                 return
             await interaction.response.defer(ephemeral=True, thinking=True)
-            changed, status = await self._refresh_voltron(
+            changed, status = await self._refresh_calendar(
                 force=True,
                 actor=str(interaction.user),
                 refresh_akurier=True,
@@ -2525,27 +2858,27 @@ class OZYAdminBot(discord.Client):
                 await interaction.followup.send(f"Refresh failed: {status}", ephemeral=True)
             else:
                 await interaction.followup.send(
-                    "Voltron calendar refreshed. " + ("Discord calendar updated." if changed else "No event changes detected."),
+                    "Tournament calendar refreshed. " + ("Discord calendar updated." if changed else "No event changes detected."),
                     ephemeral=True,
                 )
 
-        @self.tree.command(name="calendar-status", description="Leadership: show Voltron calendar integration status")
+        @self.tree.command(name="calendar-status", description="Leadership: show Tournament calendar integration status")
         async def calendar_status(interaction: discord.Interaction) -> None:
             if not await self._require_leadership(interaction):
                 return
-            snapshot = self.voltron.snapshot if self.voltron else None
-            last_success = self.voltron.last_success_utc if self.voltron else None
-            last_error = self.voltron.last_error if self.voltron else "client unavailable"
+            snapshot = self.calendar_client.snapshot if self.calendar_client else None
+            last_success = self.calendar_client.last_success_utc if self.calendar_client else None
+            last_error = self.calendar_client.last_error if self.calendar_client else "client unavailable"
             lines = [
-                f"Enabled: **{self.settings.voltron_calendar_enabled}**",
-                f"Realm: **{self.settings.voltron_realm}**",
-                "Voltron probes: **00:30, 06:30, 12:30, 18:30 UTC**",
+                f"Enabled: **{self.settings.calendar_enabled}**",
+                f"Realm: **{self.settings.calendar_realm}**",
+                "Calendar probes: **00:30, 06:30, 12:30, 18:30 UTC**",
                 "Akurier mini-events: **18:00 UTC / R+1, once daily**",
                 f"Cached actions: **{len(snapshot.actions) if snapshot else 0}**",
                 f"Cached mini tournaments: **{len(snapshot.mini_tournaments) if snapshot else 0}**",
-                f"Source last synced: **{self.voltron.last_meta_utc.isoformat() if self.voltron and self.voltron.last_meta_utc else 'unknown'}**",
-                f"Last metadata check: **{self.voltron.last_meta_checked_utc.isoformat() if self.voltron and self.voltron.last_meta_checked_utc else 'never'}**",
-                f"Last Akurier success: **{self.voltron.last_akurier_success_utc.isoformat() if self.voltron and self.voltron.last_akurier_success_utc else 'never'}**",
+                f"Source last synced: **{self.calendar_client.last_meta_utc.isoformat() if self.calendar_client and self.calendar_client.last_meta_utc else 'unknown'}**",
+                f"Last metadata check: **{self.calendar_client.last_meta_checked_utc.isoformat() if self.calendar_client and self.calendar_client.last_meta_checked_utc else 'never'}**",
+                f"Last Akurier success: **{self.calendar_client.last_akurier_success_utc.isoformat() if self.calendar_client and self.calendar_client.last_akurier_success_utc else 'never'}**",
                 f"Last successful calendar fetch/probe: **{last_success.isoformat() if last_success else 'never'}**",
                 f"Last error: **{last_error or 'none'}**",
             ]

@@ -24,6 +24,16 @@ class MemberLink:
     source: str
 
 
+@dataclass(frozen=True)
+class MemberProfile:
+    discord_user_id: int
+    game_name: str | None
+    game_user_id: str | None
+    troop_level: str | None
+    troop_level_source: str | None
+    updated_at_utc: datetime
+
+
 class AdminState:
     def __init__(self, path: Path):
         self.path = path
@@ -83,6 +93,15 @@ class AdminState:
                     source TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS member_profiles (
+                    discord_user_id INTEGER PRIMARY KEY,
+                    game_name TEXT,
+                    game_user_id TEXT,
+                    troop_level TEXT,
+                    troop_level_source TEXT,
+                    updated_at_utc TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -106,6 +125,85 @@ class AdminState:
                 """
             )
 
+    def set_member_profile_identity(
+        self,
+        discord_user_id: int,
+        *,
+        game_name: str | None,
+        game_user_id: str | None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        stable_id = (game_user_id or "").strip() or None
+        canonical = (game_name or "").strip() or None
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO member_profiles(
+                    discord_user_id, game_name, game_user_id,
+                    troop_level, troop_level_source, updated_at_utc
+                )
+                VALUES (?, ?, ?, NULL, NULL, ?)
+                ON CONFLICT(discord_user_id) DO UPDATE SET
+                    game_name=excluded.game_name,
+                    game_user_id=COALESCE(excluded.game_user_id, member_profiles.game_user_id),
+                    updated_at_utc=excluded.updated_at_utc
+                """,
+                (discord_user_id, canonical, stable_id, now),
+            )
+
+    def set_troop_level(
+        self,
+        discord_user_id: int,
+        troop_level: str | None,
+        source: str,
+        *,
+        game_name: str | None = None,
+        game_user_id: str | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        level = (troop_level or "").strip().upper() or None
+        stable_id = (game_user_id or "").strip() or None
+        canonical = (game_name or "").strip() or None
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO member_profiles(
+                    discord_user_id, game_name, game_user_id,
+                    troop_level, troop_level_source, updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(discord_user_id) DO UPDATE SET
+                    game_name=COALESCE(excluded.game_name, member_profiles.game_name),
+                    game_user_id=COALESCE(excluded.game_user_id, member_profiles.game_user_id),
+                    troop_level=excluded.troop_level,
+                    troop_level_source=excluded.troop_level_source,
+                    updated_at_utc=excluded.updated_at_utc
+                """,
+                (discord_user_id, canonical, stable_id, level, source, now),
+            )
+
+    def get_member_profile(self, discord_user_id: int) -> MemberProfile | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT discord_user_id, game_name, game_user_id,
+                       troop_level, troop_level_source, updated_at_utc
+                FROM member_profiles
+                WHERE discord_user_id=?
+                """,
+                (discord_user_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return MemberProfile(
+            discord_user_id=int(row["discord_user_id"]),
+            game_name=row["game_name"],
+            game_user_id=row["game_user_id"],
+            troop_level=row["troop_level"],
+            troop_level_source=row["troop_level_source"],
+            updated_at_utc=datetime.fromisoformat(row["updated_at_utc"]),
+        )
+
     def set_link(
         self,
         discord_user_id: int,
@@ -128,6 +226,11 @@ class AdminState:
                 """,
                 (discord_user_id, game_name, stable_id, now, source),
             )
+        self.set_member_profile_identity(
+            discord_user_id,
+            game_name=game_name,
+            game_user_id=stable_id,
+        )
 
     def get_link(self, discord_user_id: int) -> str | None:
         with self._conn() as conn:
@@ -316,6 +419,10 @@ class AdminState:
                 """,
                 (discord_user_id, now),
             )
+
+    def clear_welcomed(self, discord_user_id: int) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM welcomed_members WHERE discord_user_id=?", (discord_user_id,))
 
     def mark_schedule_posted(self, local_date: str, channel_id: int, message_id: int) -> None:
         now = datetime.now(timezone.utc).isoformat()

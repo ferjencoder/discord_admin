@@ -9,6 +9,7 @@ def base_env(monkeypatch):
     monkeypatch.setenv("DISCORD_TOKEN", "token")
     monkeypatch.setenv("SERVER_ID", "123")
     monkeypatch.delenv("RANK_ROLE_MAP", raising=False)
+    monkeypatch.delenv("TROOP_LEVEL_ROLE_MAP", raising=False)
     monkeypatch.delenv("LEADERSHIP_ROLE_IDS", raising=False)
     monkeypatch.setenv("CALENDAR_BASE_URL", "https://calendar.example.test")
     for name in (
@@ -39,6 +40,20 @@ def test_rank_role_map(monkeypatch):
     settings = load_settings()
     assert settings.rank_role_map["leader"] == 111
     assert settings.rank_role_map["superior"] == 222
+
+
+def test_troop_level_role_map(monkeypatch):
+    base_env(monkeypatch)
+    monkeypatch.setenv("TROOP_LEVEL_ROLE_MAP", "G8:888,G9:999")
+    settings = load_settings()
+    assert settings.troop_level_role_map == {"G8": 888, "G9": 999}
+
+
+def test_invalid_troop_level_role_map(monkeypatch):
+    base_env(monkeypatch)
+    monkeypatch.setenv("TROOP_LEVEL_ROLE_MAP", "eight:888")
+    with pytest.raises(ConfigError):
+        load_settings()
 
 
 def test_invalid_schedule_time(monkeypatch):

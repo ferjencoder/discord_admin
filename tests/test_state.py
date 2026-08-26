@@ -33,6 +33,8 @@ def test_welcome_dedupe(tmp_path):
     assert not state.was_welcomed(123)
     state.mark_welcomed(123)
     assert state.was_welcomed(123)
+    state.clear_welcomed(123)
+    assert not state.was_welcomed(123)
 
 
 def test_verification_request_roundtrip(tmp_path):
@@ -75,3 +77,24 @@ def test_member_link_stable_user_id_survives_name_change(tmp_path):
     assert record is not None
     assert record.game_name == "New Name"
     assert record.game_user_id == "tb:90741542"
+
+
+def test_member_profile_troop_level_roundtrip(tmp_path):
+    state = AdminState(tmp_path / "state.sqlite3")
+    state.set_troop_level(123, "g9", "onboarding-role")
+    profile = state.get_member_profile(123)
+    assert profile is not None
+    assert profile.troop_level == "G9"
+    assert profile.troop_level_source == "onboarding-role"
+
+
+def test_link_updates_member_profile_identity_without_losing_troop_level(tmp_path):
+    state = AdminState(tmp_path / "state.sqlite3")
+    state.set_troop_level(123, "G8", "verification-modal")
+    state.set_link(123, "PeekABoo Death", "test", game_user_id="tb:90741542")
+
+    profile = state.get_member_profile(123)
+    assert profile is not None
+    assert profile.game_name == "PeekABoo Death"
+    assert profile.game_user_id == "tb:90741542"
+    assert profile.troop_level == "G8"

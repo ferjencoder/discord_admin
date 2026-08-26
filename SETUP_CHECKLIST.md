@@ -71,7 +71,22 @@ LEADERSHIP_ROLE_IDS=111111111111111111,222222222222222222
 ANNOUNCEMENT_PING_ROLE_ID=333333333333333333
 AWAY_ROLE_ID=444444444444444444
 RANK_ROLE_MAP=Leader:555555555555555555,Superior:666666666666666666,Officer:777777777777777777,Veteran:888888888888888888,Soldier:999999999999999999
+TROOP_LEVEL_ROLE_MAP=G1:111111111111111111,G2:222222222222222222,G3:333333333333333333,G4:444444444444444444,G5:555555555555555555,G6:666666666666666666,G7:777777777777777777,G8:888888888888888888,G9:999999999999999999
 ```
+
+### Discord Onboarding troop question
+
+Use Community Onboarding for troop level only, because its questions use predefined answer options that can assign roles/channels.
+
+Create one required, single-select question:
+
+`What is your highest troop level?`
+
+Answers: `G1`, `G2`, `G3`, `G4`, `G5`, `G6`, `G7`, `G8`, `G9`.
+
+Each answer should assign exactly one matching troop-level Discord role. Put those role IDs in `TROOP_LEVEL_ROLE_MAP`.
+
+Do not try to collect the exact Total Battle player name through Community Onboarding. OZY Admin's **Verify OZY membership** button/modal is the authoritative name-entry workflow.
 
 ## 6. Connect PeekABoo data
 
@@ -107,18 +122,18 @@ DAILY_SCHEDULE_TIME=08:00
 
 CALENDAR_CHANNEL_ID=...
 TODAY_CHANNEL_ID=...
-VOLTRON_CALENDAR_ENABLED=true
-VOLTRON_REALM=Regular
-VOLTRON_CALENDAR_DAYS=30
-VOLTRON_TODAY_ENABLED=true
-VOLTRON_TODAY_TIME=08:00
+CALENDAR_ENABLED=true
+CALENDAR_BASE_URL=...
+CALENDAR_REALM=Regular
+CALENDAR_DAYS=30
+TODAY_ENABLED=true
 
 TRUST_EXACT_DISPLAY_NAME=false
 AUTO_SYNC_NICKNAME=false
 ```
 
-The Voltron integration does not require a Voltron login, cookie, SignalR connection,
-or personal account token. It uses the public calendar endpoints exposed by the site.
+The tournament-calendar integration does not require a source login, cookie, SignalR connection,
+or personal account token. It uses the public calendar endpoints exposed by the source.
 Automatic source traffic is intentionally sparse: four lightweight metadata probes per UTC
 day while the source cadence is learned, full content only when metadata changes, and one
 Akurier mini-event fetch per day at 18:00 UTC (R+1).
@@ -159,11 +174,15 @@ Test in this order:
 16. `/event-create` - the modal should open immediately; select category, event channel/location, and publish channel
 17. finish the second date/time step and confirm the Discord Scheduled Event is created and the event card is posted in the selected publish channel
 18. confirm a verified normal member can create an event, while an unverified outsider cannot target hidden channels
-19. `/sync-roles apply:false`
-20. inspect the preview
-21. `/sync-roles apply:true`
-22. `/announce ping:false`
-23. only after that, test `/announce ping:true`
+19. Join with a test account and confirm it initially receives Unverified access.
+20. Click **Verify OZY membership** and deliberately enter a misspelled game name; confirm the bot rejects it and asks for the precise roster name.
+21. Enter an exact active-roster name; with `TRUST_EXACT_DISPLAY_NAME=false`, confirm it becomes a pending verification instead of instantly granting rank access.
+22. Confirm the troop level selected in Discord Onboarding appears in `/member` after `TROOP_LEVEL_ROLE_MAP` is configured.
+23. `/sync-roles apply:false`
+24. inspect the preview
+25. `/sync-roles apply:true`
+26. `/announce ping:false`
+27. only after that, test `/announce ping:true`
 
 ## 9. Test a new member
 
@@ -171,8 +190,12 @@ Use a test account if possible.
 
 Expected behavior:
 
+- the member receives Unverified access first;
+- the welcome post includes **Verify OZY membership**;
 - if the Discord server display name exactly matches an active roster name, the bot identifies it but keeps the link pending by default;
 - leadership approves the identity with `/member-link` before a roster rank role is assigned;
-- otherwise the welcome message asks them to use `/verify` and can suggest close roster names;
+- if the name is not an exact active-roster match, the verification form rejects it and asks for the precise Total Battle name, with close roster suggestions when available;
+- if `TROOP_LEVEL_ROLE_MAP` is configured, the required Onboarding troop-level role is captured into the member profile and follows later role changes;
+- an already-approved Discord account that leaves and rejoins keeps its stable Total Battle identity link; access is restored only if that identity is still in the active roster;
 - if Membership Screening leaves the member pending, the welcome workflow waits until screening is complete;
 - language roles assigned by Discord Onboarding are left untouched.
