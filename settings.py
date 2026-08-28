@@ -108,8 +108,8 @@ def _rank_role_map() -> dict[str, int]:
     return result
 
 
-def _troop_level_role_map() -> dict[str, int]:
-    raw = os.getenv("TROOP_LEVEL_ROLE_MAP", "").strip()
+def _language_role_map() -> dict[str, int]:
+    raw = os.getenv("LANGUAGE_ROLE_MAP", "").strip()
     if not raw:
         return {}
     result: dict[str, int] = {}
@@ -118,17 +118,14 @@ def _troop_level_role_map() -> dict[str, int]:
         if not pair:
             continue
         if ":" not in pair:
-            raise ConfigError("TROOP_LEVEL_ROLE_MAP entries must look like G8:ROLE_ID")
-        level, role_id = pair.rsplit(":", 1)
-        level = level.strip().upper()
+            raise ConfigError("LANGUAGE_ROLE_MAP entries must look like EN:ROLE_ID")
+        code, role_id = pair.rsplit(":", 1)
+        code = code.strip().upper()
         role_id = role_id.strip()
-        if not level or not role_id.isdigit():
-            raise ConfigError(f"Invalid TROOP_LEVEL_ROLE_MAP entry: {pair!r}")
-        if not level.startswith("G") or not level[1:].isdigit():
-            raise ConfigError(f"Invalid troop level {level!r}; expected values like G8 or G9")
-        result[level] = int(role_id)
+        if not code or not role_id.isdigit():
+            raise ConfigError(f"Invalid LANGUAGE_ROLE_MAP entry: {pair!r}")
+        result[code] = int(role_id)
     return result
-
 
 def _validate_hhmm(name: str, value: str) -> str:
     parts = value.split(":")
@@ -154,7 +151,7 @@ class Settings:
 
     leadership_role_ids: frozenset[int]
     rank_role_map: dict[str, int]
-    troop_level_role_map: dict[str, int]
+    language_role_map: dict[str, int]
     away_role_id: int | None
     verified_role_id: int | None
     unverified_role_id: int | None
@@ -207,6 +204,7 @@ class Settings:
     state_remote_url: str | None
     state_remote_token: str | None
     state_remote_timeout_seconds: float
+    leadership_schedule_channel_id: int | None = None
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -253,7 +251,7 @@ def load_settings() -> Settings:
 
         leadership_role_ids=_id_set("LEADERSHIP_ROLE_IDS"),
         rank_role_map=_rank_role_map(),
-        troop_level_role_map=_troop_level_role_map(),
+        language_role_map=_language_role_map(),
         away_role_id=_optional_id("AWAY_ROLE_ID"),
         verified_role_id=_optional_id("VERIFIED_ROLE_ID"),
         unverified_role_id=_optional_id("UNVERIFIED_ROLE_ID"),
@@ -263,6 +261,7 @@ def load_settings() -> Settings:
         announcement_channel_id=_optional_id("ANNOUNCEMENT_CHANNEL_ID"),
         announcement_ping_role_id=_optional_id("ANNOUNCEMENT_PING_ROLE_ID"),
         schedule_channel_id=_optional_id("SCHEDULE_CHANNEL_ID"),
+        leadership_schedule_channel_id=_optional_id("LEADERSHIP_SCHEDULE_CHANNEL_ID"),
         calendar_channel_id=_optional_id("CALENDAR_CHANNEL_ID"),
         today_channel_id=_optional_id("TODAY_CHANNEL_ID"),
         away_channel_id=_optional_id("AWAY_CHANNEL_ID"),

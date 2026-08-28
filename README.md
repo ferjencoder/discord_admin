@@ -11,55 +11,57 @@ It is intentionally separate from `OZY Translator`. The translator only translat
 ### Member onboarding and roster verification
 
 - Greets new Discord members in `WELCOME_CHANNEL_ID`.
-- New arrivals start with the configured Unverified access role until an approved roster link exists.
-- Compares their Discord server display name/nickname to the active Total Battle roster only as a convenience hint.
-- Every welcome message includes a persistent **Verify OZY membership** button.
-- The verification form asks for:
-  - the member's exact current Total Battle name in OZY;
-  - highest troop level (`G1` through `G9`).
-- If the entered game name is not an exact active-roster match, the bot rejects it, suggests close roster names, and offers a retry button.
-- With the safe default `TRUST_EXACT_DISPLAY_NAME=false`, an exact claimed roster name creates a pending verification request. Leadership still approves the Discord-account -> roster-identity link before normal access/rank roles are granted.
-- Existing approved links are preserved by stable Total Battle `user_id`, so a legitimate rename or Discord rejoin can restore the correct identity without creating a new account binding.
-- Exact display-name match:
-  - identifies the likely Total Battle player;
-  - with the safe default `TRUST_EXACT_DISPLAY_NAME=false`, creates a pending verification request only;
-  - leadership approves with `/member-link` before any rank role is granted.
-- No exact match:
-  - suggests close roster names when the fuzzy score is above `ROSTER_MATCH_THRESHOLD`;
-  - tells the member to use `/verify` with their exact Total Battle name.
-- `/verify` is a request, not proof of identity. It does not grant rank roles under the safe default.
-- Pending claims can be posted to a private leadership verification queue using `VERIFICATION_CHANNEL_ID`. Each claim has persistent **Approve** and **Reject** buttons.
-- Approval re-checks the current authoritative roster before creating the Discord-to-TB link; rejection can include a reason. Both outcomes are stored in verification history.
-- After leadership approves the link, the configured roster rank role is synchronized.
-- Nickname synchronization is optional and only runs after an approved link exists.
-- If an unlinked member later changes their server nickname to an exact roster name, the safe default creates/updates a pending verification request; it does not grant the rank role until leadership approves the link.
+- New arrivals start with the configured `Unverified` access role until an approved roster link exists.
+- Uses the member's Discord display name, global name, and username only to **suggest likely Total Battle roster names**.
+- A suggestion is never proof of identity. Selecting a suggestion submits that exact roster name to the normal leadership verification queue.
+- If no good suggestion is found, the member can use the persistent **Verify OZY membership** button or `/verify` and enter the precise Total Battle name.
+- With the safe default `TRUST_EXACT_DISPLAY_NAME=false`, even an exact Discord display-name match is presented as a suggestion instead of being automatically linked.
+- Approval re-checks the active authoritative roster and binds Discord to the stable Total Battle `user_id`. Existing approved links therefore survive legitimate Total Battle name changes and Discord rejoins.
+- Pending claims are posted to `VERIFICATION_CHANNEL_ID` with persistent **Approve** / **Reject** controls. `/member-link` remains the leadership recovery/manual-link command.
+- Only after approval does the bot grant `Verified` and synchronize the Leader/Superior rank role when applicable.
 
-Important: Discord Community Onboarding customization questions are option-based role/channel selectors, not a free-text identity field. Do **not** use Community Onboarding as the authoritative source for the Total Battle player name. Use the OZY Admin verification form for the exact game name.
+#### Post-verification profile
 
-For troop level, Community Onboarding is useful because the answer is categorical. Create one required, single-select question such as **"What is your highest troop level?"** with answers `G1` ... `G9`, and assign one Discord role to each answer. Map those role IDs with `TROOP_LEVEL_ROLE_MAP`. OZY Admin reads the assigned role after onboarding and updates the member profile whenever the role changes.
+Language and troop profile data are deliberately collected **after** membership approval, not in Discord Community Onboarding.
 
-Example:
+The member receives a **Complete OZY profile** button and can also run `/profile`. The profile form asks for:
+
+- preferred language: `EN`, `ES`, `PT`, `SV`, `DE`, `CEB`, `FR`, `RU`, `AR`, or `NO`;
+- Guardsmen level: `G1` through `G9`;
+- Monsters level: `M1` through `M9`;
+- Specialists level: `S1` through `S9`.
+
+G/M/S are stored as profile data, not Discord roles. The selected language is stored in the profile and the bot grants exactly one matching language role. Configure the role IDs with:
 
 ```env
-TROOP_LEVEL_ROLE_MAP=G1:111111111111111111,G2:222222222222222222,G3:333333333333333333,G4:444444444444444444,G5:555555555555555555,G6:666666666666666666,G7:777777777777777777,G8:888888888888888888,G9:999999999999999999
+LANGUAGE_ROLE_MAP=EN:1536541947173408839,ES:1536542118611263609,AR:1540062337111953448,DE:1536542327714095166,FR:1536542281593782292,NO:1540062640171126904,CEB:1536542372127572028,PT:1536542159459586128,SV:1536542203319681146,RU:1540062171965431949
 ```
 
-For the leadership review queue, create a private text channel such as `LEADERSHIP / #verification` and set:
+If `LANGUAGE_ROLE_MAP` is omitted, the bot can fall back to exact role names (`EN`, `ES`, etc.), but role IDs are recommended for production.
 
-```env
-VERIFICATION_CHANNEL_ID=123456789012345678
+Do **not** assign language roles from Community Onboarding. Language roles grant access to the dedicated language channels, so OZY Admin removes them from unverified members and only restores/grants one through the post-verification profile flow.
+
+The safe join sequence is:
+
+```text
+Join
+-> Unverified
+-> roster-name suggestions from Discord name(s)
+-> member confirms/selects exact Total Battle name
+-> leadership Approve / Reject
+-> Verified + Leader/Superior sync when applicable
+-> Complete OZY profile
+-> language role + G/M/S saved
 ```
 
-Leadership can review claims from the buttons in that channel, list them with `/pending-verifications`, and inspect recent decisions with `/verification-history`. `/member-link` remains the manual override/recovery command.
-
-Troop level is stored in the bot state database together with the Discord ID and, once approved, the canonical Total Battle name/stable `user_id`. A JSON file should be treated only as a generated/read-model export if the website needs it, not as the mutable source of truth.
+Nickname synchronization remains optional (`AUTO_SYNC_NICKNAME=false` is recommended during rollout). The bot suggests roster names; it does not rename users merely because a fuzzy match looks likely.
 
 ### Roster roles
 
 `RANK_ROLE_MAP` maps Total Battle ranks to Discord role IDs. Example:
 
 ```env
-RANK_ROLE_MAP=Leader:111111111111111111,Superior:222222222222222222,Officer:333333333333333333,Veteran:444444444444444444,Soldier:555555555555555555
+RANK_ROLE_MAP=Leader:111111111111111111,Superior:222222222222222222
 ```
 
 The bot only manages roles listed in this map. It does not replace or remove unrelated Discord roles.
@@ -257,13 +259,16 @@ AUDIT_CHANNEL_ID=...
 ANNOUNCEMENT_PING_ROLE_ID=...
 LEADERSHIP_ROLE_IDS=...
 RANK_ROLE_MAP=...
-TROOP_LEVEL_ROLE_MAP=...
+LANGUAGE_ROLE_MAP=...
 AWAY_ROLE_ID=...
 ROSTER_URL=...
 CHEST_DATA_URL=...
 SCHEDULE_URL=...
 VERIFICATION_CHANNEL_ID=...
-STATE_DATABASE_URL=...
+STATE_REMOTE_URL=https://ozy.com.ar/api/ozy-admin/state
+STATE_REMOTE_TOKEN=...
+STATE_REMOTE_TIMEOUT_SECONDS=10
+STATE_DB=data/ozy_admin.sqlite3
 CALENDAR_ENABLED=true
 CALENDAR_BASE_URL=...
 CALENDAR_REALM=Regular
@@ -366,7 +371,7 @@ The service exposes:
 
 on Render's `PORT`.
 
-For durable state while keeping the OZY stack free, use the authenticated OZY website snapshot endpoint. Set `STATE_REMOTE_URL=https://ozy.com.ar/api/ozy-admin/state` and `STATE_REMOTE_TOKEN`; OZY Admin restores its small SQLite working database from Netlify Blobs at startup and uploads a consistent snapshot after state mutations. This stores Discord-to-game links, member profiles, troop levels, absences, pending verification claims, verification decision history, welcome state, and post dedupe without a separate hosted database.
+For durable state while keeping the OZY stack free, use the authenticated OZY website snapshot endpoint. Set `STATE_REMOTE_URL=https://ozy.com.ar/api/ozy-admin/state` and `STATE_REMOTE_TOKEN`; OZY Admin restores its small SQLite working database from Netlify Blobs at startup and uploads a consistent snapshot after state mutations. This stores Discord-to-game links, member profiles (language + G/M/S), absences, pending verification claims, verification decision history, welcome state, and post dedupe without a separate hosted database.
 
 Without `STATE_REMOTE_URL`, `STATE_DB` remains the SQLite fallback for local development. Do not rely on Render's ephemeral filesystem alone for production identity state. See `STATE_STORAGE.md`. Private Discord/admin state must not be exposed as public JSON.
 
@@ -401,3 +406,18 @@ Without `STATE_REMOTE_URL`, `STATE_DB` remains the SQLite fallback for local dev
 - No `Administrator` permission required.
 - No Message Content Intent required.
 - Secrets remain in environment variables, not source files.
+
+## Canonical OZY schedules
+
+OZY-created Discord events are persisted to the website schedule API when `SCHEDULE_URL` is configured. Each event is tagged `clan` or `leadership`.
+
+```env
+SCHEDULE_URL=https://ozy.com.ar/api/ozy/schedule
+OZY_DATA_API_TOKEN=<shared read/write schedule token configured in Netlify>
+SCHEDULE_CHANNEL_ID=<normal clan schedule channel>
+LEADERSHIP_SCHEDULE_CHANNEL_ID=<private leadership schedule channel>
+```
+
+`/event-create` asks for the audience during the date/time step. Normal verified members can create Clan events; Leadership events require Leader/Superior.
+
+`/schedule` and `/schedule-post` support Clan, Leadership, or Both. Leadership schedule data stays protected by the website API and is not exposed through public JSON.

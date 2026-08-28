@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -173,14 +174,55 @@ class DataProvider:
         return lookup.get(candidate.casefold())
 
     async def roster_suggestions(self, candidate: str, limit: int = 3) -> list[RosterMatch]:
-        candidate = candidate.strip().casefold()
-        if not candidate:
+        """Return advisory roster-name suggestions only.
+
+        Suggestion scoring is deliberately more tolerant than verification. It
+        ignores punctuation/spacing and gives a strong boost when a roster name
+        is visibly embedded in a Discord display name such as ``[OZY] Prince``.
+        Exact verification still goes through :meth:`exact_roster_name`.
+        """
+        raw_candidate = candidate.strip()
+        if not raw_candidate:
             return []
+
+        def normalized(value: str) -> str:
+            return " ".join(re.findall(r"[\w]+", value.casefold(), flags=re.UNICODE))
+
+        def compact(value: str) -> str:
+            return normalized(value).replace(" ", "")
+
+        cand_norm = normalized(raw_candidate)
+        cand_compact = compact(raw_candidate)
         roster = await self.roster()
-        matches = [
-            RosterMatch(name=name, score=SequenceMatcher(None, candidate, name.casefold()).ratio())
-            for name in roster
-        ]
+        matches: list[RosterMatch] = []
+
+        for name in roster:
+            name_norm = normalized(name)
+            name_compact = compact(name)
+            scores = [
+                SequenceMatcher(None, raw_candidate.casefold(), name.casefold()).ratio(),
+                SequenceMatcher(None, cand_norm, name_norm).ratio() if cand_norm and name_norm else 0.0,
+                SequenceMatcher(None, cand_compact, name_compact).ratio() if cand_compact and name_compact else 0.0,
+            ]
+
+            # A Discord display name often contains clan decorations, rank text,
+            # or other words around the actual TB name. This is useful for a
+            # suggestion, but never sufficient for automatic verification.
+            if name_norm and cand_norm and (name_norm in cand_norm or cand_norm in name_norm):
+                shorter = min(len(name_compact), len(cand_compact))
+                longer = max(len(name_compact), len(cand_compact)) or 1
+                containment = shorter / longer
+                scores.append(max(0.86, 0.90 + 0.08 * containment))
+
+            cand_tokens = set(cand_norm.split())
+            name_tokens = set(name_norm.split())
+            if cand_tokens and name_tokens:
+                overlap = len(cand_tokens & name_tokens) / len(name_tokens)
+                if overlap:
+                    scores.append(min(0.97, 0.70 + 0.27 * overlap))
+
+            matches.append(RosterMatch(name=name, score=max(scores)))
+
         matches.sort(key=lambda m: (-m.score, m.name.casefold()))
         return matches[:limit]
 
@@ -363,11 +405,21 @@ class DataProvider:
                 result.append({"key": key or label.casefold().replace(" ", "-"), "label": label, "name": name})
         return result
 
-    async def schedule_for_date(self, target_date: date) -> list[ScheduleItem]:
+    async def schedule_for_date(self, target_date: date, *, audience: str = "clan") -> list[ScheduleItem]:
+        audience = audience.strip().casefold() or "clan"
+        if audience not in {"clan", "leadership"}:
+            raise DataUnavailable(f"Unsupported schedule audience: {audience}")
+
+        url = self.settings.schedule_url
+        if url:
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}audience={audience}"
+
         raw = await self._load_json(
-            "schedule",
-            self.settings.schedule_url,
+            f"schedule:{audience}",
+            url,
             self.settings.schedule_file,
+            ozy_api_auth=bool(url),
         )
         events = raw.get("events", raw) if isinstance(raw, dict) else raw
         if not isinstance(events, list):
@@ -379,6 +431,43 @@ class DataProvider:
             if not isinstance(event, dict):
                 continue
 
+            event_audience = str(event.get("audience", "clan") or "clan").strip().casefold()
+            if event_audience != audience:
+                continue
+
+            # New canonical website schedule schema: UTC timestamp + audience.
+            start_utc = str(event.get("start_utc", "") or "").strip()
+            if start_utc:
+                try:
+                    normalized = start_utc.replace("Z", "+00:00")
+                    start_dt = datetime.fromisoformat(normalized)
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.replace(tzinfo=timezone.utc)
+                    local_dt = start_dt.astimezone(self.settings.timezone)
+                except ValueError:
+                    continue
+                if local_dt.date() != target_date:
+                    continue
+                title = str(event.get("title", "") or "").strip()
+                if not title:
+                    continue
+                details = str(
+                    event.get("description")
+                    or event.get("details")
+                    or event.get("notes")
+                    or ""
+                ).strip()
+                results.append(
+                    ScheduleItem(
+                        time=local_dt.strftime("%H:%M"),
+                        title=title,
+                        details=details,
+                        ping=bool(event.get("ping", False)),
+                    )
+                )
+                continue
+
+            # Backward-compatible local/static schedule schema.
             event_date = str(event.get("date", "")).strip()
             if event_date:
                 try:
@@ -392,9 +481,6 @@ class DataProvider:
                     allowed = {str(x).casefold() for x in weekdays}
                     if weekday not in allowed:
                         continue
-                else:
-                    # No date/weekday means daily.
-                    pass
 
             title = str(event.get("title", "")).strip()
             event_time = str(event.get("time", "")).strip()
@@ -419,3 +505,59 @@ class DataProvider:
 
         results.sort(key=sort_key)
         return results
+
+    async def upsert_schedule_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a Discord-created event in the canonical OZY website schedule."""
+        if not self.settings.schedule_url:
+            raise DataUnavailable("SCHEDULE_URL is not configured")
+        if not self.settings.ozy_data_api_token:
+            raise DataUnavailable("OZY_DATA_API_TOKEN is required to write schedule data")
+
+        timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
+        headers = {
+            "X-OZY-Admin-Token": self.settings.ozy_data_api_token,
+            "Content-Type": "application/json",
+        }
+        try:
+            async with self.session.post(
+                self.settings.schedule_url,
+                json=payload,
+                timeout=timeout,
+                headers=headers,
+            ) as response:
+                if response.status not in {200, 201}:
+                    body = (await response.text())[:300]
+                    raise DataUnavailable(
+                        f"schedule write returned HTTP {response.status}: {body or 'empty response'}"
+                    )
+                data = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            raise DataUnavailable(f"Could not write schedule to website: {exc}") from exc
+
+        self.invalidate("schedule:clan")
+        self.invalidate("schedule:leadership")
+        return data if isinstance(data, dict) else {"ok": True}
+
+    async def delete_schedule_event(self, discord_event_id: int | str) -> bool:
+        if not self.settings.schedule_url or not self.settings.ozy_data_api_token:
+            return False
+        separator = "&" if "?" in self.settings.schedule_url else "?"
+        url = f"{self.settings.schedule_url}{separator}id={discord_event_id}"
+        timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
+        headers = {"X-OZY-Admin-Token": self.settings.ozy_data_api_token}
+        try:
+            async with self.session.delete(url, timeout=timeout, headers=headers) as response:
+                if response.status == 404:
+                    return False
+                if response.status not in {200, 204}:
+                    body = (await response.text())[:300]
+                    raise DataUnavailable(
+                        f"schedule delete returned HTTP {response.status}: {body or 'empty response'}"
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise DataUnavailable(f"Could not delete schedule event from website: {exc}") from exc
+
+        self.invalidate("schedule:clan")
+        self.invalidate("schedule:leadership")
+        return True
+

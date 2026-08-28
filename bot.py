@@ -54,7 +54,26 @@ TIMEZONE_CHOICES = [
     app_commands.Choice(name="South Africa", value="Africa/Johannesburg"),
 ]
 
-TROOP_LEVELS = tuple(f"G{i}" for i in range(1, 10))
+SCHEDULE_AUDIENCE_CHOICES = [
+    app_commands.Choice(name="Clan", value="clan"),
+    app_commands.Choice(name="Leadership", value="leadership"),
+    app_commands.Choice(name="Both", value="both"),
+]
+
+PROFILE_LANGUAGES = (
+    ("EN", "English"),
+    ("ES", "Español"),
+    ("PT", "Português"),
+    ("SV", "Svenska"),
+    ("DE", "Deutsch"),
+    ("CEB", "Bisaya"),
+    ("FR", "Français"),
+    ("RU", "Русский"),
+    ("AR", "العربية"),
+    ("NO", "Norsk"),
+)
+PROFILE_LANGUAGE_CODES = {code for code, _ in PROFILE_LANGUAGES}
+PROFILE_LEVELS = tuple(range(1, 10))
 
 # Minimal-impact source schedule. Public calendar metadata is checked only four
 # times per UTC day while we learn the calendar source refresh cadence.
@@ -329,6 +348,15 @@ class EventScheduleModal(discord.ui.Modal):
             required=True,
             max_length=4,
         )
+        self.audience = discord.ui.Select(
+            placeholder="Who should see this event?",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Clan", value="clan", description="Visible to all verified OZY members"),
+                discord.SelectOption(label="Leadership", value="leadership", description="Leader / Superior schedule only"),
+            ],
+        )
         self.add_item(discord.ui.Label(
             text="R+0 reset date",
             description="The calendar date on which this game day starts at R+0.",
@@ -336,6 +364,7 @@ class EventScheduleModal(discord.ui.Modal):
         ))
         self.add_item(discord.ui.Label(text="Game reset time", component=self.reset_time))
         self.add_item(discord.ui.Label(text="Duration in minutes", component=self.duration))
+        self.add_item(discord.ui.Label(text="Audience", component=self.audience))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.draft.creator_id:
@@ -347,6 +376,14 @@ class EventScheduleModal(discord.ui.Modal):
             await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
             return
         if not await self.bot._require_event_creator(interaction):
+            return
+
+        audience = (self.audience.values[0] if self.audience.values else "clan").strip().casefold()
+        if audience == "leadership" and not self.bot._is_leadership(member):
+            await interaction.response.send_message(
+                "Only Leader/Superior can create Leadership schedule events.",
+                ephemeral=True,
+            )
             return
 
         category = guild.get_channel(self.draft.category_id)
@@ -416,12 +453,15 @@ class EventScheduleModal(discord.ui.Modal):
         embed.add_field(name="Duration", value=f"{duration_minutes} min", inline=True)
         embed.add_field(name="Category", value=category.name, inline=True)
         embed.add_field(name="Event channel", value=_channel_display(event_channel), inline=True)
+        embed.add_field(name="Audience", value="Leadership" if audience == "leadership" else "Clan", inline=True)
         embed.add_field(name="Created by", value=interaction.user.mention, inline=True)
         embed.set_footer(text="OZY Event")
 
         link_view = discord.ui.View(timeout=None)
         link_view.add_item(discord.ui.Button(label="Open Discord Event", style=discord.ButtonStyle.link, url=event_url))
 
+        published = None
+        publish_error = None
         try:
             published = await publish_channel.send(
                 embed=embed,
@@ -429,35 +469,75 @@ class EventScheduleModal(discord.ui.Modal):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.Forbidden:
-            # Keep the scheduled event and report only the publication failure.
-            await interaction.followup.send(
-                "The Discord event was created, but I cannot post in the selected publish channel. "
-                f"Event: {event_url}",
-                ephemeral=True,
-            )
-            return
+            publish_error = "I cannot post in the selected publish channel."
         except discord.HTTPException as exc:
-            await interaction.followup.send(
-                f"The Discord event was created, but publishing failed: {exc}\n{event_url}",
-                ephemeral=True,
-            )
-            return
+            publish_error = f"Publishing failed: {exc}"
 
+        # The website is the canonical schedule store. Persist the Discord event
+        # even if its announcement could not be posted, so schedule data is not lost.
+        schedule_sync_error = None
+        if self.bot.data is not None:
+            payload = {
+                "id": str(event.id),
+                "discord_event_id": str(event.id),
+                "guild_id": str(guild.id),
+                "title": self.draft.name,
+                "description": self.draft.notes,
+                "audience": audience,
+                "start_utc": start_time.isoformat().replace("+00:00", "Z"),
+                "end_utc": (start_time + timedelta(minutes=duration_minutes)).isoformat().replace("+00:00", "Z"),
+                "duration_minutes": duration_minutes,
+                "reset_label": reset_text,
+                "reset_date": _parse_event_date(str(self.event_date.value)).isoformat(),
+                "category_id": str(category.id),
+                "category_name": category.name,
+                "event_channel_id": str(event_channel.id),
+                "event_channel_name": getattr(event_channel, "name", ""),
+                "event_channel_type": str(getattr(event_channel, "type", "")),
+                "publish_channel_id": str(publish_channel.id),
+                "publish_channel_name": getattr(publish_channel, "name", ""),
+                "published_message_id": str(published.id) if published is not None else None,
+                "discord_event_url": event_url,
+                "created_by_discord_id": str(interaction.user.id),
+                "created_by_name": interaction.user.display_name,
+            }
+            try:
+                await self.bot.data.upsert_schedule_event(payload)
+            except DataUnavailable as exc:
+                schedule_sync_error = str(exc)
+                log.error("Could not persist Discord event %s to OZY website schedule: %s", event.id, exc)
+        else:
+            schedule_sync_error = "data provider unavailable"
+
+        status_lines = [
+            "Event created.",
+            f"**{self.draft.name}** - **{reset_text}**",
+            f"Audience: **{'Leadership' if audience == 'leadership' else 'Clan'}**",
+        ]
+        if published is not None:
+            status_lines.append(f"Published in {_channel_display(publish_channel)}")
+        elif publish_error:
+            status_lines.append(f"Warning: {publish_error}")
+        if schedule_sync_error:
+            status_lines.append(f"Warning: website schedule sync failed: {schedule_sync_error}")
+        else:
+            status_lines.append("Website schedule: synced")
+        status_lines.append(event_url)
         await interaction.followup.send(
-            "Event created and published.\n"
-            f"**{self.draft.name}** - **{reset_text}**\n"
-            f"Published in {_channel_display(publish_channel)}\n"
-            f"{event_url}",
+            "\n".join(status_lines),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
         await self.bot._audit(
             "Discord event created",
             str(interaction.user),
             f"{self.draft.name}\n"
+            f"Audience: {audience}\n"
             f"Category: {category.name}\n"
             f"Event channel: #{getattr(event_channel, 'name', event_channel.id)}\n"
-            f"Published: #{getattr(publish_channel, 'name', publish_channel.id)} ({published.id})\n"
+            f"Published: {('#' + getattr(publish_channel, 'name', str(publish_channel.id)) + ' (' + str(published.id) + ')') if published is not None else 'failed'}\n"
+            f"Website schedule: {'failed - ' + schedule_sync_error if schedule_sync_error else 'synced'}\n"
             f"Start: {start_time.isoformat()} ({reset_text})",
         )
 
@@ -578,14 +658,18 @@ class VerificationReviewView(discord.ui.View):
         self.add_item(VerificationRejectButton(bot, target_user_id))
 
 class MembershipVerificationModal(discord.ui.Modal):
-    """Collect the exact Total Battle name and member-entered troop level."""
+    """Collect only the claimed Total Battle roster identity.
+
+    Language and G/M/S profile data are deliberately collected after leadership
+    approves the Discord -> Total Battle identity link.
+    """
 
     def __init__(
         self,
         bot: "OZYAdminBot",
         *,
         member: discord.Member,
-        current_troop_level: str | None = None,
+        suggested_name: str | None = None,
     ):
         super().__init__(title="Verify OZY Membership", timeout=300)
         self.bot = bot
@@ -593,37 +677,18 @@ class MembershipVerificationModal(discord.ui.Modal):
 
         self.game_name = discord.ui.TextInput(
             placeholder="Exact Total Battle name used in OZY",
-            default=member.display_name[:100],
+            default=(suggested_name or member.display_name)[:100],
             max_length=100,
         )
-        options = [
-            discord.SelectOption(
-                label=level,
-                value=level,
-                default=(level == current_troop_level),
-            )
-            for level in TROOP_LEVELS
-        ]
-        self.troop_level = discord.ui.Select(
-            placeholder="Select your highest troop level",
-            options=options,
-            min_values=1,
-            max_values=1,
-            required=True,
-        )
-
         self.add_item(discord.ui.Label(text="Exact Total Battle name", component=self.game_name))
-        self.add_item(discord.ui.Label(text="Highest troop level", component=self.troop_level))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.member_id:
             await interaction.response.send_message("This verification form belongs to another member.", ephemeral=True)
             return
-        level = self.troop_level.values[0] if self.troop_level.values else None
         await self.bot._submit_membership_verification(
             interaction,
             game_name=str(self.game_name.value),
-            troop_level=level,
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
@@ -635,7 +700,7 @@ class MembershipVerificationModal(discord.ui.Modal):
 
 
 class MembershipVerificationView(discord.ui.View):
-    """Persistent welcome-button entry point for roster verification."""
+    """Persistent entry point for manually entering an exact roster name."""
 
     def __init__(self, bot: "OZYAdminBot"):
         super().__init__(timeout=None)
@@ -662,6 +727,133 @@ class MembershipVerificationRetryView(discord.ui.View):
             await interaction.response.send_message("This verification belongs to another member.", ephemeral=True)
             return
         await self.bot._open_membership_verification(interaction)
+
+
+class RosterSuggestionSelect(discord.ui.Select):
+    def __init__(self, bot: "OZYAdminBot", member_id: int, suggestions: list[str]):
+        options = [
+            discord.SelectOption(label=name[:100], value=name[:100])
+            for name in suggestions[:5]
+        ]
+        super().__init__(
+            placeholder="Is one of these your Total Battle name?",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.bot = bot
+        self.member_id = member_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message("These roster suggestions belong to another member.", ephemeral=True)
+            return
+        selected = self.values[0]
+        await self.bot._submit_suggested_roster_name(interaction, selected)
+
+
+class RosterSuggestionView(discord.ui.View):
+    """Join-time roster suggestions. Selecting one only creates a pending claim."""
+
+    def __init__(self, bot: "OZYAdminBot", member_id: int, suggestions: list[str]):
+        super().__init__(timeout=1800)
+        self.bot = bot
+        self.member_id = member_id
+        if suggestions:
+            self.add_item(RosterSuggestionSelect(bot, member_id, suggestions))
+
+    @discord.ui.button(label="Enter a different name", style=discord.ButtonStyle.secondary)
+    async def manual_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message("This verification belongs to another member.", ephemeral=True)
+            return
+        await self.bot._open_membership_verification(interaction)
+
+
+class PostVerificationProfileModal(discord.ui.Modal):
+    """Collect preferred language and G/M/S after roster identity approval."""
+
+    def __init__(self, bot: "OZYAdminBot", *, member: discord.Member):
+        super().__init__(title="Complete OZY Profile", timeout=300)
+        self.bot = bot
+        self.member_id = member.id
+        profile = bot.state.get_member_profile(member.id)
+
+        language_options = [
+            discord.SelectOption(
+                label=label,
+                value=code,
+                default=bool(profile and profile.preferred_language == code),
+            )
+            for code, label in PROFILE_LANGUAGES
+        ]
+        self.language = discord.ui.Select(
+            placeholder="Preferred language",
+            options=language_options,
+            min_values=1,
+            max_values=1,
+            required=True,
+        )
+
+        def level_select(prefix: str, current: int | None) -> discord.ui.Select:
+            return discord.ui.Select(
+                placeholder=f"{prefix} level",
+                options=[
+                    discord.SelectOption(
+                        label=f"{prefix}{level}",
+                        value=str(level),
+                        default=(current == level),
+                    )
+                    for level in PROFILE_LEVELS
+                ],
+                min_values=1,
+                max_values=1,
+                required=True,
+            )
+
+        self.guardsmen = level_select("G", profile.guardsmen_level if profile else None)
+        self.monsters = level_select("M", profile.monsters_level if profile else None)
+        self.specialists = level_select("S", profile.specialists_level if profile else None)
+
+        self.add_item(discord.ui.Label(text="Preferred language", component=self.language))
+        self.add_item(discord.ui.Label(text="Guardsmen level", component=self.guardsmen))
+        self.add_item(discord.ui.Label(text="Monsters level", component=self.monsters))
+        self.add_item(discord.ui.Label(text="Specialists level", component=self.specialists))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message("This profile form belongs to another member.", ephemeral=True)
+            return
+        await self.bot._submit_post_verification_profile(
+            interaction,
+            preferred_language=self.language.values[0],
+            guardsmen_level=int(self.guardsmen.values[0]),
+            monsters_level=int(self.monsters.values[0]),
+            specialists_level=int(self.specialists.values[0]),
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Post-verification profile modal failed", exc_info=error)
+        if interaction.response.is_done():
+            await interaction.followup.send("Profile update failed. Try `/profile` again.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Profile update failed. Try `/profile` again.", ephemeral=True)
+
+
+class PostVerificationProfileView(discord.ui.View):
+    """Persistent button used in approval DMs and fallback guild messages."""
+
+    def __init__(self, bot: "OZYAdminBot"):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="Complete OZY profile",
+        style=discord.ButtonStyle.primary,
+        custom_id="ozy:profile:complete",
+    )
+    async def profile_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.bot._open_post_verification_profile(interaction)
 
 
 class AnnouncementModal(discord.ui.Modal):
@@ -752,6 +944,7 @@ class OZYAdminBot(discord.Client):
         # Persistent welcome verification button. Register it before command
         # sync so old welcome messages keep working after a restart/redeploy.
         self.add_view(MembershipVerificationView(self))
+        self.add_view(PostVerificationProfileView(self))
 
         # Re-register persistent leadership approve/reject controls for every
         # pending claim so buttons posted before a restart keep working.
@@ -819,6 +1012,17 @@ class OZYAdminBot(discord.Client):
 
         log.info("OZY Admin operational as %s (%s)", self.user, self.user.id if self.user else "?")
 
+    async def on_scheduled_event_delete(self, event: discord.ScheduledEvent) -> None:
+        """Remove deleted Discord events from the canonical website schedule."""
+        if event.guild_id != self.settings.server_id or self.data is None:
+            return
+        try:
+            removed = await self.data.delete_schedule_event(event.id)
+            if removed:
+                log.info("Removed Discord event %s from OZY website schedule", event.id)
+        except DataUnavailable as exc:
+            log.warning("Could not remove Discord event %s from website schedule: %s", event.id, exc)
+
     async def _start_health_server(self) -> None:
         async def health(_: web.Request) -> web.Response:
             return web.json_response(
@@ -874,6 +1078,7 @@ class OZYAdminBot(discord.Client):
             "WELCOME_CHANNEL_ID": self.settings.welcome_channel_id,
             "ANNOUNCEMENT_CHANNEL_ID": self.settings.announcement_channel_id,
             "SCHEDULE_CHANNEL_ID": self.settings.schedule_channel_id,
+            "LEADERSHIP_SCHEDULE_CHANNEL_ID": self.settings.leadership_schedule_channel_id,
             "CALENDAR_CHANNEL_ID": self.settings.calendar_channel_id,
             "TODAY_CHANNEL_ID": self.settings.today_channel_id,
             "AWAY_CHANNEL_ID": self.settings.away_channel_id,
@@ -897,7 +1102,7 @@ class OZYAdminBot(discord.Client):
                 )
 
         role_ids = set(self.settings.rank_role_map.values())
-        role_ids.update(self.settings.troop_level_role_map.values())
+        role_ids.update(self.settings.language_role_map.values())
         if self.settings.away_role_id:
             role_ids.add(self.settings.away_role_id)
         if self.settings.verified_role_id:
@@ -916,6 +1121,7 @@ class OZYAdminBot(discord.Client):
                 raise ConfigError(f"Configured role ID {role_id} does not exist in this guild")
 
         managed_role_ids = set(self.settings.rank_role_map.values())
+        managed_role_ids.update(self.settings.language_role_map.values())
         if self.settings.away_role_id:
             managed_role_ids.add(self.settings.away_role_id)
         if self.settings.verified_role_id:
@@ -932,7 +1138,7 @@ class OZYAdminBot(discord.Client):
                 )
 
         if managed_role_ids and not me.guild_permissions.manage_roles:
-            raise ConfigError("OZY Admin needs Manage Roles for configured rank/away role automation")
+            raise ConfigError("OZY Admin needs Manage Roles for configured rank/access/language role automation")
         if self.settings.auto_sync_nickname and not me.guild_permissions.manage_nicknames:
             raise ConfigError("AUTO_SYNC_NICKNAME=true requires Manage Nicknames")
 
@@ -1069,8 +1275,6 @@ class OZYAdminBot(discord.Client):
         if not isinstance(channel, discord.TextChannel):
             return
         member = guild.get_member(discord_user_id)
-        profile = self.state.get_member_profile(discord_user_id)
-
         embed = discord.Embed(
             title="Roster verification pending",
             color=0xF59E0B,
@@ -1082,8 +1286,6 @@ class OZYAdminBot(discord.Client):
             inline=False,
         )
         embed.add_field(name="Claimed OZY name", value=request.requested_game_name, inline=True)
-        if profile and profile.troop_level:
-            embed.add_field(name="Troop level", value=profile.troop_level, inline=True)
         embed.add_field(name="Source", value=request.source, inline=True)
         if request.requested_game_user_id:
             embed.set_footer(text=f"TB user ID: {request.requested_game_user_id}")
@@ -1272,12 +1474,7 @@ class OZYAdminBot(discord.Client):
                 reason=reason,
                 role_result=role_result,
             )
-        try:
-            await target.send(
-                f"Your OZY membership was approved as **{canonical}**.\nRole sync: {role_result}."
-            )
-        except discord.HTTPException:
-            pass
+        await self._send_post_verification_profile_prompt(target, canonical, role_result=role_result)
         await self._audit(
             "Roster verification approved",
             str(reviewer),
@@ -1296,58 +1493,296 @@ class OZYAdminBot(discord.Client):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
-    def _troop_level_from_roles(self, member: discord.Member) -> tuple[str | None, list[str]]:
-        """Resolve the single troop level assigned by Discord Onboarding roles."""
-        if not self.settings.troop_level_role_map:
-            return None, []
-        role_ids = {role.id for role in member.roles}
-        matches = [
-            level
-            for level, role_id in self.settings.troop_level_role_map.items()
-            if role_id in role_ids
-        ]
-        matches.sort(key=lambda value: int(value[1:]) if value[1:].isdigit() else 999)
-        return (matches[0] if len(matches) == 1 else None), matches
-
-    async def _sync_troop_profile_from_roles(self, member: discord.Member, *, source: str) -> str | None:
-        level, matches = self._troop_level_from_roles(member)
-        if len(matches) > 1:
-            await self._audit(
-                "Troop level conflict",
-                str(member),
-                "Multiple onboarding troop roles are assigned: " + ", ".join(matches),
-            )
+    def _member_from_interaction(self, interaction: discord.Interaction) -> discord.Member | None:
+        if isinstance(interaction.user, discord.Member):
+            if interaction.user.guild.id == self.settings.server_id:
+                return interaction.user
+        guild = self.get_guild(self.settings.server_id)
+        if guild is None:
             return None
-        if level:
-            link = self.state.get_link_record(member.id)
-            self.state.set_troop_level(
-                member.id,
-                level,
-                source,
-                game_name=link.game_name if link else None,
-                game_user_id=link.game_user_id if link else None,
-            )
-        elif self.settings.troop_level_role_map:
-            profile = self.state.get_member_profile(member.id)
-            if profile and (profile.troop_level_source or "").startswith("onboarding-role"):
-                self.state.set_troop_level(member.id, None, source)
-        return level
+        return guild.get_member(interaction.user.id)
 
-    async def _open_membership_verification(self, interaction: discord.Interaction) -> None:
+    def _language_role_for_code(self, guild: discord.Guild, code: str) -> discord.Role | None:
+        code = code.strip().upper()
+        configured_id = self.settings.language_role_map.get(code)
+        if configured_id:
+            return guild.get_role(configured_id)
+        # Safe fallback for the current OZY server where language roles are
+        # named exactly EN / ES / AR / DE / FR / NO / CEB / PT / SV / RU.
+        return discord.utils.find(lambda role: role.name.upper() == code, guild.roles)
+
+    def _language_role_ids(self, guild: discord.Guild) -> set[int]:
+        ids: set[int] = set(self.settings.language_role_map.values())
+        for code in PROFILE_LANGUAGE_CODES:
+            role = self._language_role_for_code(guild, code)
+            if role:
+                ids.add(role.id)
+        return ids
+
+    async def _sync_language_role(self, member: discord.Member, code: str) -> str:
+        code = code.strip().upper()
+        if code not in PROFILE_LANGUAGE_CODES:
+            return f"unsupported language {code}"
+
+        target = self._language_role_for_code(member.guild, code)
+        if target is None:
+            return f"language role {code} is not configured/found"
+
+        me = member.guild.me
+        if me is None or target >= me.top_role:
+            return f"cannot manage language role {target.name}; check role hierarchy"
+
+        language_ids = self._language_role_ids(member.guild)
+        remove_roles = [
+            role for role in member.roles
+            if role.id in language_ids and role.id != target.id
+        ]
+        try:
+            if remove_roles:
+                await member.remove_roles(*remove_roles, reason=f"OZY preferred language -> {code}")
+            if target not in member.roles:
+                await member.add_roles(target, reason=f"OZY preferred language -> {code}")
+        except discord.HTTPException as exc:
+            return f"language role update failed: {exc}"
+        return f"{code} -> {target.name}"
+
+    async def _open_membership_verification(
+        self,
+        interaction: discord.Interaction,
+        *,
+        suggested_name: str | None = None,
+    ) -> None:
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if member is None or member.guild.id != self.settings.server_id:
             await interaction.response.send_message("This verification only works inside the OZY server.", ephemeral=True)
             return
-        profile = self.state.get_member_profile(member.id)
-        role_level, _ = self._troop_level_from_roles(member)
-        current_level = role_level or (profile.troop_level if profile else None)
         await interaction.response.send_modal(
             MembershipVerificationModal(
                 self,
                 member=member,
-                current_troop_level=current_level,
+                suggested_name=suggested_name,
             )
         )
+
+    async def _join_roster_suggestions(self, member: discord.Member, *, limit: int = 5) -> list[str]:
+        """Use Discord names only to suggest likely roster identities.
+
+        Suggestions are never treated as proof. The selected name still passes
+        through the exact roster claim + leadership approval flow.
+        """
+        assert self.data is not None
+        variants: list[str] = []
+        for value in (
+            member.display_name,
+            getattr(member, "global_name", None),
+            member.name,
+        ):
+            value = str(value or "").strip()
+            if value and value.casefold() not in {x.casefold() for x in variants}:
+                variants.append(value)
+
+        scored: dict[str, float] = {}
+        for value in variants:
+            exact = await self.data.exact_roster_name(value)
+            if exact:
+                scored[exact] = 1.0
+            for match in await self.data.roster_suggestions(value, limit=max(limit * 3, 10)):
+                scored[match.name] = max(scored.get(match.name, 0.0), match.score)
+
+        ordered = sorted(scored.items(), key=lambda item: (-item[1], item[0].casefold()))
+        return [name for name, score in ordered if score >= self.settings.roster_match_threshold][:limit]
+
+    async def _submit_suggested_roster_name(
+        self,
+        interaction: discord.Interaction,
+        selected_name: str,
+    ) -> None:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None or member.guild.id != self.settings.server_id:
+            await interaction.response.send_message("This verification only works inside the OZY server.", ephemeral=True)
+            return
+        assert self.data is not None
+        try:
+            canonical, response, outcome = await self._process_verification_claim(
+                member,
+                selected_name,
+                source="join-roster-suggestion",
+            )
+        except DataUnavailable as exc:
+            await interaction.response.send_message(f"Roster unavailable: {exc}", ephemeral=True)
+            return
+
+        await self._audit(
+            "Roster suggestion selected",
+            str(member),
+            f"Suggested/selected name: {selected_name}\nCanonical: {canonical or 'none'}\nOutcome: {outcome}",
+        )
+        if canonical is None:
+            await interaction.response.send_message(
+                response,
+                ephemeral=True,
+                view=MembershipVerificationRetryView(self, member.id),
+            )
+        else:
+            await interaction.response.send_message(response, ephemeral=True)
+
+    async def _open_post_verification_profile(self, interaction: discord.Interaction) -> None:
+        member = self._member_from_interaction(interaction)
+        if member is None:
+            await interaction.response.send_message("I could not resolve your OZY server membership.", ephemeral=True)
+            return
+        assert self.data is not None
+        link = self.state.get_link_record(member.id)
+        if link is None:
+            await interaction.response.send_message(
+                "Complete OZY membership verification first. Your language and G/M/S profile unlocks after the roster link is approved.",
+                ephemeral=True,
+            )
+            return
+        try:
+            info = await self.data.resolve_roster_member(
+                game_name=link.game_name,
+                game_user_id=link.game_user_id,
+            )
+        except DataUnavailable as exc:
+            await interaction.response.send_message(f"Roster unavailable: {exc}", ephemeral=True)
+            return
+        if info is None:
+            await interaction.response.send_message(
+                "Your saved roster identity is not currently active. Ask leadership to review the link before editing your profile.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(PostVerificationProfileModal(self, member=member))
+
+    async def _submit_post_verification_profile(
+        self,
+        interaction: discord.Interaction,
+        *,
+        preferred_language: str,
+        guardsmen_level: int,
+        monsters_level: int,
+        specialists_level: int,
+    ) -> None:
+        member = self._member_from_interaction(interaction)
+        if member is None:
+            await interaction.response.send_message("I could not resolve your OZY server membership.", ephemeral=True)
+            return
+
+        language = preferred_language.strip().upper()
+        if language not in PROFILE_LANGUAGE_CODES:
+            await interaction.response.send_message("Select a supported OZY language.", ephemeral=True)
+            return
+        if any(level not in PROFILE_LEVELS for level in (guardsmen_level, monsters_level, specialists_level)):
+            await interaction.response.send_message("G, M and S levels must each be between 1 and 9.", ephemeral=True)
+            return
+
+        link = self.state.get_link_record(member.id)
+        if link is None:
+            await interaction.response.send_message("Membership verification must be approved before profile setup.", ephemeral=True)
+            return
+        assert self.data is not None
+        try:
+            info = await self.data.resolve_roster_member(
+                game_name=link.game_name,
+                game_user_id=link.game_user_id,
+            )
+        except DataUnavailable as exc:
+            await interaction.response.send_message(f"Roster unavailable: {exc}", ephemeral=True)
+            return
+        if info is None:
+            await interaction.response.send_message("Your linked roster identity is no longer active.", ephemeral=True)
+            return
+
+        canonical = str(info["name"])
+        stable_id = str(info.get("user_id", "")).strip() or None
+        role_result = await self._sync_language_role(member, language)
+        if role_result.startswith(("unsupported", "language role", "cannot manage")):
+            await interaction.response.send_message(
+                f"Your profile was not saved because the language role could not be updated: {role_result}",
+                ephemeral=True,
+            )
+            return
+
+        self.state.set_member_profile_details(
+            member.id,
+            preferred_language=language,
+            guardsmen_level=guardsmen_level,
+            monsters_level=monsters_level,
+            specialists_level=specialists_level,
+            source="post-verification-profile",
+            game_name=canonical,
+            game_user_id=stable_id,
+        )
+        self.state.set_link(
+            member.id,
+            canonical,
+            "post-verification-profile-refresh",
+            game_user_id=stable_id,
+        )
+        language_label = dict(PROFILE_LANGUAGES).get(language, language)
+        await self._audit(
+            "Member profile updated",
+            str(member),
+            f"Game name: {canonical}\nLanguage: {language}\nG{guardsmen_level} / M{monsters_level} / S{specialists_level}\nRole sync: {role_result}",
+        )
+        await interaction.response.send_message(
+            f"OZY profile saved for **{canonical}**.\n"
+            f"Language: **{language_label} ({language})**\n"
+            f"Troops: **G{guardsmen_level} / M{monsters_level} / S{specialists_level}**\n"
+            f"Language role: {role_result}",
+            ephemeral=True,
+        )
+
+    async def _send_post_verification_profile_prompt(
+        self,
+        member: discord.Member,
+        canonical: str,
+        *,
+        role_result: str | None = None,
+    ) -> bool:
+        profile = self.state.get_member_profile(member.id)
+        if profile and profile.profile_complete:
+            return True
+
+        embed = discord.Embed(
+            title="OZY membership approved",
+            description=f"You are verified as **{canonical}**.",
+            color=0x10B981,
+        )
+        if role_result:
+            embed.add_field(name="Access", value=role_result, inline=False)
+        embed.add_field(
+            name="Complete your profile",
+            value=(
+                "Choose your preferred language and your current **Guardsmen (G)**, "
+                "**Monsters (M)** and **Specialists (S)** levels. The language choice "
+                "also unlocks the matching language channel."
+            ),
+            inline=False,
+        )
+        view = PostVerificationProfileView(self)
+        try:
+            await member.send(embed=embed, view=view)
+            return True
+        except discord.HTTPException:
+            pass
+
+        if self.settings.welcome_channel_id:
+            channel = self.get_channel(self.settings.welcome_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.send(
+                        content=member.mention,
+                        embed=embed,
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                    )
+                    return True
+                except discord.HTTPException:
+                    pass
+        return False
+
 
     async def _process_verification_claim(
         self,
@@ -1416,6 +1851,7 @@ class OZYAdminBot(discord.Client):
             )
             self.state.clear_verification_request(member.id)
             role_result = await self._sync_rank_role(member, canonical)
+            await self._send_post_verification_profile_prompt(member, canonical, role_result=role_result)
             return canonical, f"Linked to **{canonical}**. Role sync: {role_result}.", f"auto-approved; {role_result}"
 
         await self._queue_verification_request(
@@ -1436,31 +1872,11 @@ class OZYAdminBot(discord.Client):
         interaction: discord.Interaction,
         *,
         game_name: str,
-        troop_level: str | None,
     ) -> None:
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if member is None or member.guild.id != self.settings.server_id:
             await interaction.response.send_message("This verification only works inside the OZY server.", ephemeral=True)
             return
-
-        normalized_level = (troop_level or "").strip().upper()
-        if normalized_level not in TROOP_LEVELS:
-            await interaction.response.send_message("Select a valid troop level from G1 to G9.", ephemeral=True)
-            return
-
-        role_level, role_matches = self._troop_level_from_roles(member)
-        if len(role_matches) > 1:
-            await interaction.response.send_message(
-                "Your Discord onboarding currently assigned multiple troop-level roles: "
-                + ", ".join(role_matches)
-                + ". Fix the onboarding answer or ask leadership to correct the roles.",
-                ephemeral=True,
-            )
-            return
-
-        effective_level = role_level or normalized_level
-        level_source = "onboarding-role" if role_level else "verification-modal"
-        self.state.set_troop_level(member.id, effective_level, level_source)
 
         assert self.data is not None
         try:
@@ -1471,25 +1887,15 @@ class OZYAdminBot(discord.Client):
             )
         except DataUnavailable as exc:
             await interaction.response.send_message(
-                f"The OZY roster is temporarily unavailable. Your troop level was saved, but membership was not verified: {exc}",
+                f"The OZY roster is temporarily unavailable. Membership was not verified: {exc}",
                 ephemeral=True,
             )
             return
 
-        profile_link = self.state.get_link_record(member.id)
-        if canonical:
-            self.state.set_troop_level(
-                member.id,
-                effective_level,
-                level_source,
-                game_name=canonical,
-                game_user_id=profile_link.game_user_id if profile_link else None,
-            )
-
         await self._audit(
             "Roster verification request",
             str(member),
-            f"Game name: {canonical or game_name.strip()}\nTroop level: {effective_level}\nOutcome: {outcome}",
+            f"Game name: {canonical or game_name.strip()}\nOutcome: {outcome}",
         )
 
         if canonical is None:
@@ -1499,11 +1905,7 @@ class OZYAdminBot(discord.Client):
                 view=MembershipVerificationRetryView(self, member.id),
             )
             return
-
-        await interaction.response.send_message(
-            response + f"\nTroop level saved: **{effective_level}**.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(response, ephemeral=True)
 
     async def _resolve_member_game_name(self, member: discord.Member) -> str | None:
         assert self.data is not None
@@ -1570,7 +1972,6 @@ class OZYAdminBot(discord.Client):
                 add_roles.append(verified)
             if unverified and unverified in member.roles:
                 remove_roles.append(unverified)
-            # A roster member no longer needs the exception role.
             if special and special in member.roles:
                 remove_roles.append(special)
             state = "verified roster member"
@@ -1586,6 +1987,15 @@ class OZYAdminBot(discord.Client):
             if unverified and unverified not in member.roles:
                 add_roles.append(unverified)
             state = "unverified"
+
+            # Language channels are post-verification. If Discord Community
+            # Onboarding, a stale role, or a manual assignment gave a language
+            # role early, remove it while the member is unverified.
+            language_ids = self._language_role_ids(guild)
+            remove_roles.extend(
+                role for role in member.roles
+                if role.id in language_ids and role not in remove_roles
+            )
 
         # Roster rank roles are never kept for non-roster exceptions.
         if not active_roster_member:
@@ -1619,20 +2029,30 @@ class OZYAdminBot(discord.Client):
         )
 
         access_result = await self._sync_access_roles(member, active_roster_member=True)
+        profile = self.state.get_member_profile(member.id)
+        language_result: str | None = None
+        if profile and profile.preferred_language:
+            language_result = await self._sync_language_role(member, profile.preferred_language)
+
+        def with_language(text: str) -> str:
+            if language_result:
+                return f"{text}; language {language_result}"
+            return text
+
         rank = str(info.get("rank", "")).strip()
         if not rank:
-            return f"{access_result}; roster rank is blank"
+            return with_language(f"{access_result}; roster rank is blank")
         target_role_id = self.settings.rank_role_map.get(rank.casefold())
         if target_role_id is None:
-            return f"{access_result}; no Discord role configured for roster rank {rank}"
+            return with_language(f"{access_result}; no Discord role configured for roster rank {rank}")
 
         guild = member.guild
         target_role = guild.get_role(target_role_id)
         if target_role is None:
-            return f"configured role {target_role_id} no longer exists"
+            return with_language(f"configured role {target_role_id} no longer exists")
         me = guild.me
         if me is None or target_role >= me.top_role:
-            return f"cannot manage role {target_role.name}; check role hierarchy"
+            return with_language(f"cannot manage role {target_role.name}; check role hierarchy")
 
         managed_ids = set(self.settings.rank_role_map.values())
         remove_roles = [r for r in member.roles if r.id in managed_ids and r.id != target_role_id]
@@ -1642,7 +2062,7 @@ class OZYAdminBot(discord.Client):
             if target_role not in member.roles:
                 await member.add_roles(target_role, reason=f"OZY roster rank sync: {rank}")
         except discord.HTTPException as exc:
-            return f"Discord role update failed: {exc}"
+            return with_language(f"Discord role update failed: {exc}")
 
         if self.settings.auto_sync_nickname and member.display_name != game_name:
             try:
@@ -1651,7 +2071,7 @@ class OZYAdminBot(discord.Client):
             except discord.HTTPException as exc:
                 log.warning("Nickname sync failed for %s: %s", member.id, exc)
 
-        return f"{access_result}; {rank} -> {target_role.name}"
+        return with_language(f"{access_result}; {rank} -> {target_role.name}")
 
     # ------------------------------------------------------------------
     # Welcome / roster verification
@@ -1661,25 +2081,26 @@ class OZYAdminBot(discord.Client):
             return
         assert self.data is not None
 
-        # New arrivals start without normal clan access until roster verification
-        # succeeds or leadership grants the separate Special Access role.
+        # New arrivals start without clan access until their stable roster
+        # identity is approved. This also strips any language role that may have
+        # leaked from Discord Onboarding before verification.
         await self._sync_access_roles(member, active_roster_member=False)
-        troop_level = await self._sync_troop_profile_from_roles(member, source="onboarding-role")
 
         matched_name: str | None = None
         suggestions: list[str] = []
         role_result: str | None = None
+        linked_rejoin = False
         try:
             existing_link = self.state.get_link_record(member.id)
+            linked_info = None
             if existing_link:
                 linked_info = await self.data.resolve_roster_member(
                     game_name=existing_link.game_name,
                     game_user_id=existing_link.game_user_id,
                 )
-            else:
-                linked_info = None
 
             if linked_info:
+                linked_rejoin = True
                 matched_name = str(linked_info["name"])
                 stable_id = str(linked_info.get("user_id", "")).strip() or None
                 self.state.set_link(
@@ -1689,43 +2110,36 @@ class OZYAdminBot(discord.Client):
                     game_user_id=stable_id,
                 )
                 role_result = await self._sync_rank_role(member, matched_name)
-            else:
-                matched_name = await self.data.exact_roster_name(member.display_name)
-
-            if matched_name and not linked_info:
-                info = await self.data.member_info(matched_name)
-                stable_id = str((info or {}).get("user_id", "")).strip() or None
-                if self.settings.trust_exact_display_name:
-                    linked_user = self.state.linked_user_for_identity(matched_name, stable_id)
+            elif self.settings.trust_exact_display_name:
+                exact = await self.data.exact_roster_name(member.display_name)
+                if exact:
+                    info = await self.data.member_info(exact)
+                    stable_id = str((info or {}).get("user_id", "")).strip() or None
+                    linked_user = self.state.linked_user_for_identity(exact, stable_id)
                     if linked_user in (None, member.id):
                         self.state.set_link(
                             member.id,
-                            matched_name,
+                            exact,
                             "trusted-join-exact-display-name",
                             game_user_id=stable_id,
                         )
-                        role_result = await self._sync_rank_role(member, matched_name)
+                        matched_name = exact
+                        role_result = await self._sync_rank_role(member, exact)
                     else:
-                        await self._queue_verification_request(
-                            member,
-                            matched_name,
-                            source="join-name-already-linked",
-                            game_user_id=stable_id,
-                        )
-                        role_result = "pending leadership verification; roster name is already linked"
+                        suggestions = await self._join_roster_suggestions(member)
                 else:
-                    await self._queue_verification_request(
-                        member,
-                        matched_name,
-                        source="join-exact-display-name",
-                        game_user_id=stable_id,
-                    )
-                    role_result = "pending leadership verification"
-            elif not matched_name:
-                matches = await self.data.roster_suggestions(member.display_name, limit=3)
-                suggestions = [m.name for m in matches if m.score >= self.settings.roster_match_threshold]
+                    suggestions = await self._join_roster_suggestions(member)
+            else:
+                # Safe default: even an exact Discord display-name match is only
+                # a suggestion. The user confirms the roster name, then leadership
+                # approves the Discord -> stable TB identity claim.
+                suggestions = await self._join_roster_suggestions(member)
+                if suggestions:
+                    matched_name = suggestions[0]
         except DataUnavailable as exc:
             log.warning("Roster unavailable during member join: %s", exc)
+
+        approved_link = bool(matched_name and self.state.get_link_record(member.id))
 
         if self.settings.welcome_channel_id:
             channel = self.get_channel(self.settings.welcome_channel_id)
@@ -1735,51 +2149,70 @@ class OZYAdminBot(discord.Client):
                     description=f"Welcome {member.mention}.",
                     color=0xF59E0B,
                 )
-                if matched_name:
-                    if self.state.get_link(member.id):
-                        match_text = f"Linked roster identity: **{matched_name}**.\nRole sync: {role_result}"
-                    elif self.settings.trust_exact_display_name:
-                        match_text = f"Matched your Discord name to **{matched_name}**.\nRole sync: {role_result}"
-                    else:
-                        match_text = (
-                            f"Your Discord name matches roster player **{matched_name}**, but names are not treated as proof of identity. "
-                            "The link is pending leadership confirmation before any rank role is assigned."
-                        )
-                    embed.add_field(name="Roster match", value=match_text, inline=False)
-                else:
-                    text = (
-                        "Your Discord server name is not an exact match in the current OZY roster. "
-                        "Click **Verify OZY membership** below and enter the precise Total Battle name you currently use in the clan."
-                    )
-                    if suggestions:
-                        text += "\n\nPossible match: " + ", ".join(f"**{name}**" for name in suggestions)
-                    embed.add_field(name="Game name check", value=text, inline=False)
-                if troop_level:
-                    embed.add_field(name="Troop level", value=f"Detected from onboarding: **{troop_level}**", inline=False)
-                elif self.settings.troop_level_role_map:
+                if approved_link and matched_name:
                     embed.add_field(
-                        name="Troop level",
-                        value="No single onboarding troop level was detected. You can select it in the verification form.",
+                        name="Roster identity approved",
+                        value=f"Linked as **{matched_name}**.\nAccess sync: {role_result}",
+                        inline=False,
+                    )
+                elif suggestions:
+                    embed.add_field(
+                        name="We found likely roster names",
+                        value=(
+                            "Choose your Total Battle name from the list below. A suggestion is **not** proof of identity - "
+                            "your claim still goes to leadership for approval.\n\n"
+                            + "\n".join(f"- **{name}**" for name in suggestions)
+                        ),
+                        inline=False,
+                    )
+                else:
+                    embed.add_field(
+                        name="Verify your Total Battle name",
+                        value=(
+                            "I could not confidently match your Discord name to the active OZY roster. "
+                            "Click **Verify OZY membership** and enter your exact current Total Battle name."
+                        ),
                         inline=False,
                     )
                 embed.add_field(
-                    name="Useful commands",
-                    value="`/chests` - your chest status\n`/chats` - copy TB clan chat names\n`/away` - register an absence",
+                    name="After approval",
+                    value="You will choose your preferred language and enter your **G / M / S** troop levels.",
                     inline=False,
                 )
+                embed.add_field(
+                    name="Useful commands",
+                    value="`/verify` - roster identity\n`/profile` - language + G/M/S after approval\n`/chests` - your chest status\n`/away` - register an absence",
+                    inline=False,
+                )
+
+                if approved_link:
+                    profile = self.state.get_member_profile(member.id)
+                    view: discord.ui.View | None = (
+                        PostVerificationProfileView(self)
+                        if not (profile and profile.profile_complete)
+                        else None
+                    )
+                elif suggestions:
+                    view = RosterSuggestionView(self, member.id, suggestions)
+                else:
+                    view = MembershipVerificationView(self)
+
                 await channel.send(
                     content=member.mention,
                     embed=embed,
-                    view=MembershipVerificationView(self),
+                    view=view,
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                 )
+
+        if approved_link and matched_name:
+            await self._send_post_verification_profile_prompt(member, matched_name, role_result=role_result)
 
         self.state.mark_welcomed(member.id)
         await self._audit(
             "Member joined",
             str(member),
-            f"Discord ID: {member.id}\nRoster match: {matched_name or 'none'}\n"
-            f"Troop level: {troop_level or 'not captured'}\nSuggestions: {', '.join(suggestions) or 'none'}",
+            f"Discord ID: {member.id}\nExisting roster link: {matched_name if linked_rejoin else 'none'}\n"
+            f"Roster suggestions: {', '.join(suggestions) or 'none'}",
         )
 
     async def on_member_join(self, member: discord.Member) -> None:
@@ -1830,7 +2263,16 @@ class OZYAdminBot(discord.Client):
             await self._process_new_member(after)
 
         if {role.id for role in before.roles} != {role.id for role in after.roles}:
-            await self._sync_troop_profile_from_roles(after, source="onboarding-role-update")
+            # Keep language selection post-verification. If an unlinked account
+            # receives a language/access role from stale Community Onboarding or
+            # a manual edit, normalize it back to Unverified. Approved members
+            # are normalized to the one preferred language stored in their profile.
+            if self.state.get_link_record(after.id) is None:
+                await self._sync_access_roles(after, active_roster_member=False)
+            else:
+                profile = self.state.get_member_profile(after.id)
+                if profile and profile.preferred_language:
+                    await self._sync_language_role(after, profile.preferred_language)
 
         if before.display_name == after.display_name:
             return
@@ -1924,33 +2366,48 @@ class OZYAdminBot(discord.Client):
     # ------------------------------------------------------------------
     # Schedule
     # ------------------------------------------------------------------
-    async def _post_schedule(self, target_date, *, force: bool, actor: str) -> bool:
-        if not self.settings.schedule_channel_id:
+    async def _post_schedule(self, target_date, *, force: bool, actor: str, audience: str = "clan") -> bool:
+        audience = audience.strip().casefold() or "clan"
+        if audience == "leadership":
+            channel_id = self.settings.leadership_schedule_channel_id
+            dedupe_key = f"leadership_schedule_posted:{target_date.isoformat()}"
+            already_posted = bool(self.state.get_value(dedupe_key))
+        else:
+            channel_id = self.settings.schedule_channel_id
+            dedupe_key = None
+            already_posted = self.state.schedule_posted(target_date.isoformat())
+
+        if not channel_id:
             return False
-        channel = self.get_channel(self.settings.schedule_channel_id)
+        channel = self.get_channel(channel_id)
         if not isinstance(channel, discord.TextChannel):
             return False
-        if not force and self.state.schedule_posted(target_date.isoformat()):
-            return False
-        assert self.data is not None
-        try:
-            items = await self.data.schedule_for_date(target_date)
-        except DataUnavailable as exc:
-            log.warning("Schedule unavailable: %s", exc)
-            return False
-        if not items:
-            log.info("No schedule items for %s; automatic post skipped", target_date)
+        if not force and already_posted:
             return False
 
-        message = await channel.send(
-            format_schedule(target_date, items),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        self.state.mark_schedule_posted(target_date.isoformat(), channel.id, message.id)
+        assert self.data is not None
+        try:
+            items = await self.data.schedule_for_date(target_date, audience=audience)
+        except DataUnavailable as exc:
+            log.warning("%s schedule unavailable: %s", audience, exc)
+            return False
+        if not items:
+            log.info("No %s schedule items for %s; automatic post skipped", audience, target_date)
+            return False
+
+        body = format_schedule(target_date, items)
+        if audience == "leadership":
+            body = body.replace("## OZY Schedule", "## OZY Leadership Schedule", 1)
+        message = await channel.send(body, allowed_mentions=discord.AllowedMentions.none())
+
+        if audience == "leadership":
+            self.state.set_value(dedupe_key, f"{channel.id}:{message.id}")
+        else:
+            self.state.mark_schedule_posted(target_date.isoformat(), channel.id, message.id)
         await self._audit(
             "Daily schedule posted",
             actor,
-            f"Date: {target_date.isoformat()}\nChannel: #{channel.name}\nItems: {len(items)}",
+            f"Audience: {audience}\nDate: {target_date.isoformat()}\nChannel: #{channel.name}\nItems: {len(items)}",
         )
         return True
 
@@ -1966,10 +2423,20 @@ class OZYAdminBot(discord.Client):
             now = datetime.now(tz)
             today_target = datetime.combine(now.date(), dt_time(hour, minute), tzinfo=tz)
 
-            # If the service starts/restarts after today's posting time, catch up once.
-            if now >= today_target and not self.state.schedule_posted(now.date().isoformat()):
+            # If the service starts/restarts after today's posting time, catch up
+            # whichever audience has not yet been posted.
+            clan_missing = not self.state.schedule_posted(now.date().isoformat())
+            leadership_key = f"leadership_schedule_posted:{now.date().isoformat()}"
+            leadership_missing = bool(
+                self.settings.leadership_schedule_channel_id
+                and not self.state.get_value(leadership_key)
+            )
+            if now >= today_target and (clan_missing or leadership_missing):
                 try:
-                    await self._post_schedule(now.date(), force=False, actor="automatic scheduler")
+                    if clan_missing:
+                        await self._post_schedule(now.date(), force=False, actor="automatic scheduler", audience="clan")
+                    if leadership_missing:
+                        await self._post_schedule(now.date(), force=False, actor="automatic scheduler", audience="leadership")
                 except Exception:
                     log.exception("Catch-up daily schedule post failed")
 
@@ -1984,7 +2451,8 @@ class OZYAdminBot(discord.Client):
                 raise
 
             try:
-                await self._post_schedule(next_target.date(), force=False, actor="automatic scheduler")
+                await self._post_schedule(next_target.date(), force=False, actor="automatic scheduler", audience="clan")
+                await self._post_schedule(next_target.date(), force=False, actor="automatic scheduler", audience="leadership")
             except Exception:
                 log.exception("Automatic daily schedule post failed")
 
@@ -2621,7 +3089,7 @@ class OZYAdminBot(discord.Client):
             matches = [x for x in items if not q or q in x["label"].casefold() or q in x["key"].casefold()]
             return [app_commands.Choice(name=x["label"], value=x["key"]) for x in matches[:25]]
 
-        @self.tree.command(name="verify", description="Verify your OZY roster identity and troop level")
+        @self.tree.command(name="verify", description="Verify your OZY roster identity")
         @app_commands.describe(game_name="Optional exact Total Battle name; leave blank to open the verification form")
         async def verify(interaction: discord.Interaction, game_name: Optional[str] = None) -> None:
             if not isinstance(interaction.user, discord.Member):
@@ -2705,6 +3173,7 @@ class OZYAdminBot(discord.Client):
                     game_user_id=stable_id,
                 )
                 role_result = await self._sync_rank_role(member, canonical)
+                await self._send_post_verification_profile_prompt(member, canonical, role_result=role_result)
                 if pending_request:
                     resolved = self.state.resolve_verification_request(
                         member.id,
@@ -2803,6 +3272,10 @@ class OZYAdminBot(discord.Client):
                 candidates += [m.name for m in suggestions if m.name not in candidates]
             return [app_commands.Choice(name=name[:100], value=name) for name in candidates[:25]]
 
+        @self.tree.command(name="profile", description="Complete or edit your OZY language and G/M/S profile")
+        async def profile(interaction: discord.Interaction) -> None:
+            await self._open_post_verification_profile(interaction)
+
         @self.tree.command(name="member", description="Show roster/link status for yourself or a member")
         @app_commands.describe(member="Optional Discord member; leadership can inspect others")
         async def member_info(interaction: discord.Interaction, member: Optional[discord.Member] = None) -> None:
@@ -2826,8 +3299,11 @@ class OZYAdminBot(discord.Client):
                         text += f" Pending verification: **{pending}**."
                     elif suggestions:
                         text += " Possible matches: " + ", ".join(m.name for m in suggestions)
-                    if profile and profile.troop_level:
-                        text += f" Troop level: **{profile.troop_level}**."
+                    if profile and profile.profile_complete:
+                        text += (
+                            f" Profile: **{profile.preferred_language}**, "
+                            f"**G{profile.guardsmen_level}/M{profile.monsters_level}/S{profile.specialists_level}**."
+                        )
                     await interaction.response.send_message(text, ephemeral=True)
                     return
                 info = await self.data.member_info(game_name)
@@ -2840,8 +3316,16 @@ class OZYAdminBot(discord.Client):
 
             embed = discord.Embed(title=game_name, color=0xF59E0B)
             embed.add_field(name="Discord", value=target.mention, inline=False)
-            if profile and profile.troop_level:
-                embed.add_field(name="Troop level", value=profile.troop_level, inline=True)
+            if profile:
+                if profile.preferred_language:
+                    language_label = dict(PROFILE_LANGUAGES).get(profile.preferred_language, profile.preferred_language)
+                    embed.add_field(name="Language", value=f"{language_label} ({profile.preferred_language})", inline=True)
+                if profile.guardsmen_level is not None:
+                    embed.add_field(name="Guardsmen", value=f"G{profile.guardsmen_level}", inline=True)
+                if profile.monsters_level is not None:
+                    embed.add_field(name="Monsters", value=f"M{profile.monsters_level}", inline=True)
+                if profile.specialists_level is not None:
+                    embed.add_field(name="Specialists", value=f"S{profile.specialists_level}", inline=True)
             for label, key in (("Rank", "rank"), ("Hero level", "level"), ("Might", "might"), ("Location", "location"), ("Last seen", "last_seen")):
                 value = info.get(key)
                 if value not in (None, ""):
@@ -3174,36 +3658,83 @@ class OZYAdminBot(discord.Client):
             await self._audit("Away cleared", str(member), f"Previous record: {record or 'none'}")
             await interaction.response.send_message("Away status cleared.", ephemeral=True)
 
-        @self.tree.command(name="schedule", description="Show today's OZY clan schedule")
-        @app_commands.describe(public="Post publicly instead of only showing it to you")
-        async def schedule(interaction: discord.Interaction, public: bool = False) -> None:
+        @self.tree.command(name="schedule", description="Show today's OZY clan or leadership schedule")
+        @app_commands.describe(
+            audience="Clan schedule, Leadership schedule, or both",
+            public="Post publicly instead of only showing it to you",
+        )
+        @app_commands.choices(audience=SCHEDULE_AUDIENCE_CHOICES)
+        async def schedule(
+            interaction: discord.Interaction,
+            audience: Optional[app_commands.Choice[str]] = None,
+            public: bool = False,
+        ) -> None:
             assert self.data is not None
+            selected = audience.value if audience else "clan"
+            member = interaction.user if isinstance(interaction.user, discord.Member) else None
+            if selected in {"leadership", "both"} and not self._is_leadership(member):
+                await interaction.response.send_message("Leadership schedule is restricted to Leader/Superior.", ephemeral=True)
+                return
+            if public and not self._is_leadership(member):
+                await interaction.response.send_message("Only leadership can post the schedule publicly.", ephemeral=True)
+                return
+
             today = datetime.now(self.settings.timezone).date()
             try:
-                items = await self.data.schedule_for_date(today)
+                if selected == "both":
+                    clan_items = await self.data.schedule_for_date(today, audience="clan")
+                    leadership_items = await self.data.schedule_for_date(today, audience="leadership")
+                    clan_text = format_schedule(today, clan_items)
+                    leadership_text = format_schedule(today, leadership_items).replace(
+                        "## OZY Schedule", "## OZY Leadership Schedule", 1
+                    )
+                    body = clan_text + "\n\n" + leadership_text
+                else:
+                    items = await self.data.schedule_for_date(today, audience=selected)
+                    body = format_schedule(today, items)
+                    if selected == "leadership":
+                        body = body.replace("## OZY Schedule", "## OZY Leadership Schedule", 1)
             except DataUnavailable as exc:
                 await interaction.response.send_message(f"Schedule unavailable: {exc}", ephemeral=True)
                 return
-            if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
-                await interaction.response.send_message("Only leadership can post the schedule publicly.", ephemeral=True)
-                return
+
             await interaction.response.send_message(
-                format_schedule(today, items),
+                body,
                 ephemeral=not public,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
-        @self.tree.command(name="schedule-post", description="Leadership: post today's schedule to the configured schedule channel")
-        async def schedule_post(interaction: discord.Interaction) -> None:
+        @self.tree.command(name="schedule-post", description="Leadership: post today's clan or leadership schedule")
+        @app_commands.describe(audience="Which configured schedule channel to publish")
+        @app_commands.choices(audience=SCHEDULE_AUDIENCE_CHOICES)
+        async def schedule_post(
+            interaction: discord.Interaction,
+            audience: Optional[app_commands.Choice[str]] = None,
+        ) -> None:
             if not await self._require_leadership(interaction):
                 return
+            selected = audience.value if audience else "clan"
             today = datetime.now(self.settings.timezone).date()
-            posted = await self._post_schedule(today, force=True, actor=str(interaction.user))
-            if posted:
-                await interaction.response.send_message("Today's schedule was posted.", ephemeral=True)
+            audiences = ("clan", "leadership") if selected == "both" else (selected,)
+            posted_labels = []
+            for item_audience in audiences:
+                posted = await self._post_schedule(
+                    today,
+                    force=True,
+                    actor=str(interaction.user),
+                    audience=item_audience,
+                )
+                if posted:
+                    posted_labels.append(item_audience)
+
+            if posted_labels:
+                await interaction.response.send_message(
+                    "Posted: " + ", ".join(posted_labels) + ".",
+                    ephemeral=True,
+                )
             else:
                 await interaction.response.send_message(
-                    "Nothing was posted. Check SCHEDULE_CHANNEL_ID and today's schedule data.",
+                    "Nothing was posted. Check the configured schedule channel(s) and today's website schedule data.",
                     ephemeral=True,
                 )
 

@@ -1,31 +1,46 @@
-# OZY Admin - OZY website state persistence
+# OZY Admin - Post-verification Profile + Roster Suggestions
 
-## Production architecture
+## Changed behavior
 
-- Local working state: `data/ozy_admin.sqlite3`
-- Durable state: authenticated snapshot stored by `ozy.com.ar` in Netlify Blobs
-- No separate hosted database required
-- PostgreSQL support remains only as an unused compatibility option
+1. New members are kept Unverified.
+2. OZY Admin compares Discord display/global/account names to the active roster and shows up to 5 likely Total Battle names.
+3. Selecting a suggestion does not auto-verify. It submits an exact roster claim to leadership.
+4. Leadership approval grants normal roster access/rank synchronization.
+5. After approval, the member gets a `Complete OZY profile` button.
+6. The profile collects preferred language plus G/M/S levels (1-9).
+7. G/M/S are profile data only. No G/M/S Discord roles are created or managed.
+8. Preferred language grants exactly one matching language role.
+9. Unverified members have any language role stripped, preventing Community Onboarding from bypassing roster verification.
+10. `/profile` lets an already verified member edit language/G/M/S later.
+11. `/member` shows language, G, M and S.
 
-## New Render variables
+## Render environment
 
-```env
-STATE_REMOTE_URL=https://ozy.com.ar/api/ozy-admin/state
-STATE_REMOTE_TOKEN=<same secret configured on Netlify>
-STATE_REMOTE_TIMEOUT_SECONDS=10
-STATE_DB=data/ozy_admin.sqlite3
+Remove the obsolete variable:
+
+```text
+TROOP_LEVEL_ROLE_MAP
 ```
 
-Do not configure `STATE_DATABASE_URL` or `DATABASE_URL` when `STATE_REMOTE_URL` is used.
+Add:
 
-## Safety behavior
+```text
+LANGUAGE_ROLE_MAP=EN:1536541947173408839,ES:1536542118611263609,AR:1540062337111953448,DE:1536542327714095166,FR:1536542281593782292,NO:1540062640171126904,CEB:1536542372127572028,PT:1536542159459586128,SV:1536542203319681146,RU:1540062171965431949
+```
 
-- Startup GET 404 means first run and initializes new state.
-- Authentication errors, network failures, or server errors fail startup rather than overwriting durable state with an empty DB.
-- Remote payloads must have a valid SQLite file header.
-- Local database snapshots are generated with SQLite's backup API before upload.
-- State endpoint token is separate from public/browser credentials.
+Keep:
 
-## Verification/onboarding state persisted
+```text
+TRUST_EXACT_DISPLAY_NAME=false
+AUTO_SYNC_NICKNAME=false
+```
 
-The snapshot includes all existing OZY Admin state tables, including member identity links, stable TB IDs, troop profiles, pending verification claims/history, Away state, welcome state, and calendar/chest/schedule dedupe state.
+## Discord Community Onboarding
+
+Apply the safe Onboarding configuration that does not grant language roles. Language is now collected by OZY Admin only after roster approval.
+
+## Deployment
+
+Replace the included changed files in the current `discord_admin` project, commit, push, then redeploy Render.
+
+No new Python dependency is required.

@@ -49,7 +49,21 @@ class MemberProfile:
     game_user_id: str | None
     troop_level: str | None
     troop_level_source: str | None
+    preferred_language: str | None
+    guardsmen_level: int | None
+    monsters_level: int | None
+    specialists_level: int | None
+    profile_source: str | None
     updated_at_utc: datetime
+
+    @property
+    def profile_complete(self) -> bool:
+        return bool(
+            self.preferred_language
+            and self.guardsmen_level is not None
+            and self.monsters_level is not None
+            and self.specialists_level is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -330,6 +344,11 @@ class AdminState:
                     game_user_id TEXT,
                     troop_level TEXT,
                     troop_level_source TEXT,
+                    preferred_language TEXT,
+                    guardsmen_level INTEGER,
+                    monsters_level INTEGER,
+                    specialists_level INTEGER,
+                    profile_source TEXT,
                     updated_at_utc TEXT NOT NULL
                 )""",
                 """CREATE TABLE IF NOT EXISTS bot_state (
@@ -341,6 +360,11 @@ class AdminState:
                 "ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS requested_game_user_id TEXT",
                 "ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS queue_channel_id BIGINT",
                 "ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS queue_message_id BIGINT",
+                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT",
+                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS guardsmen_level INTEGER",
+                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS monsters_level INTEGER",
+                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS specialists_level INTEGER",
+                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS profile_source TEXT",
                 """CREATE UNIQUE INDEX IF NOT EXISTS idx_member_links_game_user_id
                    ON member_links(game_user_id)
                    WHERE game_user_id IS NOT NULL AND game_user_id <> ''""",
@@ -414,6 +438,11 @@ class AdminState:
                     game_user_id TEXT,
                     troop_level TEXT,
                     troop_level_source TEXT,
+                    preferred_language TEXT,
+                    guardsmen_level INTEGER,
+                    monsters_level INTEGER,
+                    specialists_level INTEGER,
+                    profile_source TEXT,
                     updated_at_utc TEXT NOT NULL
                 );
 
@@ -439,6 +468,27 @@ class AdminState:
                 conn.execute("ALTER TABLE verification_requests ADD COLUMN queue_channel_id INTEGER")
             if "queue_message_id" not in verification_columns:
                 conn.execute("ALTER TABLE verification_requests ADD COLUMN queue_message_id INTEGER")
+
+            profile_columns = columns("member_profiles")
+            if "preferred_language" not in profile_columns:
+                conn.execute("ALTER TABLE member_profiles ADD COLUMN preferred_language TEXT")
+            if "guardsmen_level" not in profile_columns:
+                conn.execute("ALTER TABLE member_profiles ADD COLUMN guardsmen_level INTEGER")
+            if "monsters_level" not in profile_columns:
+                conn.execute("ALTER TABLE member_profiles ADD COLUMN monsters_level INTEGER")
+            if "specialists_level" not in profile_columns:
+                conn.execute("ALTER TABLE member_profiles ADD COLUMN specialists_level INTEGER")
+            if "profile_source" not in profile_columns:
+                conn.execute("ALTER TABLE member_profiles ADD COLUMN profile_source TEXT")
+
+            # Preserve old G-level data as Guardsmen level when upgrading from the
+            # previous single troop_level profile schema.
+            conn.execute(
+                """UPDATE member_profiles
+                   SET guardsmen_level=CAST(SUBSTR(troop_level, 2) AS INTEGER)
+                   WHERE guardsmen_level IS NULL
+                     AND troop_level GLOB 'G[1-9]'"""
+            )
 
             conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS idx_member_links_game_user_id
@@ -509,11 +559,70 @@ class AdminState:
                 (discord_user_id, canonical, stable_id, level, source, now),
             )
 
+    def set_member_profile_details(
+        self,
+        discord_user_id: int,
+        *,
+        preferred_language: str,
+        guardsmen_level: int,
+        monsters_level: int,
+        specialists_level: int,
+        source: str,
+        game_name: str | None = None,
+        game_user_id: str | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        language = preferred_language.strip().upper()
+        if not language:
+            raise ValueError("preferred_language is required")
+        for label, value in (
+            ("guardsmen_level", guardsmen_level),
+            ("monsters_level", monsters_level),
+            ("specialists_level", specialists_level),
+        ):
+            if not 1 <= int(value) <= 9:
+                raise ValueError(f"{label} must be between 1 and 9")
+
+        stable_id = (game_user_id or "").strip() or None
+        canonical = (game_name or "").strip() or None
+        legacy_guard = f"G{int(guardsmen_level)}"
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO member_profiles(
+                    discord_user_id, game_name, game_user_id,
+                    troop_level, troop_level_source,
+                    preferred_language, guardsmen_level, monsters_level, specialists_level,
+                    profile_source, updated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(discord_user_id) DO UPDATE SET
+                    game_name=COALESCE(excluded.game_name, member_profiles.game_name),
+                    game_user_id=COALESCE(excluded.game_user_id, member_profiles.game_user_id),
+                    troop_level=excluded.troop_level,
+                    troop_level_source=excluded.troop_level_source,
+                    preferred_language=excluded.preferred_language,
+                    guardsmen_level=excluded.guardsmen_level,
+                    monsters_level=excluded.monsters_level,
+                    specialists_level=excluded.specialists_level,
+                    profile_source=excluded.profile_source,
+                    updated_at_utc=excluded.updated_at_utc
+                """,
+                (
+                    discord_user_id, canonical, stable_id,
+                    legacy_guard, "profile-gms-compat",
+                    language, int(guardsmen_level), int(monsters_level), int(specialists_level),
+                    source, now,
+                ),
+            )
+
     def get_member_profile(self, discord_user_id: int) -> MemberProfile | None:
         with self._conn() as conn:
             row = conn.execute(
                 """SELECT discord_user_id, game_name, game_user_id,
-                          troop_level, troop_level_source, updated_at_utc
+                          troop_level, troop_level_source,
+                          preferred_language, guardsmen_level, monsters_level, specialists_level,
+                          profile_source, updated_at_utc
                    FROM member_profiles WHERE discord_user_id=?""",
                 (discord_user_id,),
             ).fetchone()
@@ -525,6 +634,11 @@ class AdminState:
             game_user_id=row["game_user_id"],
             troop_level=row["troop_level"],
             troop_level_source=row["troop_level_source"],
+            preferred_language=row["preferred_language"],
+            guardsmen_level=(int(row["guardsmen_level"]) if row["guardsmen_level"] is not None else None),
+            monsters_level=(int(row["monsters_level"]) if row["monsters_level"] is not None else None),
+            specialists_level=(int(row["specialists_level"]) if row["specialists_level"] is not None else None),
+            profile_source=row["profile_source"],
             updated_at_utc=datetime.fromisoformat(row["updated_at_utc"]),
         )
 

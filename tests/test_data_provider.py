@@ -17,7 +17,7 @@ def make_settings(tmp_path: Path) -> Settings:
         self_ping_interval_seconds=600,
         leadership_role_ids=frozenset(),
         rank_role_map={},
-        troop_level_role_map={},
+        language_role_map={},
         away_role_id=None,
         verified_role_id=None,
         unverified_role_id=None,
@@ -185,5 +185,62 @@ def test_chest_leaderboard_uses_active_roster_as_authority(tmp_path):
         assert board.total_chests == 60
         assert board.members[0].met_target is True
         assert board.members[2].met_target is False
+
+    asyncio.run(run())
+
+
+def test_schedule_website_schema_filters_audience_and_converts_utc(tmp_path):
+    s = make_settings(tmp_path)
+    s.schedule_file.write_text(json.dumps({
+        "events": [
+            {
+                "id": "123456789012345678",
+                "audience": "clan",
+                "title": "Clan Meeting",
+                "description": "General coordination",
+                "start_utc": "2026-08-27T02:00:00Z",
+                "end_utc": "2026-08-27T03:00:00Z",
+                "duration_minutes": 60,
+            },
+            {
+                "id": "223456789012345678",
+                "audience": "leadership",
+                "title": "Leadership Meeting",
+                "description": "War planning",
+                "start_utc": "2026-08-27T01:00:00Z",
+                "end_utc": "2026-08-27T02:00:00Z",
+                "duration_minutes": 60,
+            },
+        ]
+    }), encoding="utf-8")
+    provider = DataProvider(s, None)
+
+    async def run():
+        # 02:00 UTC is 23:00 on 26 Aug in Argentina.
+        clan = await provider.schedule_for_date(date(2026, 8, 26), audience="clan")
+        leadership = await provider.schedule_for_date(date(2026, 8, 26), audience="leadership")
+        assert [(x.time, x.title) for x in clan] == [("23:00", "Clan Meeting")]
+        assert [(x.time, x.title) for x in leadership] == [("22:00", "Leadership Meeting")]
+
+    asyncio.run(run())
+
+
+def test_roster_suggestions_tolerate_discord_decorations_but_exact_stays_strict(tmp_path):
+    s = make_settings(tmp_path)
+    s.roster_file.write_text(json.dumps({"members": {
+        "Red Jane": {"status": "active", "user_id": "tb:1"},
+        "Prince": {"status": "active", "user_id": "tb:2"},
+        "Another Player": {"status": "active", "user_id": "tb:3"},
+    }}), encoding="utf-8")
+    provider = DataProvider(s, None)
+
+    async def run():
+        # Fuzzy/containment matching is only a suggestion.
+        matches = await provider.roster_suggestions("[OZY] Red Jane | Fer", 3)
+        assert matches[0].name == "Red Jane"
+        assert matches[0].score >= 0.78
+        # The authoritative verification gate remains exact.
+        assert await provider.exact_roster_name("[OZY] Red Jane | Fer") is None
+        assert await provider.exact_roster_name("red jane") == "Red Jane"
 
     asyncio.run(run())

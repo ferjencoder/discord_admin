@@ -1,0 +1,23 @@
+OZY Translator reaction-translation category policy
+
+ALLOW flag-reaction translation in:
+START HERE  = 1540721682459787375
+IMPORTANT   = 1540486733572079736
+RESOURCES   = 1540202195637633104
+GAME TALK   = 1540178537078726816
+LEADERSHIP  = 1540527295301816411
+
+GENERAL language category:
+GENERAL     = 1536750253036806275
+
+Dedicated language channels are already excluded from reaction mode by the
+Translator design and continue using automatic language fan-out.
+
+DO NOT ALLOW:
+ADMIN       = 1540583740479381616
+VOICE       = 1536505730989957334
+
+The existing OZY Translator build already supports category-ID/channel-ID
+allowlists for reaction-based topic translation. Use the exact environment
+variable names from that Translator build/settings.py. Do not invent new names
+until the current Translator config has been inspected.

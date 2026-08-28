@@ -17,4 +17,4 @@ STATE_REMOTE_TOKEN=<same secret as Netlify OZY_ADMIN_STATE_TOKEN>
 STATE_REMOTE_TIMEOUT_SECONDS=10
 VERIFICATION_CHANNEL_ID=<private leadership verification channel ID>
 
-Verify /healthz reports "state_backend": "postgres" after deployment.
+Verify /healthz reports "state_backend": "web-snapshot" after deployment.
