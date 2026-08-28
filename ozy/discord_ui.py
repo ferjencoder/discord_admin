@@ -589,12 +589,17 @@ class MembershipVerificationModal(discord.ui.Modal):
         self.bot = bot
         self.member_id = member.id
 
+        # Keep the membership entry modal deliberately conservative.
+        # A plain TextInput is supported across Discord modal clients and avoids
+        # coupling this critical verification entry point to newer Label layouts.
         self.game_name = discord.ui.TextInput(
+            label="Exact Total Battle name",
             placeholder="Exact Total Battle name used in OZY",
             default=(suggested_name or member.display_name)[:100],
             max_length=100,
+            required=True,
         )
-        self.add_item(discord.ui.Label(text="Exact Total Battle name", component=self.game_name))
+        self.add_item(self.game_name)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.member_id:
@@ -626,7 +631,15 @@ class MembershipVerificationView(discord.ui.View):
         custom_id="ozy:membership:verify",
     )
     async def verify_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self.bot._open_membership_verification(interaction)
+        try:
+            await self.bot._open_membership_verification(interaction)
+        except Exception as exc:
+            log.exception("Could not open membership verification modal", exc_info=exc)
+            message = "I could not open the verification form. Try `/verify` or contact leadership."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
 
 
 class MembershipVerificationRetryView(discord.ui.View):
