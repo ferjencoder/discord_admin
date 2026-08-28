@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "notes": "Core OZY roles only. G/M/S levels are member profile data, not Discord roles.",
+  "roles": [
+    {
+      "key": "unverified",
+      "name": "Unverified",
+      "color": 0,
+      "permissions": [],
+      "hoist": false,
+      "mentionable": false
+    },
+    {
+      "key": "verified",
+      "name": "Verified",
+      "color": 0,
+      "permissions": [],
+      "hoist": false,
+      "mentionable": false
+    },
+    {
+      "key": "special_access",
+      "name": "Special Access",
+      "color": 0,
+      "permissions": [],
+      "hoist": false,
+      "mentionable": false
+    },
+    {
+      "key": "away",
+      "name": "Away",
+      "color": 0,
+      "permissions": [],
+      "hoist": false,
+      "mentionable": false
+    },
+    {
+      "key": "soldier",
+      "name": "Soldier",
+      "color": 0,
+      "permissions": [],
+      "hoist": false,
+      "mentionable": false
+    },
+    {
+      "key": "veteran",
+      "name": "Veteran",
+      "color": 0,
+      "permissions": [],
+      "hoist": false,
+      "mentionable": false
+    },
+    {
+      "key": "officer",
+      "name": "Officer",
+      "color": 0,
+      "permissions": [],
+      "hoist": false,
+      "mentionable": false
+    },
+    {
+      "key": "superior",
+      "name": "Superior",
+      "color": 0,
+      "permissions": [],
+      "hoist": true,
+      "mentionable": false
+    },
+    {
+      "key": "leader",
+      "name": "Leader",
+      "color": 0,
+      "permissions": [],
+      "hoist": true,
+      "mentionable": false
+    }
+  ]
+}

@@ -174,7 +174,18 @@ class AdminState:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.remote_timeout_seconds) as response:
-                return response.read()
+                payload = response.read()
+                if method == "GET" and payload is not None and not payload.startswith(self.SQLITE_HEADER):
+                    content_type = response.headers.get("content-type", "")
+                    final_url = response.geturl()
+                    preview = payload[:160].decode("utf-8", errors="replace").replace("\n", " ").strip()
+                    raise RuntimeError(
+                        "OZY web state endpoint returned HTTP 200 but not a SQLite snapshot "
+                        f"(content-type={content_type!r}, final_url={final_url!r}, body_prefix={preview!r}). "
+                        "This usually means /api/ozy-admin/state is being handled by the website SPA fallback "
+                        "instead of the Netlify Function."
+                    )
+                return payload
         except urllib.error.HTTPError as exc:
             if method == "GET" and exc.code == 404:
                 return None

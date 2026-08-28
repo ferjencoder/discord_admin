@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "member_profile_example": {
+    "discord_user_id": "123456789012345678",
+    "game_user_id": "987654321",
+    "game_name": "PeekABoo Death",
+    "guardsmen_level": 9,
+    "monsters_level": 8,
+    "specialists_level": 9,
+    "levels_source": "self_reported",
+    "updated_at_utc": "2026-08-28T03:00:00Z"
+  },
+  "notes": [
+    "G/M/S are profile attributes, not Discord roles.",
+    "Use stable Total Battle user_id as the durable game identity.",
+    "Exact game_name comes from the authoritative OZY roster.",
+    "Treat G/M/S as self-reported unless another trusted source verifies them."
+  ]
+}

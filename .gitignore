@@ -1,14 +1,27 @@
+# Environment / secrets
 .env
 *.env
 !.env.example
+
+# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
 venv/
+
+# Runtime database
 data/*.sqlite3
 data/*.sqlite3-*
+
+# Local fallback / generated data
 data/roster.json
 data/chest_data.json
 data/schedule.json
-.env.example
+
+# Generated Discord exports
+exports/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
