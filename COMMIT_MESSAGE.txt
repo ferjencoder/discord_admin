@@ -1,1 +1,0 @@
-fix: sync event creation and make calendar reset-aware

@@ -32,24 +32,26 @@ X-OZY-Admin-Token: <secret>
 
 Do not reuse `PEEKABOO_SYNC_TOKEN`. That token authorizes publishing and should not grant read access to the Discord bot.
 
-## Recommended endpoints
+## Production endpoints
 
-Any stable URLs are acceptable. For example:
-
-```text
-https://ozy-clan.netlify.app/.netlify/functions/ozy-admin-data?dataset=roster
-https://ozy-clan.netlify.app/.netlify/functions/ozy-admin-data?dataset=chests
-```
-
-Then configure Render:
+Current OZY Admin production endpoints:
 
 ```text
-ROSTER_URL=https://ozy-clan.netlify.app/.netlify/functions/ozy-admin-data?dataset=roster
-CHEST_DATA_URL=https://ozy-clan.netlify.app/.netlify/functions/ozy-admin-data?dataset=chests
-OZY_DATA_API_TOKEN=<same read-only secret configured in Netlify>
+https://ozy.com.ar/api/v1/roster
+https://ozy.com.ar/api/v1/chests/current
+https://ozy.com.ar/api/ozy/schedule
 ```
 
-The function must read the currently published persistent OZY dataset. For bot access control it must not silently fall back to obsolete HOT/K305 bundled files.
+Configure Render:
+
+```env
+ROSTER_URL=https://ozy.com.ar/api/v1/roster
+CHEST_DATA_URL=https://ozy.com.ar/api/v1/chests/current
+SCHEDULE_URL=https://ozy.com.ar/api/ozy/schedule
+OZY_DATA_API_TOKEN=<same private data secret configured in Netlify>
+```
+
+The API functions must read the currently published persistent OZY dataset. For bot access control it must not silently fall back to obsolete HOT/K305 bundled files.
 
 If the authoritative published roster is unavailable or invalid, return a non-2xx response. The bot is designed to preserve existing Discord access during a roster API outage instead of mass-revoking members.
 

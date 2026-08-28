@@ -1,7 +1,7 @@
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
-from event_calendar import (
+from ozy.event_calendar import (
     build_calendar_chunks,
     build_today_chunks,
     game_day_for_instant,

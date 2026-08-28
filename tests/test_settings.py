@@ -16,7 +16,7 @@ def base_env(monkeypatch):
         "VERIFIED_ROLE_ID", "UNVERIFIED_ROLE_ID", "SPECIAL_ACCESS_ROLE_ID",
         "CHEST_CHANNEL_ID", "CHEST_RESET_POST_ENABLED", "CHEST_RESET_POST_TIME_UTC",
         "CHEST_REPORT_CHUNK_SIZE", "ROSTER_ACCESS_SYNC_MINUTES", "OZY_DATA_API_TOKEN",
-        "VERIFICATION_CHANNEL_ID", "STATE_DATABASE_URL", "DATABASE_URL",
+        "VERIFICATION_CHANNEL_ID",
         "STATE_REMOTE_URL", "STATE_REMOTE_TOKEN", "STATE_REMOTE_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -35,7 +35,6 @@ def test_load_minimal_settings(monkeypatch):
     assert settings.roster_access_sync_minutes == 10
     assert settings.ozy_data_api_token is None
     assert settings.verification_channel_id is None
-    assert settings.state_database_url is None
     assert settings.state_remote_url is None
     assert settings.state_remote_token is None
     assert settings.state_remote_timeout_seconds == 10.0
@@ -106,10 +105,9 @@ def test_access_and_chest_settings(monkeypatch):
 def test_persistent_state_settings(monkeypatch):
     base_env(monkeypatch)
     monkeypatch.setenv("VERIFICATION_CHANNEL_ID", "3001")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@db.example/ozy")
     settings = load_settings()
     assert settings.verification_channel_id == 3001
-    assert settings.state_database_url == "postgresql://user:pass@db.example/ozy"
+    assert settings.state_db.as_posix().endswith("data/ozy_admin.sqlite3")
 
 
 def test_web_snapshot_state_settings(monkeypatch):
@@ -130,10 +128,3 @@ def test_web_snapshot_requires_token(monkeypatch):
         load_settings()
 
 
-def test_web_snapshot_and_database_url_are_mutually_exclusive(monkeypatch):
-    base_env(monkeypatch)
-    monkeypatch.setenv("STATE_REMOTE_URL", "https://ozy.com.ar/api/ozy-admin/state")
-    monkeypatch.setenv("STATE_REMOTE_TOKEN", "x" * 32)
-    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@db.example/ozy")
-    with pytest.raises(ConfigError):
-        load_settings()

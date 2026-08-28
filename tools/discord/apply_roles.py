@@ -16,7 +16,7 @@ SERVER_ID = int(os.getenv("SERVER_ID", "0") or 0)
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Create/update OZY Discord roles from a blueprint. Dry-run by default.")
-    p.add_argument("blueprint", nargs="?", default="ozy_roles_blueprint.json")
+    p.add_argument("blueprint", nargs="?", default="config/discord/roles_blueprint.json")
     p.add_argument("--apply", action="store_true", help="Actually create/update roles.")
     return p.parse_args()
 

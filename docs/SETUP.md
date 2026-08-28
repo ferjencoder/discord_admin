@@ -108,7 +108,7 @@ SERVER_ID=...
 
 Then add the channel/role/data variables above.
 
-For persistent production state, configure the authenticated `https://ozy.com.ar/api/ozy-admin/state` Netlify Blob endpoint and set `STATE_REMOTE_URL` plus `STATE_REMOTE_TOKEN` in Render. Create a private leadership text channel such as `#verification` and set `VERIFICATION_CHANNEL_ID` to that channel ID. See `STATE_STORAGE.md`.
+For persistent production state, configure the authenticated `https://ozy.com.ar/api/ozy-admin/state` Netlify Blob endpoint and set `STATE_REMOTE_URL` plus `STATE_REMOTE_TOKEN` in Render. Create a private leadership text channel such as `#verification` and set `VERIFICATION_CHANNEL_ID` to that channel ID. See `docs/STATE_STORAGE.md`.
 
 Recommended schedule/calendar defaults:
 
@@ -199,3 +199,11 @@ Expected behavior:
 - an already-approved Discord account that leaves and rejoins keeps its stable Total Battle identity link; access is restored only if that identity is still in the active roster;
 - if Membership Screening leaves the member pending, the welcome workflow waits until screening is complete;
 - Discord Community Onboarding does not assign language roles; OZY Admin grants one only after verification.
+
+
+## Local verification
+
+```bash
+py -m pip install -r requirements.txt
+py -m pytest -q
+```

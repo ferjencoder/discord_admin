@@ -12,18 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any
 
 log = logging.getLogger("ozy-admin.state")
-
-try:
-    import psycopg
-    from psycopg.rows import dict_row
-    from psycopg_pool import ConnectionPool
-except ImportError:  # local SQLite-only development remains supported
-    psycopg = None
-    dict_row = None
-    ConnectionPool = None
 
 
 @dataclass(frozen=True)
@@ -91,16 +81,6 @@ class VerificationHistoryRecord:
     reason: str
 
 
-class _ConnectionAdapter:
-    def __init__(self, raw: Any, backend: str):
-        self.raw = raw
-        self.backend = backend
-
-    def execute(self, sql: str, params: tuple[Any, ...] = ()):
-        if self.backend == "postgres":
-            sql = sql.replace("?", "%s")
-        return self.raw.execute(sql, params)
-
 
 class AdminState:
     """Persistent OZY Admin state.
@@ -111,7 +91,8 @@ class AdminState:
     restored before the schema is opened. This avoids depending on Render's
     ephemeral filesystem without requiring a separate hosted database.
 
-    PostgreSQL remains supported as an optional compatibility backend.
+    Production uses the authenticated OZY web snapshot endpoint. Local-only
+    SQLite remains available for development and tests.
     """
 
     SQLITE_HEADER = b"SQLite format 3\x00"
@@ -119,44 +100,23 @@ class AdminState:
     def __init__(
         self,
         path: Path,
-        database_url: str | None = None,
         *,
         remote_url: str | None = None,
         remote_token: str | None = None,
         remote_timeout_seconds: float = 10.0,
     ):
         self.path = path
-        self.database_url = (database_url or "").strip() or None
         self.remote_url = (remote_url or "").strip() or None
         self.remote_token = (remote_token or "").strip() or None
         self.remote_timeout_seconds = max(1.0, float(remote_timeout_seconds))
-        if self.database_url and self.remote_url:
-            raise RuntimeError("Use either PostgreSQL state or OZY web snapshot state, not both")
         if self.remote_url and not self.remote_token:
             raise RuntimeError("remote_token is required when remote_url is configured")
 
-        self.backend = "web-snapshot" if self.remote_url else ("postgres" if self.database_url else "sqlite")
+        self.backend = "web-snapshot" if self.remote_url else "sqlite"
         self._lock = RLock()
-        self._pool = None
-
-        if self.backend == "postgres":
-            if psycopg is None or ConnectionPool is None:
-                raise RuntimeError(
-                    "STATE_DATABASE_URL/DATABASE_URL is configured but psycopg is not installed. "
-                    "Install requirements.txt before starting OZY Admin."
-                )
-            assert self.database_url is not None and ConnectionPool is not None
-            self._pool = ConnectionPool(
-                conninfo=self.database_url,
-                min_size=1,
-                max_size=4,
-                kwargs={"row_factory": dict_row},
-                open=True,
-            )
-        else:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.remote_url:
-                self._restore_remote_snapshot()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.remote_url:
+            self._restore_remote_snapshot()
 
         self._init_db()
         if self.remote_url:
@@ -166,8 +126,6 @@ class AdminState:
 
     @property
     def storage_label(self) -> str:
-        if self.backend == "postgres":
-            return "PostgreSQL"
         if self.backend == "web-snapshot":
             return f"OZY Web snapshot + SQLite cache ({self.path})"
         return f"SQLite ({self.path})"
@@ -257,24 +215,11 @@ class AdminState:
     @contextmanager
     def _conn(self):
         with self._lock:
-            if self.backend == "postgres":
-                assert self._pool is not None
-                with self._pool.connection() as raw:
-                    conn = _ConnectionAdapter(raw, self.backend)
-                    try:
-                        yield conn
-                        raw.commit()
-                    except Exception:
-                        raw.rollback()
-                        raise
-                return
-
             raw = sqlite3.connect(self.path)
             raw.row_factory = sqlite3.Row
-            conn = _ConnectionAdapter(raw, self.backend)
             changed = False
             try:
-                yield conn
+                yield raw
                 raw.commit()
                 changed = raw.total_changes > 0
             except Exception:
@@ -287,97 +232,12 @@ class AdminState:
                 self._push_remote_snapshot()
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
+        """State connections are short-lived; retained for API compatibility."""
+        return None
 
     def _init_db(self) -> None:
-        if self.backend == "postgres":
-            statements = [
-                """CREATE TABLE IF NOT EXISTS member_links (
-                    discord_user_id BIGINT PRIMARY KEY,
-                    game_name TEXT NOT NULL,
-                    game_user_id TEXT,
-                    linked_at_utc TEXT NOT NULL,
-                    source TEXT NOT NULL
-                )""",
-                """CREATE TABLE IF NOT EXISTS away (
-                    discord_user_id BIGINT PRIMARY KEY,
-                    game_name TEXT,
-                    until_utc TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    created_at_utc TEXT NOT NULL
-                )""",
-                """CREATE TABLE IF NOT EXISTS daily_schedule_posts (
-                    local_date TEXT PRIMARY KEY,
-                    channel_id BIGINT NOT NULL,
-                    message_id BIGINT NOT NULL,
-                    posted_at_utc TEXT NOT NULL
-                )""",
-                """CREATE TABLE IF NOT EXISTS welcomed_members (
-                    discord_user_id BIGINT PRIMARY KEY,
-                    welcomed_at_utc TEXT NOT NULL
-                )""",
-                """CREATE TABLE IF NOT EXISTS verification_requests (
-                    discord_user_id BIGINT PRIMARY KEY,
-                    requested_game_name TEXT NOT NULL,
-                    requested_game_user_id TEXT,
-                    requested_at_utc TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    queue_channel_id BIGINT,
-                    queue_message_id BIGINT
-                )""",
-                """CREATE TABLE IF NOT EXISTS verification_history (
-                    history_id TEXT PRIMARY KEY,
-                    discord_user_id BIGINT NOT NULL,
-                    requested_game_name TEXT NOT NULL,
-                    requested_game_user_id TEXT,
-                    requested_at_utc TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    decision TEXT NOT NULL,
-                    reviewed_by_user_id BIGINT NOT NULL,
-                    reviewed_at_utc TEXT NOT NULL,
-                    reason TEXT NOT NULL
-                )""",
-                """CREATE TABLE IF NOT EXISTS member_profiles (
-                    discord_user_id BIGINT PRIMARY KEY,
-                    game_name TEXT,
-                    game_user_id TEXT,
-                    troop_level TEXT,
-                    troop_level_source TEXT,
-                    preferred_language TEXT,
-                    guardsmen_level INTEGER,
-                    monsters_level INTEGER,
-                    specialists_level INTEGER,
-                    profile_source TEXT,
-                    updated_at_utc TEXT NOT NULL
-                )""",
-                """CREATE TABLE IF NOT EXISTS bot_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at_utc TEXT NOT NULL
-                )""",
-                "ALTER TABLE member_links ADD COLUMN IF NOT EXISTS game_user_id TEXT",
-                "ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS requested_game_user_id TEXT",
-                "ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS queue_channel_id BIGINT",
-                "ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS queue_message_id BIGINT",
-                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT",
-                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS guardsmen_level INTEGER",
-                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS monsters_level INTEGER",
-                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS specialists_level INTEGER",
-                "ALTER TABLE member_profiles ADD COLUMN IF NOT EXISTS profile_source TEXT",
-                """CREATE UNIQUE INDEX IF NOT EXISTS idx_member_links_game_user_id
-                   ON member_links(game_user_id)
-                   WHERE game_user_id IS NOT NULL AND game_user_id <> ''""",
-                "CREATE INDEX IF NOT EXISTS idx_verification_history_discord_user ON verification_history(discord_user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_verification_history_reviewed_at ON verification_history(reviewed_at_utc)",
-            ]
-            with self._conn() as conn:
-                for statement in statements:
-                    conn.execute(statement)
-            return
-
         with self._conn() as conn:
-            conn.raw.executescript(
+            conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
 

@@ -1,6 +1,6 @@
 from datetime import date
 
-from utils import format_chat_directory, format_schedule, safe_code_block
+from ozy.utils import format_chat_directory, format_schedule, safe_code_block
 
 
 class Item:
@@ -36,7 +36,7 @@ def test_schedule_format():
 
 def test_chest_ranking_blocks_split_and_keep_exact_names():
     from types import SimpleNamespace
-    from utils import format_chest_ranking_blocks
+    from ozy.utils import format_chest_ranking_blocks
 
     members = tuple(
         SimpleNamespace(name=f"Player {i:02d}", points=1000 - i, chests=i, met_target=False)

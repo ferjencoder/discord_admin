@@ -10,19 +10,17 @@ __pycache__/
 .venv/
 venv/
 
-# Runtime database
+# Runtime state / generated data
 data/*.sqlite3
 data/*.sqlite3-*
-
-# Local fallback / generated data
 data/roster.json
 data/chest_data.json
 data/schedule.json
 
-# Generated Discord exports
+# Operator exports
 exports/
 
-# OS / editor junk
+# Editors / OS
+.vscode/
 .DS_Store
 Thumbs.db
-exports

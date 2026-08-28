@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from state import AdminState
+from ozy.state import AdminState
 
 
 def test_member_link_roundtrip(tmp_path):

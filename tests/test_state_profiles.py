@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from state import AdminState
+from ozy.state import AdminState
 
 
 def test_post_verification_profile_persists_language_and_gms(tmp_path: Path):
