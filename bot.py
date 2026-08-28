@@ -23,6 +23,7 @@ from ozy.discord_ui import (
     AnnouncementModal,
     EventScheduleView,
     EventSetupModal,
+    MembershipVerificationModal,
     MembershipVerificationRetryView,
     MembershipVerificationView,
     PostVerificationProfileModal,
