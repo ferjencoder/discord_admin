@@ -18,7 +18,7 @@ def test_simple_member_setup_commands_are_registered():
     ui_source = _source("ozy/discord_ui.py")
 
     assert 'custom_id="ozy:membership:verify"' in ui_source
-    assert 'label="Set game name"' in ui_source
+    assert 'label="Enter game name"' in ui_source
     assert '@self.tree.command(name="game-name"' in bot_source
     assert '@self.tree.command(name="member-name"' in bot_source
     assert '@self.tree.command(name="member-troops"' in bot_source

@@ -66,3 +66,17 @@ def test_legacy_guard_level_migrates_to_guardsmen(tmp_path: Path):
         assert profile.profile_complete is False
     finally:
         state2.close()
+
+
+def test_plain_game_name_clears_legacy_stable_identity(tmp_path):
+    state = AdminState(tmp_path / "state.sqlite3")
+    state.set_link(123, "OldName", "legacy", game_user_id="999")
+    state.set_plain_game_name(123, "New Name", "member-entered")
+    link = state.get_link_record(123)
+    assert link is not None
+    assert link.game_name == "New Name"
+    assert link.game_user_id is None
+    profile = state.get_member_profile(123)
+    assert profile is not None
+    assert profile.game_name == "New Name"
+    assert profile.game_user_id is None

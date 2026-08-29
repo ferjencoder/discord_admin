@@ -499,10 +499,10 @@ class EventScheduleView(discord.ui.View):
 
 
 class GameNameModal(discord.ui.Modal):
-    """Fallback form for entering the exact Total Battle roster name.
+    """Simple profile field for the member's current Total Battle name.
 
-    Discord Community Onboarding owns language and G/M/S. The game-name step only
-    establishes the Discord -> Total Battle identity link.
+    The value is stored exactly as entered. It is not checked against the roster,
+    is not unique, and never controls server access.
     """
 
     def __init__(
@@ -519,7 +519,7 @@ class GameNameModal(discord.ui.Modal):
 
         self.game_name = discord.ui.TextInput(
             label="Total Battle name",
-            placeholder="Current name in the OZY roster",
+            placeholder="Your current name in Total Battle",
             default=(suggested_name or (profile.game_name if profile else None) or member.display_name)[:100],
             max_length=100,
             required=True,
@@ -544,14 +544,14 @@ class GameNameModal(discord.ui.Modal):
 
 
 class GameNameView(discord.ui.View):
-    """Persistent entry point for manually entering an exact roster name."""
+    """Persistent entry point for the optional game-name profile field."""
 
     def __init__(self, bot: "OZYAdminBot"):
         super().__init__(timeout=None)
         self.bot = bot
 
     @discord.ui.button(
-        label="Set game name",
+        label="Enter game name",
         style=discord.ButtonStyle.primary,
         custom_id="ozy:membership:verify",
     )
@@ -565,61 +565,6 @@ class GameNameView(discord.ui.View):
                 await interaction.followup.send(message, ephemeral=True)
             else:
                 await interaction.response.send_message(message, ephemeral=True)
-
-
-class GameNameRetryView(discord.ui.View):
-    def __init__(self, bot: "OZYAdminBot", member_id: int):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.member_id = member_id
-
-    @discord.ui.button(label="Enter exact name again", style=discord.ButtonStyle.primary)
-    async def retry_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if interaction.user.id != self.member_id:
-            await interaction.response.send_message("This setup belongs to another member.", ephemeral=True)
-            return
-        await self.bot._open_game_name(interaction)
-
-
-class RosterSuggestionSelect(discord.ui.Select):
-    def __init__(self, bot: "OZYAdminBot", member_id: int, suggestions: list[str]):
-        options = [
-            discord.SelectOption(label=name[:100], value=name[:100])
-            for name in suggestions[:5]
-        ]
-        super().__init__(
-            placeholder="Is one of these your game name?",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-        self.bot = bot
-        self.member_id = member_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.member_id:
-            await interaction.response.send_message("These roster suggestions belong to another member.", ephemeral=True)
-            return
-        selected = self.values[0]
-        await self.bot._submit_suggested_roster_name(interaction, selected)
-
-
-class RosterSuggestionView(discord.ui.View):
-    """Suggestions based on the game name the member entered."""
-
-    def __init__(self, bot: "OZYAdminBot", member_id: int, suggestions: list[str]):
-        super().__init__(timeout=1800)
-        self.bot = bot
-        self.member_id = member_id
-        if suggestions:
-            self.add_item(RosterSuggestionSelect(bot, member_id, suggestions))
-
-    @discord.ui.button(label="Try a different name", style=discord.ButtonStyle.secondary)
-    async def manual_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if interaction.user.id != self.member_id:
-            await interaction.response.send_message("This setup belongs to another member.", ephemeral=True)
-            return
-        await self.bot._open_game_name(interaction)
 
 
 class AnnouncementModal(discord.ui.Modal):

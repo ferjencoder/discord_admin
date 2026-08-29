@@ -17,11 +17,11 @@ PROTECTED_ROLE_IDS = {
     "1536675686029467658": "Leader",
     "1536676026288181319": "Superior",
     "1542765585606254634": "Unverified",
-    "1542765587023925298": "Verified",
     "1542765588475281408": "Special Access",
 }
 
 METADATA_ROLE_IDS = {
+    "1542765587023925298": "Verified",
     "1536541947173408839": "EN",
     "1536542118611263609": "ES",
     "1540062337111953448": "AR",
@@ -227,14 +227,19 @@ def lint(config: dict) -> list[str]:
         ptitle = prompt.get("title", "(untitled)")
         for option in prompt.get("options", []):
             otitle = option.get("title", "(untitled)")
-            for role_id in option.get("role_ids", []):
-                role_id = str(role_id)
+            role_ids = {str(x) for x in option.get("role_ids", [])}
+            for role_id in role_ids:
                 if role_id in PROTECTED_ROLE_IDS:
                     warnings.append(
                         f'Prompt "{ptitle}" option "{otitle}" assigns protected role '
                         f'{PROTECTED_ROLE_IDS[role_id]} ({role_id}). '
-                        "OZY access policy says native onboarding must not grant access-control roles."
+                        "Native onboarding must not grant leadership/exception roles."
                     )
+            verified_id = "1542765587023925298"
+            if verified_id in role_ids and ptitle != "What language do you prefer?":
+                warnings.append(
+                    f'Prompt "{ptitle}" option "{otitle}" grants Verified outside the required language question.'
+                )
 
     for channel_id in map(str, config.get("default_channel_ids", [])):
         if channel_id not in DEFAULT_SAFE_PUBLIC:

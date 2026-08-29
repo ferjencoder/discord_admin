@@ -1,46 +1,51 @@
-# OZY Admin - hard simplified onboarding
+# OZY Admin - remove roster gating from onboarding
 
-Replace the included files, preserving their paths, then delete the paths in
-DELETE_THESE.txt.
+## Discord limitation
 
-## Resulting member flow
+Community Onboarding only supports multiple-choice and dropdown prompts. It
+cannot collect arbitrary free text such as a Total Battle player name.
 
-1. Discord Community Onboarding asks:
-   - preferred language
-   - Guardsmen level
-   - Monsters level
-   - Specialists level
-2. OZY Admin greets the member with one `Set game name` button.
-3. The member types the current Total Battle name.
-4. Exact active-roster match -> link immediately -> Verified access.
-5. Non-exact match -> closest active-roster names are offered for selection.
-6. No Leader/Superior approval queue.
+This patch therefore uses the simplest no-approval model available:
 
-Discord Community Onboarding cannot collect arbitrary free-text answers, so
-the Total Battle name remains the single bot-assisted field.
+1. Native onboarding asks language + G/M/S.
+2. Every required language answer grants the normal Verified access role plus
+   the selected language role.
+3. Normal clan access opens from native onboarding alone.
+4. ADMIN and LEADERSHIP remain restricted by their own role permissions.
+5. OZY Admin's game-name field is profile information only.
+6. The game name is stored exactly as entered:
+   - no roster lookup
+   - no fuzzy matching
+   - no uniqueness check
+   - no stable Total Battle identity check
+   - no access decision
+7. `/game-name` changes your own name.
+8. `/member-name` lets Leader/Superior change another member's name.
+9. `/member-troops` updates another member's G/M/S.
+10. `/members-json` exports current Discord members with game name, language,
+    Guardsmen, Monsters and Specialists.
 
-## Member maintenance
+Legacy stable Total Battle IDs are cleared the next time a free-form game name
+is saved, so an old account link cannot produce the previous "already linked to
+another Discord account" error.
 
-- `/game-name <name>` - member changes their own current game name. If a stable
-  Total Battle user_id already exists, self-service changes must keep that ID.
-- Language and G/M/S are edited through Discord Channels & Roles.
+## Install
 
-## Leadership maintenance
+Replace the included files, preserving paths.
 
-- `/member-name @member <game_name>`
-- `/member-troops @member <G> <M> <S>`
-- `/members-json`
-
-`/members-json` returns an ephemeral JSON attachment with the active roster
-merged with Discord identity, preferred language and G/M/S values.
-
-## Apply the 4-question onboarding
-
-First inspect/dry-run:
+Run:
 
 ```bash
+py -m pytest -q
 py tools/discord/onboarding.py show config/discord/onboarding.json
 py tools/discord/onboarding.py apply config/discord/onboarding.json
+```
+
+The onboarding dry run should show every language answer with two roles, e.g.:
+
+```text
+English
+  roles: EN, Verified
 ```
 
 Then apply:
@@ -49,11 +54,8 @@ Then apply:
 py tools/discord/onboarding.py apply config/discord/onboarding.json --apply
 ```
 
-## Validate
+Then deploy the bot.
 
-```bash
-py -m pytest -q
-py preflight_ozy_admin.py
-```
-
-The build used for this package passed 64 tests.
+Important: Discord messages already posted by an older bot deployment are not
+rewritten automatically. Delete the old test welcome message shown in Discord,
+or test with a fresh join after deploying this patch.

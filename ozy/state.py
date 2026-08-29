@@ -518,6 +518,40 @@ class AdminState:
             )
         self.set_member_profile_identity(discord_user_id, game_name=game_name, game_user_id=stable_id)
 
+    def set_plain_game_name(self, discord_user_id: int, game_name: str, source: str) -> None:
+        """Store a member-entered game name as profile data, not as a roster identity.
+
+        Any legacy stable Total Battle user_id is deliberately cleared. Game names
+        are not unique and are never used as an access-control decision.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        name = game_name.strip()
+        if not name:
+            raise ValueError("game_name is required")
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO member_links(discord_user_id, game_name, game_user_id, linked_at_utc, source)
+                   VALUES (?, ?, NULL, ?, ?)
+                   ON CONFLICT(discord_user_id) DO UPDATE SET
+                       game_name=excluded.game_name,
+                       game_user_id=NULL,
+                       linked_at_utc=excluded.linked_at_utc,
+                       source=excluded.source""",
+                (discord_user_id, name, now, source),
+            )
+            conn.execute(
+                """INSERT INTO member_profiles(
+                       discord_user_id, game_name, game_user_id,
+                       troop_level, troop_level_source, updated_at_utc
+                   )
+                   VALUES (?, ?, NULL, NULL, NULL, ?)
+                   ON CONFLICT(discord_user_id) DO UPDATE SET
+                       game_name=excluded.game_name,
+                       game_user_id=NULL,
+                       updated_at_utc=excluded.updated_at_utc""",
+                (discord_user_id, name, now),
+            )
+
     def get_link(self, discord_user_id: int) -> str | None:
         with self._conn() as conn:
             row = conn.execute("SELECT game_name FROM member_links WHERE discord_user_id=?", (discord_user_id,)).fetchone()
