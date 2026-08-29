@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -11,8 +12,9 @@ from pathlib import Path
 
 API_BASE = "https://discord.com/api/v10"
 
-# Access-control roles must never be assigned by native onboarding.
-# Language and G/M/S roles are metadata only and are intentionally allowed.
+# Leadership/exception roles must never be assigned by native onboarding.
+# The existing "Verified" role ID is now only the normal member-access role.
+# Language and G/M/S roles remain metadata.
 PROTECTED_ROLE_IDS = {
     "1536675686029467658": "Leader",
     "1536676026288181319": "Superior",
@@ -21,7 +23,7 @@ PROTECTED_ROLE_IDS = {
 }
 
 METADATA_ROLE_IDS = {
-    "1542765587023925298": "Verified",
+    "1542765587023925298": "Member Access",
     "1536541947173408839": "EN",
     "1536542118611263609": "ES",
     "1540062337111953448": "AR",
@@ -223,6 +225,30 @@ def summarize(config: dict) -> None:
 def lint(config: dict) -> list[str]:
     warnings: list[str] = []
 
+    # OZY onboarding should never carry stale HOT branding.  This checks the
+    # API-managed Guild Onboarding payload only; Discord Server Guide's Welcome
+    # Sign is a separate UI-managed surface.
+    serialized = json.dumps(config, ensure_ascii=False)
+    if re.search(r"\bHOT\b", serialized):
+        warnings.append(
+            'Onboarding payload contains stale "HOT" branding. OZY onboarding must not reference HOT.'
+        )
+
+    desired_level_orders = {
+        "What is your Guardsmen level?": [f"G{i}" for i in range(9, 0, -1)],
+        "What is your Monsters level?": [f"M{i}" for i in range(9, 0, -1)],
+        "What is your Specialists level?": [f"S{i}" for i in range(9, 0, -1)],
+    }
+    for prompt in config.get("prompts", []):
+        expected = desired_level_orders.get(prompt.get("title"))
+        if expected is not None:
+            actual = [str(option.get("title", "")) for option in prompt.get("options", [])]
+            if actual != expected:
+                warnings.append(
+                    f'Prompt "{prompt.get("title")}" must be ordered highest to lowest: '
+                    + ", ".join(expected)
+                )
+
     for prompt in config.get("prompts", []):
         ptitle = prompt.get("title", "(untitled)")
         for option in prompt.get("options", []):
@@ -235,10 +261,10 @@ def lint(config: dict) -> list[str]:
                         f'{PROTECTED_ROLE_IDS[role_id]} ({role_id}). '
                         "Native onboarding must not grant leadership/exception roles."
                     )
-            verified_id = "1542765587023925298"
-            if verified_id in role_ids and ptitle != "What language do you prefer?":
+            member_access_id = "1542765587023925298"
+            if member_access_id in role_ids and ptitle != "What language do you prefer?":
                 warnings.append(
-                    f'Prompt "{ptitle}" option "{otitle}" grants Verified outside the required language question.'
+                    f'Prompt "{ptitle}" option "{otitle}" grants the member-access role outside the required language question.'
                 )
 
     for channel_id in map(str, config.get("default_channel_ids", [])):

@@ -158,6 +158,7 @@ class Settings:
     special_access_role_id: int | None
 
     welcome_channel_id: int | None
+    goodbye_channel_id: int | None
     announcement_channel_id: int | None
     announcement_ping_role_id: int | None
     schedule_channel_id: int | None
@@ -251,6 +252,7 @@ def load_settings() -> Settings:
         special_access_role_id=_optional_id("SPECIAL_ACCESS_ROLE_ID"),
 
         welcome_channel_id=_optional_id("WELCOME_CHANNEL_ID"),
+        goodbye_channel_id=_optional_id("GOODBYE_CHANNEL_ID"),
         announcement_channel_id=_optional_id("ANNOUNCEMENT_CHANNEL_ID"),
         announcement_ping_role_id=_optional_id("ANNOUNCEMENT_PING_ROLE_ID"),
         schedule_channel_id=_optional_id("SCHEDULE_CHANNEL_ID"),

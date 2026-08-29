@@ -81,12 +81,13 @@ Specialists levels. Each answer assigns a zero-permission metadata role. OZY
 Admin mirrors those roles into `member_profiles` using
 `profile_source=discord-onboarding`.
 
-The metadata roles do not grant clan access. `Verified` / `Special Access`
-remain the access gate. Members edit language/G/M/S through Discord **Channels
-& Roles**; `/profile` only displays the mirrored structured profile.
+Language and G/M/S remain native onboarding metadata. The required language
+answer also grants the normal member-access role. Members edit language/G/M/S
+through Discord **Channels & Roles**; `/profile` only displays the mirrored
+structured profile.
 
-The authoritative flow is: native Onboarding -> roster identity claim ->
-automatic roster-name match -> Verified.
+There is no roster identity claim or approval step. The Discord server nickname
+is used as the member's Total Battle name.
 
 ## 6. Connect PeekABoo data
 
@@ -130,7 +131,6 @@ CALENDAR_REALM=Regular
 CALENDAR_DAYS=30
 TODAY_ENABLED=true
 
-AUTO_SYNC_NICKNAME=false
 ```
 
 The tournament-calendar integration does not require a source login, cookie, SignalR connection,

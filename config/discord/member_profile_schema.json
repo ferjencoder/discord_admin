@@ -1,8 +1,7 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "member_profile_example": {
     "discord_user_id": "123456789012345678",
-    "game_user_id": "987654321",
     "game_name": "PeekABoo Death",
     "preferred_language": "EN",
     "guardsmen_level": 9,
@@ -13,9 +12,9 @@
   },
   "notes": [
     "Discord native Onboarding is the member-facing source for language and G/M/S.",
-    "EN/ES/etc and G1-G9/M1-M9/S1-S9 roles are zero-permission metadata roles, not access roles.",
-    "OZY Admin mirrors a complete role selection into structured member_profiles fields.",
-    "Verified/Special Access control clan access independently of profile metadata.",
-    "Use stable Total Battle user_id as the durable game identity after the first explicit roster-name link."
+    "G1-G9/M1-M9/S1-S9 roles are zero-permission metadata roles.",
+    "The required language answer also grants the normal member-access role.",
+    "The Discord server nickname is treated as the current Total Battle name.",
+    "OZY Admin performs no roster verification, fuzzy matching, uniqueness check, or approval for membership."
   ]
 }

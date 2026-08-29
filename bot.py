@@ -25,8 +25,6 @@ from ozy.discord_ui import (
     AnnouncementModal,
     EventScheduleView,
     EventSetupModal,
-    GameNameModal,
-    GameNameView,
 )
 from ozy.event_calendar import (
     TournamentCalendarClient,
@@ -130,10 +128,6 @@ class OZYAdminBot(discord.Client):
         self.calendar_client = TournamentCalendarClient(self.settings, self.http_session)
 
         await self._start_health_server()
-
-        # Persistent game-name button. Register it before command
-        # sync so old welcome messages keep working after a restart/redeploy.
-        self.add_view(GameNameView(self))
 
         guild = discord.Object(id=self.settings.server_id)
         self.tree.copy_global_to(guild=guild)
@@ -253,6 +247,7 @@ class OZYAdminBot(discord.Client):
 
         configured_channels = {
             "WELCOME_CHANNEL_ID": self.settings.welcome_channel_id,
+            "GOODBYE_CHANNEL_ID": self.settings.goodbye_channel_id,
             "ANNOUNCEMENT_CHANNEL_ID": self.settings.announcement_channel_id,
             "SCHEDULE_CHANNEL_ID": self.settings.schedule_channel_id,
             "LEADERSHIP_SCHEDULE_CHANNEL_ID": self.settings.leadership_schedule_channel_id,
@@ -327,11 +322,9 @@ class OZYAdminBot(discord.Client):
                     ping_role.name,
                 )
 
-        if not self.settings.rank_role_map:
-            log.warning("RANK_ROLE_MAP is empty; roster linking will work but rank roles will not be changed")
-        if not self.settings.verified_role_id or not self.settings.unverified_role_id:
+        if not self.settings.verified_role_id:
             log.warning(
-                "VERIFIED_ROLE_ID and UNVERIFIED_ROLE_ID should both be configured to enforce roster-gated server access"
+                "VERIFIED_ROLE_ID is not configured; normal member access will rely entirely on Discord channel defaults"
             )
         if self.settings.chest_reset_post_enabled and not self.settings.chest_channel_id:
             log.warning("CHEST_RESET_POST_ENABLED=true but CHEST_CHANNEL_ID is not configured")
@@ -360,30 +353,24 @@ class OZYAdminBot(discord.Client):
         return False
 
     def _can_create_events(self, member: discord.Member | None) -> bool:
-        """Allow normal roster-gated members plus leadership/special-access users."""
+        """Allow members who completed onboarding plus leadership."""
         if member is None:
             return False
         if self._is_leadership(member):
             return True
 
         role_ids = {role.id for role in member.roles}
-        if self.settings.special_access_role_id and self.settings.special_access_role_id in role_ids:
-            return True
         if self.settings.verified_role_id:
             return self.settings.verified_role_id in role_ids
-        if self.settings.unverified_role_id and self.settings.unverified_role_id in role_ids:
-            return False
 
-        # Backward-compatible fallback for servers that have not configured the
-        # roster access roles yet. Once VERIFIED_ROLE_ID is configured, that role
-        # becomes the normal-member gate for self-service event creation.
+        # No bot-owned verification layer. Discord Onboarding is authoritative.
         return True
 
     async def _require_event_creator(self, interaction: discord.Interaction) -> bool:
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if self._can_create_events(member):
             return True
-        message = "Verify your OZY membership before creating events."
+        message = "Complete Discord onboarding before creating events."
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:
@@ -413,6 +400,34 @@ class OZYAdminBot(discord.Client):
         if guild is None:
             return None
         return guild.get_member(interaction.user.id)
+
+    @staticmethod
+    def _game_name_from_discord(member: discord.Member) -> str:
+        """Use the server nickname as the Total Battle name.
+
+        There is no roster identity/linking layer. If a member has no server
+        nickname yet, fall back to their Discord display name.
+        """
+        return (member.nick or member.display_name).strip()
+
+    def _find_named_text_channel(
+        self,
+        guild: discord.Guild,
+        *,
+        channel_name: str,
+        category_name: str | None = None,
+    ) -> discord.TextChannel | None:
+        wanted_channel = channel_name.strip().casefold()
+        wanted_category = category_name.strip().casefold() if category_name else None
+        for channel in guild.text_channels:
+            if channel.name.casefold() != wanted_channel:
+                continue
+            if wanted_category is not None:
+                category = channel.category
+                if category is None or category.name.casefold() != wanted_category:
+                    continue
+            return channel
+        return None
 
     def _sync_profile_from_onboarding_roles(self, member: discord.Member) -> str:
         """Mirror native Discord Onboarding metadata roles into OZY state.
@@ -452,7 +467,7 @@ class OZYAdminBot(discord.Client):
                 existing.monsters_level,
                 existing.specialists_level,
             )
-            if current == desired:
+            if current == desired and existing.game_name == self._game_name_from_discord(member):
                 return (
                     f"{selection.preferred_language} / G{selection.guardsmen_level} / "
                     f"M{selection.monsters_level} / S{selection.specialists_level}"
@@ -465,8 +480,8 @@ class OZYAdminBot(discord.Client):
             monsters_level=selection.monsters_level,
             specialists_level=selection.specialists_level,
             source="discord-onboarding",
-            game_name=(existing.game_name if existing else None),
-            game_user_id=(existing.game_user_id if existing else None),
+            game_name=self._game_name_from_discord(member),
+            game_user_id=None,
         )
         return (
             f"{selection.preferred_language} / G{selection.guardsmen_level} / "
@@ -519,16 +534,17 @@ class OZYAdminBot(discord.Client):
                 monsters_level=monsters,
                 specialists_level=specialists,
                 source="leadership-troop-update",
-                game_name=(profile.game_name if profile else None),
-                game_user_id=(profile.game_user_id if profile else None),
+                game_name=self._game_name_from_discord(member),
+                game_user_id=None,
             )
         return "profile updated"
 
     async def _build_members_json(self, guild: discord.Guild) -> dict:
-        """Export current Discord members with native onboarding profile data.
+        """Export current Discord members with language and G/M/S profile data.
 
-        The website roster is intentionally not consulted. A game name is profile
-        information only and can be duplicated or changed freely.
+        Membership is never checked against the Total Battle roster. The member's
+        server nickname is the game-name field. If no nickname is set, Discord's
+        display name is used.
         """
         members: list[dict] = []
         for member in guild.members:
@@ -536,11 +552,12 @@ class OZYAdminBot(discord.Client):
                 continue
             self._sync_profile_from_onboarding_roles(member)
             profile = self.state.get_member_profile(member.id)
-            game_name = self.state.get_link(member.id)
+            game_name = self._game_name_from_discord(member)
             members.append({
                 "discord_user_id": member.id,
                 "discord_username": str(member),
                 "discord_display_name": member.display_name,
+                "discord_nickname": member.nick,
                 "game_name": game_name,
                 "preferred_language": (profile.preferred_language if profile else None),
                 "guardsmen_level": (profile.guardsmen_level if profile else None),
@@ -548,177 +565,110 @@ class OZYAdminBot(discord.Client):
                 "specialists_level": (profile.specialists_level if profile else None),
             })
 
-        members.sort(key=lambda item: ((item["game_name"] or item["discord_display_name"] or "").casefold()))
+        members.sort(key=lambda item: (item["game_name"] or "").casefold())
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "guild_id": guild.id,
             "member_count": len(members),
             "members": members,
         }
 
-    async def _open_game_name(
+    async def _set_game_name(
         self,
-        interaction: discord.Interaction,
-        *,
-        suggested_name: str | None = None,
-    ) -> None:
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if member is None or member.guild.id != self.settings.server_id:
-            await interaction.response.send_message("This setup only works inside the OZY server.", ephemeral=True)
-            return
-        await interaction.response.send_modal(
-            GameNameModal(self, member=member, suggested_name=suggested_name)
-        )
-
-    async def _submit_game_name(
-        self,
-        interaction: discord.Interaction,
-        *,
+        member: discord.Member,
         game_name: str,
-    ) -> None:
-        """Store the member's game name without roster validation or access logic."""
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if member is None or member.guild.id != self.settings.server_id:
-            await interaction.response.send_message("This setup only works inside the OZY server.", ephemeral=True)
-            return
-
+        *,
+        actor: str,
+    ) -> tuple[bool, str]:
+        """Set the Discord server nickname used as the member's game name."""
         entered = game_name.strip()
         if not entered:
-            await interaction.response.send_message("Enter your current Total Battle name.", ephemeral=True)
-            return
+            return False, "Game name cannot be blank."
+        if len(entered) > 32:
+            return False, "Discord server nicknames are limited to 32 characters."
 
-        previous = self.state.get_link(member.id)
-        self.state.set_plain_game_name(member.id, entered, "self-game-name")
-        self.state.clear_verification_request(member.id)
-        self._sync_profile_from_onboarding_roles(member)
+        previous = self._game_name_from_discord(member)
+        try:
+            await member.edit(nick=entered, reason=f"OZY game-name update by {actor}")
+        except discord.Forbidden:
+            return False, "I cannot change that nickname. Check role hierarchy / Manage Nicknames."
+        except discord.HTTPException as exc:
+            return False, f"Discord nickname update failed: {exc}"
+
+        profile = self.state.get_member_profile(member.id)
+        if profile and profile.profile_complete:
+            self.state.set_member_profile_details(
+                member.id,
+                preferred_language=profile.preferred_language,
+                guardsmen_level=profile.guardsmen_level,
+                monsters_level=profile.monsters_level,
+                specialists_level=profile.specialists_level,
+                source=profile.profile_source or "discord-onboarding",
+                game_name=entered,
+                game_user_id=None,
+            )
 
         await self._audit(
-            "Member game name",
-            str(member),
-            f"Previous: {previous or 'none'}\nNew: {entered}",
+            "Member game name changed",
+            actor,
+            f"Discord member: {member} ({member.id})\nPrevious: {previous}\nNew: {entered}",
         )
-        await interaction.response.send_message(
-            f"Game name saved as **{entered}**. No roster check is performed.",
-            ephemeral=True,
-        )
+        return True, entered
 
     async def _resolve_member_game_name(self, member: discord.Member) -> str | None:
-        """Return the member-maintained game-name profile field."""
-        return self.state.get_link(member.id)
+        """Return the member's server nickname/display name.
 
-    async def _sync_access_roles(self, member: discord.Member, active_roster_member: bool) -> str:
-        """Compatibility no-op. Native Discord Onboarding owns normal member access."""
-        return "Discord onboarding manages member access"
-
-    async def _sync_rank_role(self, member: discord.Member, game_name: str) -> str:
-        """Optionally sync Leader/Superior rank when the free-form name matches roster.
-
-        This helper never changes normal channel access and never treats the roster
-        result as an identity proof.
+        This is profile data only and never a membership-verification result.
         """
-        assert self.data is not None
-        info = await self.data.member_info(game_name)
-        if not info:
-            return "no matching roster rank; member access unchanged"
-
-        rank = str(info.get("rank", "")).strip()
-        if not rank:
-            return "matching roster entry has no rank; member access unchanged"
-        target_role_id = self.settings.rank_role_map.get(rank.casefold())
-        if target_role_id is None:
-            return f"no Discord role configured for roster rank {rank}"
-
-        guild = member.guild
-        target_role = guild.get_role(target_role_id)
-        if target_role is None:
-            return f"configured role {target_role_id} no longer exists"
-        me = guild.me
-        if me is None or target_role >= me.top_role:
-            return f"cannot manage role {target_role.name}; check role hierarchy"
-
-        managed_ids = set(self.settings.rank_role_map.values())
-        remove_roles = [r for r in member.roles if r.id in managed_ids and r.id != target_role_id]
-        try:
-            if remove_roles:
-                await member.remove_roles(*remove_roles, reason=f"OZY roster rank sync: {rank}")
-            if target_role not in member.roles:
-                await member.add_roles(target_role, reason=f"OZY roster rank sync: {rank}")
-        except discord.HTTPException as exc:
-            return f"Discord role update failed: {exc}"
-        return f"{rank} -> {target_role.name}"
+        value = self._game_name_from_discord(member)
+        return value or None
 
     # ------------------------------------------------------------------
     # Welcome / roster identity
     # ------------------------------------------------------------------
     async def _process_new_member(self, member: discord.Member) -> None:
+        """Say hello after Discord's native onboarding completes."""
         if member.guild.id != self.settings.server_id or member.bot:
             return
 
         onboarding_profile = self._sync_profile_from_onboarding_roles(member)
-        game_name = self.state.get_link(member.id)
 
+        channel: discord.TextChannel | None = None
         if self.settings.welcome_channel_id:
-            channel = self.get_channel(self.settings.welcome_channel_id)
-            if isinstance(channel, discord.TextChannel):
-                embed = discord.Embed(
-                    title="Welcome to OZY",
-                    description=(
-                        f"Welcome {member.mention}. Your Discord onboarding is complete and normal clan access "
-                        "is handled by your onboarding choices."
-                    ),
-                    color=0xF59E0B,
-                )
-                if game_name:
-                    embed.add_field(
-                        name="Game name",
-                        value=f"Saved as **{game_name}**. Use `/game-name` whenever it changes.",
-                        inline=False,
-                    )
-                    view: discord.ui.View | None = None
-                else:
-                    embed.add_field(
-                        name="Game name",
-                        value=(
-                            "Discord cannot collect free-text answers inside native Community Onboarding. "
-                            "Click **Enter game name** once and type your Total Battle name. "
-                            "It is stored exactly as entered and is not checked against the roster."
-                        ),
-                        inline=False,
-                    )
-                    view = GameNameView(self)
+            candidate = self.get_channel(self.settings.welcome_channel_id)
+            if isinstance(candidate, discord.TextChannel):
+                channel = candidate
+        if channel is None:
+            channel = self._find_named_text_channel(
+                member.guild,
+                channel_name="welcome",
+                category_name="START HERE",
+            )
 
-                profile = self.state.get_member_profile(member.id)
-                if profile and profile.profile_complete:
-                    language_label = dict(PROFILE_LANGUAGES).get(
-                        profile.preferred_language or "", profile.preferred_language or "Unknown"
-                    )
-                    embed.add_field(
-                        name="Your onboarding choices",
-                        value=(
-                            f"**{language_label}** · "
-                            f"**G{profile.guardsmen_level} / M{profile.monsters_level} / S{profile.specialists_level}**"
-                        ),
-                        inline=False,
-                    )
-                embed.add_field(
-                    name="Change later",
-                    value="Language/G/M/S: **Channels & Roles**. Game name: `/game-name`.",
-                    inline=False,
-                )
-
+        if channel is not None:
+            embed = discord.Embed(
+                title="🦇 Welcome to the Madhouse",
+                description=(
+                    f"{member.mention}, the gates are open, the bats are awake, "
+                    "and OZY just got a little louder. Welcome to Odyssey."
+                ),
+                color=0x7C3AED,
+            )
+            embed.set_footer(text="No trials. No paperwork. Just don't feed the bats after midnight.")
+            try:
                 await channel.send(
-                    content=member.mention,
                     embed=embed,
-                    view=view,
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                 )
+            except discord.HTTPException as exc:
+                log.warning("Welcome message failed for %s: %s", member.id, exc)
 
         self.state.mark_welcomed(member.id)
         await self._audit(
             "Member joined",
             str(member),
-            f"Discord ID: {member.id}\nGame name: {game_name or 'not set'}\nOnboarding profile: {onboarding_profile}",
+            f"Discord ID: {member.id}\nOnboarding profile: {onboarding_profile}",
         )
 
     async def on_member_join(self, member: discord.Member) -> None:
@@ -732,15 +682,44 @@ class OZYAdminBot(discord.Client):
     async def on_member_remove(self, member: discord.Member) -> None:
         if member.guild.id != self.settings.server_id or member.bot:
             return
-        # Profile data is preserved across rejoins, but it never blocks another
-        # Discord account from using the same display/game name.
+
+        channel: discord.TextChannel | None = None
+        if self.settings.goodbye_channel_id:
+            candidate = self.get_channel(self.settings.goodbye_channel_id)
+            if isinstance(candidate, discord.TextChannel):
+                channel = candidate
+        if channel is None:
+            channel = self._find_named_text_channel(
+                member.guild,
+                channel_name="goodbye",
+                category_name="START HERE",
+            )
+
+        if channel is not None:
+            embed = discord.Embed(
+                title="🦇 Another Bat Leaves the Belfry",
+                description=(
+                    f"**{member.display_name}** has left the madhouse. "
+                    "The bats raise a wing in salute. Safe travels beyond the gates."
+                ),
+                color=0x4C1D95,
+            )
+            embed.set_footer(text="The OZY door stays loud.")
+            try:
+                await channel.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException as exc:
+                log.warning("Goodbye message failed for %s: %s", member.id, exc)
+
         self.state.clear_welcomed(member.id)
         self.state.clear_away(member.id)
-        self.state.clear_verification_request(member.id)
+
         await self._audit(
             "Member left Discord",
             str(member),
-            f"Discord ID: {member.id}\nSaved game name: {self.state.get_link(member.id) or 'none'}",
+            f"Discord ID: {member.id}\nGame/display name: {self._game_name_from_discord(member)}",
         )
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
@@ -748,7 +727,10 @@ class OZYAdminBot(discord.Client):
             return
         if before.pending and not after.pending:
             await self._process_new_member(after)
-        if {role.id for role in before.roles} != {role.id for role in after.roles}:
+        if (
+            {role.id for role in before.roles} != {role.id for role in after.roles}
+            or before.nick != after.nick
+        ):
             self._sync_profile_from_onboarding_roles(after)
 
     # ------------------------------------------------------------------
@@ -1345,88 +1327,6 @@ class OZYAdminBot(discord.Client):
     # ------------------------------------------------------------------
     # Authoritative roster/access synchronization
     # ------------------------------------------------------------------
-    async def _sync_all_member_access(self, *, apply: bool) -> dict[str, int]:
-        assert self.data is not None
-        self.data.invalidate("roster")
-        roster = await self.data.roster()
-        exact_lookup = {name.casefold(): name for name in roster}
-        user_id_lookup = {
-            str(info.get("user_id", "")).strip(): name
-            for name, info in roster.items()
-            if str(info.get("user_id", "")).strip()
-        }
-        links = self.state.all_link_records()
-        guild = self.get_guild(self.settings.server_id)
-        if guild is None:
-            raise DataUnavailable("OZY guild unavailable")
-
-        special_role = guild.get_role(self.settings.special_access_role_id) if self.settings.special_access_role_id else None
-        counts = {
-            "discord_members": 0,
-            "roster_linked": 0,
-            "special_access": 0,
-            "unverified": 0,
-            "stale_links": 0,
-        }
-
-        for member in guild.members:
-            if member.bot:
-                continue
-            counts["discord_members"] += 1
-            link = links.get(member.id)
-            canonical = None
-            if link:
-                if link.game_user_id:
-                    canonical = user_id_lookup.get(link.game_user_id)
-                if canonical is None:
-                    canonical = exact_lookup.get(link.game_name.casefold())
-            if canonical:
-                counts["roster_linked"] += 1
-                if apply:
-                    roster_user_id = str(roster[canonical].get("user_id", "")).strip() or None
-                    if canonical != link.game_name or roster_user_id != link.game_user_id:
-                        self.state.set_link(
-                            member.id,
-                            canonical,
-                            "canonicalized-access-sync",
-                            game_user_id=roster_user_id,
-                        )
-                    await self._sync_rank_role(member, canonical)
-                continue
-
-            if link:
-                counts["stale_links"] += 1
-
-            has_special = bool(special_role and special_role in member.roles)
-            if has_special:
-                counts["special_access"] += 1
-            else:
-                counts["unverified"] += 1
-            if apply:
-                await self._sync_access_roles(member, active_roster_member=False)
-
-        return counts
-
-    async def _roster_access_sync_loop(self) -> None:
-        await self.wait_until_ready()
-
-        while not self.is_closed():
-            try:
-                await self._sync_all_member_access(apply=True)
-            except asyncio.CancelledError:
-                raise
-            except DataUnavailable as exc:
-                # If the website is unavailable, preserve current Discord access
-                # rather than mass-revoking members because of an upstream outage.
-                log.warning("Roster access sync skipped; authoritative roster unavailable: %s", exc)
-            except Exception:
-                log.exception("Roster access sync failed")
-
-            try:
-                await asyncio.sleep(self.settings.roster_access_sync_minutes * 60)
-            except asyncio.CancelledError:
-                raise
-
     # ------------------------------------------------------------------
     # Away expiry
     # ------------------------------------------------------------------
@@ -1525,36 +1425,43 @@ class OZYAdminBot(discord.Client):
             matches = [x for x in items if not q or q in x["label"].casefold() or q in x["key"].casefold()]
             return [app_commands.Choice(name=x["label"], value=x["key"]) for x in matches[:25]]
 
-        @self.tree.command(name="game-name", description="Set or update your Total Battle game name")
+        @self.tree.command(name="game-name", description="Set your OZY nickname to your Total Battle name")
         @app_commands.describe(game_name="Your current Total Battle name")
         async def game_name_command(interaction: discord.Interaction, game_name: str) -> None:
             if not isinstance(interaction.user, discord.Member):
                 await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
                 return
-            await self._submit_game_name(interaction, game_name=game_name)
+            ok, result = await self._set_game_name(
+                interaction.user,
+                game_name,
+                actor=str(interaction.user),
+            )
+            if ok:
+                await interaction.response.send_message(
+                    f"Your OZY server nickname is now **{result}**.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(result, ephemeral=True)
 
-        @self.tree.command(name="member-name", description="Leadership: set/correct a member's Total Battle name")
+        @self.tree.command(name="member-name", description="Leadership: change a member's OZY/game nickname")
         @app_commands.describe(member="Discord member", game_name="Current Total Battle name")
         async def member_name(interaction: discord.Interaction, member: discord.Member, game_name: str) -> None:
             if not await self._require_leadership(interaction):
                 return
-            entered = game_name.strip()
-            if not entered:
-                await interaction.response.send_message("Game name cannot be blank.", ephemeral=True)
-                return
-            previous = self.state.get_link(member.id)
-            self.state.set_plain_game_name(member.id, entered, f"leadership-name:{interaction.user.id}")
-            self._sync_profile_from_onboarding_roles(member)
-            await self._audit(
-                "Member game name changed",
-                str(interaction.user),
-                f"Discord member: {member} ({member.id})\nPrevious: {previous or 'none'}\nNew: {entered}",
+            ok, result = await self._set_game_name(
+                member,
+                game_name,
+                actor=str(interaction.user),
             )
-            await interaction.response.send_message(
-                f"{member.mention}'s game name is now **{entered}**.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            if ok:
+                await interaction.response.send_message(
+                    f"{member.mention}'s OZY server nickname is now **{result}**.",
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await interaction.response.send_message(result, ephemeral=True)
 
         @self.tree.command(name="member-troops", description="Leadership: update a member's G/M/S levels")
         @app_commands.describe(member="Discord member", guardsmen="1-9", monsters="1-9", specialists="1-9")
@@ -1636,7 +1543,7 @@ class OZYAdminBot(discord.Client):
 
             self._sync_profile_from_onboarding_roles(target)
             profile = self.state.get_member_profile(target.id)
-            game_name = self.state.get_link(target.id)
+            game_name = self._game_name_from_discord(target)
             embed = discord.Embed(title=(game_name or target.display_name), color=0xF59E0B)
             embed.add_field(name="Discord", value=target.mention, inline=False)
             embed.add_field(name="Game name", value=(game_name or "Not set"), inline=False)
@@ -1682,7 +1589,7 @@ class OZYAdminBot(discord.Client):
                     game_name = own_game_name
                 if not game_name:
                     await interaction.response.send_message(
-                        "Your Discord account is not linked to a roster player yet. Use `/game-name` with your current Total Battle name.",
+                        "I could not determine your game name. Set your OZY server nickname or use `/game-name`.",
                         ephemeral=True,
                     )
                     return
@@ -1814,67 +1721,6 @@ class OZYAdminBot(discord.Client):
                 lines.append(f"Chests: **FAILED** - {exc}")
 
             await interaction.followup.send("\n\n".join(lines), ephemeral=True)
-
-        @self.tree.command(name="special-access", description="Leadership: grant or revoke non-roster server access")
-        @app_commands.describe(member="Discord member", grant="True to grant; False to revoke", reason="Optional audit note")
-        async def special_access(
-            interaction: discord.Interaction,
-            member: discord.Member,
-            grant: bool,
-            reason: str = "",
-        ) -> None:
-            if not await self._require_leadership(interaction):
-                return
-            if not self.settings.special_access_role_id:
-                await interaction.response.send_message("SPECIAL_ACCESS_ROLE_ID is not configured.", ephemeral=True)
-                return
-            role = member.guild.get_role(self.settings.special_access_role_id)
-            if role is None:
-                await interaction.response.send_message("The configured Special Access role does not exist.", ephemeral=True)
-                return
-
-            assert self.data is not None
-            try:
-                active_game_name = await self._resolve_member_game_name(member)
-            except DataUnavailable:
-                active_game_name = None
-
-            try:
-                if grant:
-                    if active_game_name:
-                        result = await self._sync_rank_role(member, active_game_name)
-                        await interaction.response.send_message(
-                            f"{member.mention} is already an active roster member. Normal roster access is authoritative. {result}.",
-                            ephemeral=True,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                        return
-                    if role not in member.roles:
-                        await member.add_roles(role, reason=f"OZY special access granted by {interaction.user}: {reason or 'no reason'}")
-                    result = await self._sync_access_roles(member, active_roster_member=False)
-                    action = "granted"
-                else:
-                    if role in member.roles:
-                        await member.remove_roles(role, reason=f"OZY special access revoked by {interaction.user}: {reason or 'no reason'}")
-                    if active_game_name:
-                        result = await self._sync_rank_role(member, active_game_name)
-                    else:
-                        result = await self._sync_access_roles(member, active_roster_member=False)
-                    action = "revoked"
-            except discord.HTTPException as exc:
-                await interaction.response.send_message(f"Discord role update failed: {exc}", ephemeral=True)
-                return
-
-            await self._audit(
-                f"Special access {action}",
-                str(interaction.user),
-                f"Member: {member} ({member.id})\nReason: {reason or 'none'}\nResult: {result}",
-            )
-            await interaction.response.send_message(
-                f"Special access {action} for {member.mention}. Access state: {result}.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
 
         @self.tree.command(name="away", description="Mark yourself away from clan activity")
         @app_commands.describe(days="Number of days away (1-90)", reason="Short reason")
@@ -2183,72 +2029,6 @@ class OZYAdminBot(discord.Client):
                 await interaction.response.send_message("ANNOUNCEMENT_CHANNEL_ID is not configured.", ephemeral=True)
                 return
             await interaction.response.send_modal(AnnouncementModal(self, ping=ping))
-
-        @self.tree.command(name="sync-roles", description="Leadership: preview or apply roster-based rank role synchronization")
-        @app_commands.describe(apply="False = preview only; True = actually change roles")
-        async def sync_roles(interaction: discord.Interaction, apply: bool = False) -> None:
-            if not await self._require_leadership(interaction):
-                return
-            if interaction.guild is None:
-                await interaction.response.send_message("Guild unavailable.", ephemeral=True)
-                return
-            assert self.data is not None
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            try:
-                roster = await self.data.roster()
-            except DataUnavailable as exc:
-                await interaction.followup.send(f"Roster unavailable: {exc}", ephemeral=True)
-                return
-
-            links = self.state.all_links()
-            exact_lookup = {name.casefold(): name for name in roster}
-            matched = 0
-            changed = 0
-            unresolved: list[str] = []
-            results: list[str] = []
-
-            for member in interaction.guild.members:
-                if member.bot:
-                    continue
-                game_name = links.get(member.id)
-                if game_name:
-                    game_name = exact_lookup.get(game_name.casefold())
-                if not game_name:
-                    unresolved.append(member.display_name)
-                    continue
-                matched += 1
-
-                info = roster[game_name]
-                rank = str(info.get("rank", "")).strip()
-                target_id = self.settings.rank_role_map.get(rank.casefold()) if rank else None
-                target_role = interaction.guild.get_role(target_id) if target_id else None
-                current_managed = [r for r in member.roles if r.id in set(self.settings.rank_role_map.values())]
-                already_correct = bool(target_role and target_role in current_managed and len(current_managed) == 1)
-                if not already_correct:
-                    changed += 1
-                    results.append(f"{member.display_name} -> {game_name} / {rank or '?'}")
-                    if apply:
-                        await self._sync_rank_role(member, game_name)
-
-            mode = "APPLIED" if apply else "PREVIEW"
-            summary = (
-                f"**{mode}**\nLinked roster members: **{matched}**\nRole changes needed: **{changed}**\n"
-                f"Unresolved Discord names: **{len(unresolved)}**"
-            )
-            details = results[:15]
-            if details:
-                summary += "\n\n" + "\n".join(f"- {x}" for x in details)
-                if len(results) > 15:
-                    summary += f"\n- ...and {len(results) - 15} more"
-            if unresolved:
-                summary += "\n\nUnresolved sample: " + ", ".join(unresolved[:10])
-
-            await self._audit(
-                "Roster role sync",
-                str(interaction.user),
-                f"Mode: {mode}\nMatched: {matched}\nChanges: {changed}\nUnresolved: {len(unresolved)}",
-            )
-            await interaction.followup.send(truncate(summary, 1900), ephemeral=True)
 
         @self.tree.error
         async def tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:

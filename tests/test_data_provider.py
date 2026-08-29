@@ -23,6 +23,7 @@ def make_settings(tmp_path: Path) -> Settings:
         unverified_role_id=None,
         special_access_role_id=None,
         welcome_channel_id=None,
+        goodbye_channel_id=None,
         announcement_channel_id=None,
         announcement_ping_role_id=None,
         schedule_channel_id=None,

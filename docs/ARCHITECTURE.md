@@ -32,19 +32,20 @@ discord_admin/
 
 ```text
 Discord native Onboarding
--> language + G/M/S metadata roles
--> OZY Admin mirrors them into structured member_profiles
--> roster-name suggestion / exact name fallback
--> automatic roster-name match
--> Verified + Leader/Superior sync
+-> language + G/M/S roles
+-> normal member access
+-> OZY Admin mirrors language/G/M/S into structured member_profiles
 ```
 
-Discord owns the member-facing language/G/M/S choices. OZY Admin owns roster
-identity and authorization. Roster suggestions are never proof of identity.
-Stable Total Battle `user_id` is the durable identity after the initial link.
+There is no bot-owned membership verification layer. OZY Admin does not compare
+a joining member with the website roster and does not create an approval queue.
 
-Language and G/M/S Discord roles are metadata only and grant no clan access.
-`Verified` / `Special Access` are the access gate. The database mirror is used for reports, JSON exports and APIs.
+The member's Discord server nickname is the operational game-name field. This
+keeps renames native to Discord and prevents stale account-link records from
+blocking rejoins or test accounts.
+
+`Leader` and `Superior` remain staff roles. ADMIN and LEADERSHIP category
+permissions are independent of onboarding.
 
 ## Data flow
 

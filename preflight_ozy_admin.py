@@ -152,7 +152,7 @@ def check_data_api(r: Result) -> None:
                     and str(info.get("status", "active")).lower() not in {"removed", "inactive", "former"}
                 ]
                 stable = sum(1 for _, info in active if str(info.get("user_id", "")).strip())
-                r.ok(f"Roster API reachable - {len(active)} active members, {stable} with stable user_id")
+                r.ok(f"Roster API reachable for game-data features - {len(active)} active members, {stable} with stable user_id")
                 if active and stable < len(active):
                     r.warn(f"{len(active) - stable} active roster members have no stable user_id")
             else:
@@ -320,6 +320,7 @@ def check_discord(r: Result) -> None:
 
     channel_envs = (
         "WELCOME_CHANNEL_ID",
+        "GOODBYE_CHANNEL_ID",
         "ANNOUNCEMENT_CHANNEL_ID",
         "SCHEDULE_CHANNEL_ID",
         "LEADERSHIP_SCHEDULE_CHANNEL_ID",
@@ -339,7 +340,35 @@ def check_discord(r: Result) -> None:
     else:
         r.ok(f"All {len(configured_channels)} configured Discord channel IDs exist")
 
-    # Native profile metadata must not bypass roster-gated access.
+    # GOODBYE_CHANNEL_ID is optional because the bot can fall back to an exact
+    # START HERE / #goodbye lookup. Still verify the fallback exists.
+    if not parse_id("GOODBYE_CHANNEL_ID"):
+        categories = {
+            int(x["id"]): x
+            for x in channels
+            if isinstance(x, dict)
+            and str(x.get("id", "")).isdigit()
+            and int(x.get("type", -1)) == 4
+        }
+        start_here_ids = {
+            cid for cid, category in categories.items()
+            if str(category.get("name", "")).strip().casefold() == "start here"
+        }
+        goodbye = next(
+            (
+                x for x in channels
+                if isinstance(x, dict)
+                and str(x.get("name", "")).strip().casefold() == "goodbye"
+                and int(x.get("parent_id") or 0) in start_here_ids
+            ),
+            None,
+        )
+        if goodbye:
+            r.ok("START HERE / #goodbye found by name (GOODBYE_CHANNEL_ID may remain unset)")
+        else:
+            r.warn("GOODBYE_CHANNEL_ID is unset and START HERE / #goodbye was not found")
+
+    # Native profile metadata must not bypass the onboarding member-access role.
     channel_by_id = {int(x["id"]): x for x in channels if isinstance(x, dict) and str(x.get("id", "")).isdigit()}
     verified_id = parse_id("VERIFIED_ROLE_ID")
     if verified_id and language_map:
@@ -355,16 +384,16 @@ def check_discord(r: Result) -> None:
                 access_errors.append(f"{code}:language-role-has-channel-overwrite")
             verified_overwrite = overwrites.get(str(verified_id))
             if not verified_overwrite or not (int(verified_overwrite.get("allow", "0")) & VIEW_CHANNEL):
-                access_errors.append(f"{code}:Verified-does-not-allow-view")
+                access_errors.append(f"{code}:member-access-does-not-allow-view")
             everyone_overwrite = overwrites.get(guild_id)
             if not everyone_overwrite or not (int(everyone_overwrite.get("deny", "0")) & VIEW_CHANNEL):
                 access_errors.append(f"{code}:everyone-not-denied-view")
         if access_errors:
             r.fail("Language channel access model is inconsistent: " + ", ".join(access_errors))
         else:
-            r.ok("Language channels are Verified-gated; language roles are metadata only")
+            r.ok("Language channels are onboarding-member gated; language roles are metadata only")
 
-    # Normal Verified members must never gain visibility into restricted staff categories.
+    # Normal onboarded members must never gain visibility into restricted staff categories.
     if verified_id:
         restricted_errors = []
         for label, category_id in RESTRICTED_CATEGORY_IDS.items():
@@ -378,11 +407,11 @@ def check_discord(r: Result) -> None:
                 restricted_errors.append(f"{label}:everyone-not-denied-view")
             verified_overwrite = overwrites.get(str(verified_id))
             if verified_overwrite and (int(verified_overwrite.get("allow", "0")) & VIEW_CHANNEL):
-                restricted_errors.append(f"{label}:Verified-explicitly-allows-view")
+                restricted_errors.append(f"{label}:member-access-explicitly-allows-view")
         if restricted_errors:
             r.fail("Restricted category access is inconsistent: " + ", ".join(restricted_errors))
         else:
-            r.ok("ADMIN and LEADERSHIP remain hidden from normal Verified members")
+            r.ok("ADMIN and LEADERSHIP remain hidden from normal onboarded members")
 
 
 def main() -> int:

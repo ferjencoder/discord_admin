@@ -14,7 +14,7 @@ def base_env(monkeypatch):
     monkeypatch.setenv("CALENDAR_BASE_URL", "https://calendar.example.test")
     for name in (
         "VERIFIED_ROLE_ID", "UNVERIFIED_ROLE_ID", "SPECIAL_ACCESS_ROLE_ID",
-        "CHEST_CHANNEL_ID", "CHEST_RESET_POST_ENABLED", "CHEST_RESET_POST_TIME_UTC",
+        "GOODBYE_CHANNEL_ID", "CHEST_CHANNEL_ID", "CHEST_RESET_POST_ENABLED", "CHEST_RESET_POST_TIME_UTC",
         "CHEST_REPORT_CHUNK_SIZE", "ROSTER_ACCESS_SYNC_MINUTES", "OZY_DATA_API_TOKEN",
         "STATE_REMOTE_URL", "STATE_REMOTE_TOKEN", "STATE_REMOTE_TIMEOUT_SECONDS",
     ):
@@ -35,6 +35,7 @@ def test_load_minimal_settings(monkeypatch):
     assert settings.state_remote_url is None
     assert settings.state_remote_token is None
     assert settings.state_remote_timeout_seconds == 10.0
+    assert settings.goodbye_channel_id is None
 
 
 def test_rank_role_map(monkeypatch):
@@ -123,3 +124,10 @@ def test_web_snapshot_requires_token(monkeypatch):
         load_settings()
 
 
+
+
+def test_goodbye_channel_setting(monkeypatch):
+    base_env(monkeypatch)
+    monkeypatch.setenv("GOODBYE_CHANNEL_ID", "987654321")
+    settings = load_settings()
+    assert settings.goodbye_channel_id == 987654321

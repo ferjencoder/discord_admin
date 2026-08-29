@@ -1,27 +1,14 @@
 {
-  "schema_version": 2,
-  "notes": "Access roles are separate from native-onboarding metadata roles. Language and G/M/S metadata roles have zero permissions and never grant clan access.",
+  "schema_version": 3,
+  "notes": "Language/G/M/S are onboarding metadata. The existing Verified role ID is now only the normal member-access role; no roster verification occurs.",
   "access_roles": [
     {
-      "key": "unverified",
-      "name": "Unverified",
-      "permissions": [],
-      "hoist": false,
-      "mentionable": false
-    },
-    {
-      "key": "verified",
+      "key": "member_access",
       "name": "Verified",
       "permissions": [],
       "hoist": false,
-      "mentionable": false
-    },
-    {
-      "key": "special_access",
-      "name": "Special Access",
-      "permissions": [],
-      "hoist": false,
-      "mentionable": false
+      "mentionable": false,
+      "note": "Legacy Discord role name. Semantically this is just normal Member access and may be renamed to Member later."
     },
     {
       "key": "away",
@@ -46,10 +33,51 @@
     }
   ],
   "metadata_roles": {
-    "languages": ["EN", "ES", "PT", "SV", "DE", "CEB", "FR", "RU", "AR", "NO"],
-    "guardsmen": ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9"],
-    "monsters": ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9"],
-    "specialists": ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"],
+    "languages": [
+      "EN",
+      "ES",
+      "PT",
+      "SV",
+      "DE",
+      "CEB",
+      "FR",
+      "RU",
+      "AR",
+      "NO"
+    ],
+    "guardsmen": [
+      "G9",
+      "G8",
+      "G7",
+      "G6",
+      "G5",
+      "G4",
+      "G3",
+      "G2",
+      "G1"
+    ],
+    "monsters": [
+      "M9",
+      "M8",
+      "M7",
+      "M6",
+      "M5",
+      "M4",
+      "M3",
+      "M2",
+      "M1"
+    ],
+    "specialists": [
+      "S9",
+      "S8",
+      "S7",
+      "S6",
+      "S5",
+      "S4",
+      "S3",
+      "S2",
+      "S1"
+    ],
     "rules": {
       "permissions": [],
       "hoist": false,
