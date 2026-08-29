@@ -11,6 +11,25 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DISCORD_API = "https://discord.com/api/v10"
 ADMINISTRATOR = 1 << 3
+VIEW_CHANNEL = 1 << 10
+
+LANGUAGE_CHANNEL_IDS = {
+    "EN": 1536508569338253332,
+    "ES": 1536508632785748108,
+    "PT": 1536510376617967616,
+    "SV": 1536510464144441515,
+    "DE": 1536508684081827880,
+    "CEB": 1536508734530920570,
+    "FR": 1536525721584017548,
+    "RU": 1538166128017412096,
+    "AR": 1538166161873567794,
+    "NO": 1538637390149587025,
+}
+TROOP_METADATA_ROLE_NAMES = {
+    *(f"G{i}" for i in range(1, 10)),
+    *(f"M{i}" for i in range(1, 10)),
+    *(f"S{i}" for i in range(1, 10)),
+}
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -264,6 +283,20 @@ def check_discord(r: Result) -> None:
     else:
         r.fail("LANGUAGE_ROLE_MAP is empty")
 
+    missing_troop_roles = sorted(TROOP_METADATA_ROLE_NAMES - set(role_by_name))
+    if missing_troop_roles:
+        r.fail("Missing native onboarding metadata roles: " + ", ".join(missing_troop_roles))
+    else:
+        bad_troop_roles = []
+        for name in sorted(TROOP_METADATA_ROLE_NAMES):
+            role = role_by_name[name]
+            if int(role.get("permissions", "0")) != 0 or role.get("hoist") or role.get("mentionable"):
+                bad_troop_roles.append(name)
+        if bad_troop_roles:
+            r.fail("Troop metadata roles must have zero permissions/not be hoisted or mentionable: " + ", ".join(bad_troop_roles))
+        else:
+            r.ok("All 27 G/M/S metadata roles exist with zero guild permissions")
+
     translator = role_by_name.get("OZY Translator")
     if translator:
         permissions = int(translator.get("permissions", "0"))
@@ -301,6 +334,31 @@ def check_discord(r: Result) -> None:
             r.fail(f"Configured Discord channel missing: {name}={cid}")
     else:
         r.ok(f"All {len(configured_channels)} configured Discord channel IDs exist")
+
+    # Native profile metadata must not bypass roster-gated access.
+    channel_by_id = {int(x["id"]): x for x in channels if isinstance(x, dict) and str(x.get("id", "")).isdigit()}
+    verified_id = parse_id("VERIFIED_ROLE_ID")
+    if verified_id and language_map:
+        access_errors = []
+        for code, channel_id in LANGUAGE_CHANNEL_IDS.items():
+            channel = channel_by_id.get(channel_id)
+            if not channel:
+                access_errors.append(f"{code}:channel-missing")
+                continue
+            overwrites = {str(o.get("id")): o for o in channel.get("permission_overwrites", [])}
+            language_role_id = language_map.get(code)
+            if language_role_id and str(language_role_id) in overwrites:
+                access_errors.append(f"{code}:language-role-has-channel-overwrite")
+            verified_overwrite = overwrites.get(str(verified_id))
+            if not verified_overwrite or not (int(verified_overwrite.get("allow", "0")) & VIEW_CHANNEL):
+                access_errors.append(f"{code}:Verified-does-not-allow-view")
+            everyone_overwrite = overwrites.get(guild_id)
+            if not everyone_overwrite or not (int(everyone_overwrite.get("deny", "0")) & VIEW_CHANNEL):
+                access_errors.append(f"{code}:everyone-not-denied-view")
+        if access_errors:
+            r.fail("Language channel access model is inconsistent: " + ", ".join(access_errors))
+        else:
+            r.ok("Language channels are Verified-gated; language roles are metadata only")
 
 
 def main() -> int:

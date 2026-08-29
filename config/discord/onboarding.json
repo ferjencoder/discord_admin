@@ -1,6 +1,584 @@
 {
   "prompts": [
     {
+      "id": "1543137179277197347",
+      "title": "What language do you prefer?",
+      "options": [
+        {
+          "id": "1543137179277197350",
+          "title": "English",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇬🇧",
+            "animated": false
+          },
+          "role_ids": [
+            "1536541947173408839"
+          ],
+          "channel_ids": [
+            "1536508569338253332"
+          ]
+        },
+        {
+          "id": "1543137179277197351",
+          "title": "Español",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇪🇸",
+            "animated": false
+          },
+          "role_ids": [
+            "1536542118611263609"
+          ],
+          "channel_ids": [
+            "1536508632785748108"
+          ]
+        },
+        {
+          "id": "1543137179277197352",
+          "title": "Português",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇵🇹",
+            "animated": false
+          },
+          "role_ids": [
+            "1536542159459586128"
+          ],
+          "channel_ids": [
+            "1536510376617967616"
+          ]
+        },
+        {
+          "id": "1543137179277197353",
+          "title": "Svenska",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇸🇪",
+            "animated": false
+          },
+          "role_ids": [
+            "1536542203319681146"
+          ],
+          "channel_ids": [
+            "1536510464144441515"
+          ]
+        },
+        {
+          "id": "1543137179277197354",
+          "title": "Deutsch",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇩🇪",
+            "animated": false
+          },
+          "role_ids": [
+            "1536542327714095166"
+          ],
+          "channel_ids": [
+            "1536508684081827880"
+          ]
+        },
+        {
+          "id": "1543137179365023804",
+          "title": "Bisaya",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇵🇭",
+            "animated": false
+          },
+          "role_ids": [
+            "1536542372127572028"
+          ],
+          "channel_ids": [
+            "1536508734530920570"
+          ]
+        },
+        {
+          "id": "1543137179365023805",
+          "title": "Français",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇫🇷",
+            "animated": false
+          },
+          "role_ids": [
+            "1536542281593782292"
+          ],
+          "channel_ids": [
+            "1536525721584017548"
+          ]
+        },
+        {
+          "id": "1543137179365023806",
+          "title": "Русский",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇷🇺",
+            "animated": false
+          },
+          "role_ids": [
+            "1540062171965431949"
+          ],
+          "channel_ids": [
+            "1538166128017412096"
+          ]
+        },
+        {
+          "id": "1543137179365023807",
+          "title": "العربية",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇸🇦",
+            "animated": false
+          },
+          "role_ids": [
+            "1540062337111953448"
+          ],
+          "channel_ids": [
+            "1538166161873567794"
+          ]
+        },
+        {
+          "id": "1543137179365023808",
+          "title": "Norsk",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": "🇳🇴",
+            "animated": false
+          },
+          "role_ids": [
+            "1540062640171126904"
+          ],
+          "channel_ids": [
+            "1538637390149587025"
+          ]
+        }
+      ],
+      "single_select": true,
+      "required": true,
+      "in_onboarding": true,
+      "type": 1
+    },
+    {
+      "id": "1543137179365023809",
+      "title": "What is your Guardsmen level?",
+      "options": [
+        {
+          "id": "1543137179365023812",
+          "title": "G1",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136199281999882"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179365023813",
+          "title": "G2",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136201244934144"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179423866900",
+          "title": "G3",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136203040100456"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179423866901",
+          "title": "G4",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136205636640778"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179423866902",
+          "title": "G5",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136208300019764"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179423866903",
+          "title": "G6",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136210539651102"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179423866904",
+          "title": "G7",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136212225884230"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179423866905",
+          "title": "G8",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136214360531044"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179423866906",
+          "title": "G9",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136216562671708"
+          ],
+          "channel_ids": []
+        }
+      ],
+      "single_select": true,
+      "required": true,
+      "in_onboarding": true,
+      "type": 1
+    },
+    {
+      "id": "1543137179423866907",
+      "title": "What is your Monsters level?",
+      "options": [
+        {
+          "id": "1543137179478528030",
+          "title": "M1",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136218118885418"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179478528031",
+          "title": "M2",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136220094136351"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179478528032",
+          "title": "M3",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136221851553812"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179478528033",
+          "title": "M4",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136224225656845"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179478528034",
+          "title": "M5",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136225743872052"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179478528035",
+          "title": "M6",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136227874578473"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179478528036",
+          "title": "M7",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136229904879727"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179478528037",
+          "title": "M8",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136231741980735"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179478528038",
+          "title": "M9",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136234199584788"
+          ],
+          "channel_ids": []
+        }
+      ],
+      "single_select": true,
+      "required": true,
+      "in_onboarding": true,
+      "type": 1
+    },
+    {
+      "id": "1543137179478528039",
+      "title": "What is your Specialists level?",
+      "options": [
+        {
+          "id": "1543137179490844744",
+          "title": "S1",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136236250730597"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179490844745",
+          "title": "S2",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136237739704415"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179490844746",
+          "title": "S3",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136239623086082"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179490844747",
+          "title": "S4",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136241586016396"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179490844748",
+          "title": "S5",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136243347357716"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179490844749",
+          "title": "S6",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136245360758834"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179490844750",
+          "title": "S7",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136247000727622"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179490844751",
+          "title": "S8",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136248628256860"
+          ],
+          "channel_ids": []
+        },
+        {
+          "id": "1543137179537244160",
+          "title": "S9",
+          "description": "",
+          "emoji": {
+            "id": null,
+            "name": null,
+            "animated": false
+          },
+          "role_ids": [
+            "1543136250419085313"
+          ],
+          "channel_ids": []
+        }
+      ],
+      "single_select": true,
+      "required": true,
+      "in_onboarding": true,
+      "type": 1
+    },
+    {
       "id": "1536560623603814400",
       "title": "Do you want ping notifications for events and announcements?",
       "options": [
@@ -34,15 +612,15 @@
         }
       ],
       "single_select": true,
-      "required": true,
-      "in_onboarding": true,
+      "required": false,
+      "in_onboarding": false,
       "type": 0
     }
   ],
   "default_channel_ids": [
     "1536546915678949488",
-    "1536548034891227166",
     "1540724448649289778",
+    "1536548034891227166",
     "1542964851805257858"
   ],
   "enabled": true,

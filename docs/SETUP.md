@@ -75,13 +75,19 @@ RANK_ROLE_MAP=Leader:555555555555555555,Superior:666666666666666666
 LANGUAGE_ROLE_MAP=EN:111111111111111111,ES:222222222222222222,DE:333333333333333333
 ```
 
-### Post-verification profile
+### Native Discord profile
 
-Do not use Community Onboarding to assign language or troop-level roles. OZY Admin collects the preferred language plus Guardsmen, Monsters, and Specialists levels only after leadership approves the roster identity.
+Community Onboarding collects preferred language plus Guardsmen, Monsters and
+Specialists levels. Each answer assigns a zero-permission metadata role. OZY
+Admin mirrors those roles into `member_profiles` using
+`profile_source=discord-onboarding`.
 
-G/M/S are stored as profile data, not Discord roles. The preferred language maps to exactly one configured language role through `LANGUAGE_ROLE_MAP`.
+The metadata roles do not grant clan access. `Verified` / `Special Access`
+remain the access gate. Members edit language/G/M/S through Discord **Channels
+& Roles**; `/profile` only displays the mirrored structured profile.
 
-The authoritative flow is: Unverified -> roster suggestion/exact claim -> leadership approval -> Verified -> Complete OZY profile.
+The authoritative flow is: native Onboarding -> roster identity claim ->
+leadership approval -> Verified.
 
 ## 6. Connect PeekABoo data
 
@@ -195,10 +201,10 @@ Expected behavior:
 - if the Discord server display name exactly matches an active roster name, the bot identifies it but keeps the link pending by default;
 - leadership approves the identity from the private verification queue; `/member-link` remains the manual fallback;
 - if the name is not an exact active-roster match, the verification form rejects it and asks for the precise Total Battle name, with close roster suggestions when available;
-- after approval, the member completes preferred language plus G/M/S; G/M/S are stored as profile data and the language role is synchronized by OZY Admin;
+- Discord Onboarding collects language + G/M/S; OZY Admin mirrors those metadata roles into structured profile fields;
 - an already-approved Discord account that leaves and rejoins keeps its stable Total Battle identity link; access is restored only if that identity is still in the active roster;
 - if Membership Screening leaves the member pending, the welcome workflow waits until screening is complete;
-- Discord Community Onboarding does not assign language roles; OZY Admin grants one only after verification.
+- Discord Community Onboarding assigns language/G/M/S metadata roles; those roles grant no clan access.
 
 
 ## Local verification

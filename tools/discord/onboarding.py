@@ -11,13 +11,17 @@ from pathlib import Path
 
 API_BASE = "https://discord.com/api/v10"
 
-# OZY roles that onboarding must NOT assign before roster verification.
+# Access-control roles must never be assigned by native onboarding.
+# Language and G/M/S roles are metadata only and are intentionally allowed.
 PROTECTED_ROLE_IDS = {
     "1536675686029467658": "Leader",
     "1536676026288181319": "Superior",
     "1542765585606254634": "Unverified",
     "1542765587023925298": "Verified",
     "1542765588475281408": "Special Access",
+}
+
+METADATA_ROLE_IDS = {
     "1536541947173408839": "EN",
     "1536542118611263609": "ES",
     "1540062337111953448": "AR",
@@ -28,7 +32,37 @@ PROTECTED_ROLE_IDS = {
     "1536542159459586128": "PT",
     "1536542203319681146": "SV",
     "1540062171965431949": "RU",
+    "1543136199281999882": "G1",
+    "1543136201244934144": "G2",
+    "1543136203040100456": "G3",
+    "1543136205636640778": "G4",
+    "1543136208300019764": "G5",
+    "1543136210539651102": "G6",
+    "1543136212225884230": "G7",
+    "1543136214360531044": "G8",
+    "1543136216562671708": "G9",
+    "1543136218118885418": "M1",
+    "1543136220094136351": "M2",
+    "1543136221851553812": "M3",
+    "1543136224225656845": "M4",
+    "1543136225743872052": "M5",
+    "1543136227874578473": "M6",
+    "1543136229904879727": "M7",
+    "1543136231741980735": "M8",
+    "1543136234199584788": "M9",
+    "1543136236250730597": "S1",
+    "1543136237739704415": "S2",
+    "1543136239623086082": "S3",
+    "1543136241586016396": "S4",
+    "1543136243347357716": "S5",
+    "1543136245360758834": "S6",
+    "1543136247000727622": "S7",
+    "1543136248628256860": "S8",
+    "1543136250419085313": "S9",
+    "1536560870530879509": "Events",
+    "1536561639388749955": "Silent",
 }
+
 
 KNOWN_CHANNELS = {
     "1536546915678949488": "rules",
@@ -176,7 +210,7 @@ def summarize(config: dict) -> None:
         for option in prompt.get("options", []):
             channels = [name_channel(str(x)) for x in option.get("channel_ids", [])]
             roles = [
-                PROTECTED_ROLE_IDS.get(str(x), str(x))
+                PROTECTED_ROLE_IDS.get(str(x), METADATA_ROLE_IDS.get(str(x), str(x)))
                 for x in option.get("role_ids", [])
             ]
             print(f"       - {option.get('title', '(untitled)')}")
@@ -199,7 +233,7 @@ def lint(config: dict) -> list[str]:
                     warnings.append(
                         f'Prompt "{ptitle}" option "{otitle}" assigns protected role '
                         f'{PROTECTED_ROLE_IDS[role_id]} ({role_id}). '
-                        "OZY verification policy says onboarding must not grant this role."
+                        "OZY access policy says native onboarding must not grant access-control roles."
                     )
 
     for channel_id in map(str, config.get("default_channel_ids", [])):

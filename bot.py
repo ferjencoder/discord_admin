@@ -18,7 +18,8 @@ from ozy.data_provider import DataProvider, DataUnavailable
 from settings import ConfigError, Settings, load_settings
 from ozy.state import AdminState
 from ozy.utils import format_chat_directory, format_chest_ranking_blocks, format_schedule, safe_code_block, truncate
-from ozy.constants import PROFILE_LANGUAGES, PROFILE_LANGUAGE_CODES, PROFILE_LEVELS
+from ozy.constants import PROFILE_LANGUAGES
+from ozy.onboarding_profile import extract_onboarding_profile
 from ozy.discord_ui import (
     AnnouncementModal,
     EventScheduleView,
@@ -26,8 +27,6 @@ from ozy.discord_ui import (
     MembershipVerificationModal,
     MembershipVerificationRetryView,
     MembershipVerificationView,
-    PostVerificationProfileModal,
-    PostVerificationProfileView,
     RosterSuggestionView,
     VerificationRejectModal,
     VerificationReviewView,
@@ -139,7 +138,6 @@ class OZYAdminBot(discord.Client):
         # Persistent welcome verification button. Register it before command
         # sync so old welcome messages keep working after a restart/redeploy.
         self.add_view(MembershipVerificationView(self))
-        self.add_view(PostVerificationProfileView(self))
 
         # Re-register persistent leadership approve/reject controls for every
         # pending claim so buttons posted before a restart keep working.
@@ -438,6 +436,7 @@ class OZYAdminBot(discord.Client):
         source: str,
         game_user_id: str | None = None,
     ) -> None:
+        self._sync_profile_from_onboarding_roles(member)
         previous = self.state.get_verification_request_record(member.id)
         self.state.set_verification_request(
             member.id,
@@ -680,7 +679,7 @@ class OZYAdminBot(discord.Client):
                 reason=reason,
                 role_result=role_result,
             )
-        await self._send_post_verification_profile_prompt(target, canonical, role_result=role_result)
+        self._sync_profile_from_onboarding_roles(target)
         approved_profile = self.state.get_member_profile(target.id)
         profile_text = ""
         if approved_profile and approved_profile.profile_complete:
@@ -716,49 +715,64 @@ class OZYAdminBot(discord.Client):
             return None
         return guild.get_member(interaction.user.id)
 
-    def _language_role_for_code(self, guild: discord.Guild, code: str) -> discord.Role | None:
-        code = code.strip().upper()
-        configured_id = self.settings.language_role_map.get(code)
-        if configured_id:
-            return guild.get_role(configured_id)
-        # Safe fallback for the current OZY server where language roles are
-        # named exactly EN / ES / AR / DE / FR / NO / CEB / PT / SV / RU.
-        return discord.utils.find(lambda role: role.name.upper() == code, guild.roles)
+    def _sync_profile_from_onboarding_roles(self, member: discord.Member) -> str:
+        """Mirror native Discord Onboarding metadata roles into OZY state.
 
-    def _language_role_ids(self, guild: discord.Guild) -> set[int]:
-        ids: set[int] = set(self.settings.language_role_map.values())
-        for code in PROFILE_LANGUAGE_CODES:
-            role = self._language_role_for_code(guild, code)
-            if role:
-                ids.add(role.id)
-        return ids
+        Discord owns the member-facing language/G/M/S choices. OZY state keeps a
+        durable structured mirror for reports, verification cards and APIs.
+        Access is not derived from these metadata roles.
+        """
+        selection = extract_onboarding_profile(
+            ((role.id, role.name) for role in member.roles),
+            self.settings.language_role_map,
+        )
+        if not selection.complete:
+            missing: list[str] = []
+            if selection.preferred_language is None:
+                missing.append("language")
+            if selection.guardsmen_level is None:
+                missing.append("G")
+            if selection.monsters_level is None:
+                missing.append("M")
+            if selection.specialists_level is None:
+                missing.append("S")
+            detail = ", ".join(selection.issues or tuple(f"missing {item}" for item in missing))
+            return f"onboarding profile incomplete ({detail or 'unknown'})"
 
-    async def _sync_language_role(self, member: discord.Member, code: str) -> str:
-        code = code.strip().upper()
-        if code not in PROFILE_LANGUAGE_CODES:
-            return f"unsupported language {code}"
+        existing = self.state.get_member_profile(member.id)
+        desired = (
+            selection.preferred_language,
+            selection.guardsmen_level,
+            selection.monsters_level,
+            selection.specialists_level,
+        )
+        if existing is not None:
+            current = (
+                existing.preferred_language,
+                existing.guardsmen_level,
+                existing.monsters_level,
+                existing.specialists_level,
+            )
+            if current == desired:
+                return (
+                    f"{selection.preferred_language} / G{selection.guardsmen_level} / "
+                    f"M{selection.monsters_level} / S{selection.specialists_level}"
+                )
 
-        target = self._language_role_for_code(member.guild, code)
-        if target is None:
-            return f"language role {code} is not configured/found"
-
-        me = member.guild.me
-        if me is None or target >= me.top_role:
-            return f"cannot manage language role {target.name}; check role hierarchy"
-
-        language_ids = self._language_role_ids(member.guild)
-        remove_roles = [
-            role for role in member.roles
-            if role.id in language_ids and role.id != target.id
-        ]
-        try:
-            if remove_roles:
-                await member.remove_roles(*remove_roles, reason=f"OZY preferred language -> {code}")
-            if target not in member.roles:
-                await member.add_roles(target, reason=f"OZY preferred language -> {code}")
-        except discord.HTTPException as exc:
-            return f"language role update failed: {exc}"
-        return f"{code} -> {target.name}"
+        self.state.set_member_profile_details(
+            member.id,
+            preferred_language=selection.preferred_language,
+            guardsmen_level=selection.guardsmen_level,
+            monsters_level=selection.monsters_level,
+            specialists_level=selection.specialists_level,
+            source="discord-onboarding",
+            game_name=(existing.game_name if existing else None),
+            game_user_id=(existing.game_user_id if existing else None),
+        )
+        return (
+            f"{selection.preferred_language} / G{selection.guardsmen_level} / "
+            f"M{selection.monsters_level} / S{selection.specialists_level}"
+        )
 
     async def _open_membership_verification(
         self,
@@ -815,6 +829,7 @@ class OZYAdminBot(discord.Client):
         if member is None or member.guild.id != self.settings.server_id:
             await interaction.response.send_message("This verification only works inside the OZY server.", ephemeral=True)
             return
+        self._sync_profile_from_onboarding_roles(member)
         assert self.data is not None
         try:
             canonical, response, outcome = await self._process_verification_claim(
@@ -839,164 +854,6 @@ class OZYAdminBot(discord.Client):
             )
         else:
             await interaction.response.send_message(response, ephemeral=True)
-
-    async def _open_post_verification_profile(self, interaction: discord.Interaction) -> None:
-        member = self._member_from_interaction(interaction)
-        if member is None:
-            await interaction.response.send_message("I could not resolve your OZY server membership.", ephemeral=True)
-            return
-        assert self.data is not None
-        link = self.state.get_link_record(member.id)
-        if link is None:
-            await interaction.response.send_message(
-                "Complete OZY membership verification first. Your language and G/M/S profile unlocks after the roster link is approved.",
-                ephemeral=True,
-            )
-            return
-        try:
-            info = await self.data.resolve_roster_member(
-                game_name=link.game_name,
-                game_user_id=link.game_user_id,
-            )
-        except DataUnavailable as exc:
-            await interaction.response.send_message(f"Roster unavailable: {exc}", ephemeral=True)
-            return
-        if info is None:
-            await interaction.response.send_message(
-                "Your saved roster identity is not currently active. Ask leadership to review the link before editing your profile.",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.send_modal(PostVerificationProfileModal(self, member=member))
-
-    async def _submit_post_verification_profile(
-        self,
-        interaction: discord.Interaction,
-        *,
-        preferred_language: str,
-        guardsmen_level: int,
-        monsters_level: int,
-        specialists_level: int,
-    ) -> None:
-        member = self._member_from_interaction(interaction)
-        if member is None:
-            await interaction.response.send_message("I could not resolve your OZY server membership.", ephemeral=True)
-            return
-
-        language = preferred_language.strip().upper()
-        if language not in PROFILE_LANGUAGE_CODES:
-            await interaction.response.send_message("Select a supported OZY language.", ephemeral=True)
-            return
-        if any(level not in PROFILE_LEVELS for level in (guardsmen_level, monsters_level, specialists_level)):
-            await interaction.response.send_message("G, M and S levels must each be between 1 and 9.", ephemeral=True)
-            return
-
-        link = self.state.get_link_record(member.id)
-        if link is None:
-            await interaction.response.send_message("Membership verification must be approved before profile setup.", ephemeral=True)
-            return
-        assert self.data is not None
-        try:
-            info = await self.data.resolve_roster_member(
-                game_name=link.game_name,
-                game_user_id=link.game_user_id,
-            )
-        except DataUnavailable as exc:
-            await interaction.response.send_message(f"Roster unavailable: {exc}", ephemeral=True)
-            return
-        if info is None:
-            await interaction.response.send_message("Your linked roster identity is no longer active.", ephemeral=True)
-            return
-
-        canonical = str(info["name"])
-        stable_id = str(info.get("user_id", "")).strip() or None
-        role_result = await self._sync_language_role(member, language)
-        if role_result.startswith(("unsupported", "language role", "cannot manage")):
-            await interaction.response.send_message(
-                f"Your profile was not saved because the language role could not be updated: {role_result}",
-                ephemeral=True,
-            )
-            return
-
-        self.state.set_member_profile_details(
-            member.id,
-            preferred_language=language,
-            guardsmen_level=guardsmen_level,
-            monsters_level=monsters_level,
-            specialists_level=specialists_level,
-            source="post-verification-profile",
-            game_name=canonical,
-            game_user_id=stable_id,
-        )
-        self.state.set_link(
-            member.id,
-            canonical,
-            "post-verification-profile-refresh",
-            game_user_id=stable_id,
-        )
-        language_label = dict(PROFILE_LANGUAGES).get(language, language)
-        await self._audit(
-            "Member profile updated",
-            str(member),
-            f"Game name: {canonical}\nLanguage: {language}\nG{guardsmen_level} / M{monsters_level} / S{specialists_level}\nRole sync: {role_result}",
-        )
-        await interaction.response.send_message(
-            f"OZY profile saved for **{canonical}**.\n"
-            f"Language: **{language_label} ({language})**\n"
-            f"Troops: **G{guardsmen_level} / M{monsters_level} / S{specialists_level}**\n"
-            f"Language role: {role_result}",
-            ephemeral=True,
-        )
-
-    async def _send_post_verification_profile_prompt(
-        self,
-        member: discord.Member,
-        canonical: str,
-        *,
-        role_result: str | None = None,
-    ) -> bool:
-        profile = self.state.get_member_profile(member.id)
-        if profile and profile.profile_complete:
-            return True
-
-        embed = discord.Embed(
-            title="OZY membership approved",
-            description=f"You are verified as **{canonical}**.",
-            color=0x10B981,
-        )
-        if role_result:
-            embed.add_field(name="Access", value=role_result, inline=False)
-        embed.add_field(
-            name="Complete your profile",
-            value=(
-                "Choose your preferred language and your current **Guardsmen (G)**, "
-                "**Monsters (M)** and **Specialists (S)** levels. The language choice "
-                "also unlocks the matching language channel."
-            ),
-            inline=False,
-        )
-        view = PostVerificationProfileView(self)
-        try:
-            await member.send(embed=embed, view=view)
-            return True
-        except discord.HTTPException:
-            pass
-
-        if self.settings.welcome_channel_id:
-            channel = self.get_channel(self.settings.welcome_channel_id)
-            if isinstance(channel, discord.TextChannel):
-                try:
-                    await channel.send(
-                        content=member.mention,
-                        embed=embed,
-                        view=view,
-                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-                    )
-                    return True
-                except discord.HTTPException:
-                    pass
-        return False
-
 
     async def _process_verification_claim(
         self,
@@ -1065,7 +922,7 @@ class OZYAdminBot(discord.Client):
             )
             self.state.clear_verification_request(member.id)
             role_result = await self._sync_rank_role(member, canonical)
-            await self._send_post_verification_profile_prompt(member, canonical, role_result=role_result)
+            self._sync_profile_from_onboarding_roles(member)
             return canonical, f"Linked to **{canonical}**. Role sync: {role_result}.", f"auto-approved; {role_result}"
 
         await self._queue_verification_request(
@@ -1076,8 +933,8 @@ class OZYAdminBot(discord.Client):
         )
         return (
             canonical,
-            f"Exact roster name found: **{canonical}**. Your name, language and troop levels were submitted together. "
-            "Your request is waiting for leadership approval; normal server access stays locked until approval.",
+            f"Exact roster name found: **{canonical}**. Your onboarding profile is already recorded from Discord. "
+            "Your roster identity is waiting for leadership approval; normal clan access stays locked until approval.",
             "pending leadership approval",
         )
 
@@ -1086,30 +943,26 @@ class OZYAdminBot(discord.Client):
         interaction: discord.Interaction,
         *,
         game_name: str,
-        preferred_language: str,
-        guardsmen_level: int,
-        monsters_level: int,
-        specialists_level: int,
     ) -> None:
+        """Submit only the roster identity claim.
+
+        Language and G/M/S come from Discord Community Onboarding and are
+        mirrored into the OZY profile automatically from member roles.
+        """
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if member is None or member.guild.id != self.settings.server_id:
             await interaction.response.send_message("This verification only works inside the OZY server.", ephemeral=True)
             return
 
-        language = preferred_language.strip().upper()
-        if language not in PROFILE_LANGUAGE_CODES:
-            await interaction.response.send_message("Select a supported OZY language.", ephemeral=True)
-            return
-        if any(level not in PROFILE_LEVELS for level in (guardsmen_level, monsters_level, specialists_level)):
-            await interaction.response.send_message("G, M and S levels must each be between 1 and 9.", ephemeral=True)
-            return
+        # Capture native onboarding selections before leadership sees the claim.
+        self._sync_profile_from_onboarding_roles(member)
 
         assert self.data is not None
         try:
             canonical, response, outcome = await self._process_verification_claim(
                 member,
                 game_name,
-                source="verification-modal",
+                source="verification-name",
             )
         except DataUnavailable as exc:
             await interaction.response.send_message(
@@ -1118,35 +971,10 @@ class OZYAdminBot(discord.Client):
             )
             return
 
-        if canonical is not None:
-            info = await self.data.member_info(canonical)
-            stable_id = str((info or {}).get("user_id", "")).strip() or None
-            self.state.set_member_profile_details(
-                member.id,
-                preferred_language=language,
-                guardsmen_level=guardsmen_level,
-                monsters_level=monsters_level,
-                specialists_level=specialists_level,
-                source="verification-submission",
-                game_name=canonical,
-                game_user_id=stable_id,
-            )
-            # The claim is queued before profile persistence inside
-            # _process_verification_claim. Refresh the same queue message now so
-            # leadership reviews the complete submission in one card.
-            if self.state.get_verification_request_record(member.id) is not None:
-                await self._publish_verification_request(member.id)
-            elif outcome.startswith("already linked") or outcome.startswith("auto-approved"):
-                await self._sync_language_role(member, language)
-
         await self._audit(
             "Roster verification request",
             str(member),
-            (
-                f"Game name: {canonical or game_name.strip()}\n"
-                f"Profile: {language} / G{guardsmen_level} / M{monsters_level} / S{specialists_level}\n"
-                f"Outcome: {outcome}"
-            ),
+            f"Game name: {canonical or game_name.strip()}\nOutcome: {outcome}",
         )
 
         if canonical is None:
@@ -1239,14 +1067,9 @@ class OZYAdminBot(discord.Client):
                 add_roles.append(unverified)
             state = "unverified"
 
-            # Language channels are post-verification. If Discord Community
-            # Onboarding, a stale role, or a manual assignment gave a language
-            # role early, remove it while the member is unverified.
-            language_ids = self._language_role_ids(guild)
-            remove_roles.extend(
-                role for role in member.roles
-                if role.id in language_ids and role not in remove_roles
-            )
+            # Native Onboarding language/G/M/S roles are profile metadata only.
+            # They are safe to keep before verification because clan channel
+            # access is gated separately by Verified/Special Access.
 
         # Roster rank roles are never kept for non-roster exceptions.
         if not active_roster_member:
@@ -1280,30 +1103,22 @@ class OZYAdminBot(discord.Client):
         )
 
         access_result = await self._sync_access_roles(member, active_roster_member=True)
-        profile = self.state.get_member_profile(member.id)
-        language_result: str | None = None
-        if profile and profile.preferred_language:
-            language_result = await self._sync_language_role(member, profile.preferred_language)
-
-        def with_language(text: str) -> str:
-            if language_result:
-                return f"{text}; language {language_result}"
-            return text
+        self._sync_profile_from_onboarding_roles(member)
 
         rank = str(info.get("rank", "")).strip()
         if not rank:
-            return with_language(f"{access_result}; roster rank is blank")
+            return f"{access_result}; roster rank is blank"
         target_role_id = self.settings.rank_role_map.get(rank.casefold())
         if target_role_id is None:
-            return with_language(f"{access_result}; no Discord role configured for roster rank {rank}")
+            return f"{access_result}; no Discord role configured for roster rank {rank}"
 
         guild = member.guild
         target_role = guild.get_role(target_role_id)
         if target_role is None:
-            return with_language(f"configured role {target_role_id} no longer exists")
+            return f"configured role {target_role_id} no longer exists"
         me = guild.me
         if me is None or target_role >= me.top_role:
-            return with_language(f"cannot manage role {target_role.name}; check role hierarchy")
+            return f"cannot manage role {target_role.name}; check role hierarchy"
 
         managed_ids = set(self.settings.rank_role_map.values())
         remove_roles = [r for r in member.roles if r.id in managed_ids and r.id != target_role_id]
@@ -1322,7 +1137,7 @@ class OZYAdminBot(discord.Client):
             except discord.HTTPException as exc:
                 log.warning("Nickname sync failed for %s: %s", member.id, exc)
 
-        return with_language(f"{access_result}; {rank} -> {target_role.name}")
+        return f"{access_result}; {rank} -> {target_role.name}"
 
     # ------------------------------------------------------------------
     # Welcome / roster verification
@@ -1332,9 +1147,10 @@ class OZYAdminBot(discord.Client):
             return
         assert self.data is not None
 
-        # New arrivals start without clan access until their stable roster
-        # identity is approved. This also strips any language role that may have
-        # leaked from Discord Onboarding before verification.
+        # Native Discord Onboarding has already collected language + G/M/S.
+        # Mirror those metadata roles first, then keep clan access locked until
+        # the roster identity is approved.
+        onboarding_profile = self._sync_profile_from_onboarding_roles(member)
         await self._sync_access_roles(member, active_roster_member=False)
 
         matched_name: str | None = None
@@ -1425,24 +1241,32 @@ class OZYAdminBot(discord.Client):
                         ),
                         inline=False,
                     )
+                profile = self.state.get_member_profile(member.id)
+                if profile and profile.profile_complete:
+                    language_label = dict(PROFILE_LANGUAGES).get(
+                        profile.preferred_language or "", profile.preferred_language or "Unknown"
+                    )
+                    embed.add_field(
+                        name="Your onboarding profile",
+                        value=(
+                            f"**{language_label}** · "
+                            f"**G{profile.guardsmen_level} / M{profile.monsters_level} / S{profile.specialists_level}**"
+                        ),
+                        inline=False,
+                    )
                 embed.add_field(
-                    name="After approval",
-                    value="You will choose your preferred language and enter your **G / M / S** troop levels.",
+                    name="What happens next",
+                    value="Confirm your Total Battle roster name. Leadership approves the identity link, then clan access opens.",
                     inline=False,
                 )
                 embed.add_field(
                     name="Useful commands",
-                    value="`/verify` - submit name + language + G/M/S\n`/profile` - edit language or troop levels later\n`/chests` - your chest status\n`/away` - register an absence",
+                    value="`/verify` - enter your exact Total Battle name if needed\n`/profile` - view your onboarding profile\n`/chests` - your chest status\n`/away` - register an absence",
                     inline=False,
                 )
 
                 if approved_link:
-                    profile = self.state.get_member_profile(member.id)
-                    view: discord.ui.View | None = (
-                        PostVerificationProfileView(self)
-                        if not (profile and profile.profile_complete)
-                        else None
-                    )
+                    view: discord.ui.View | None = None
                 elif suggestions:
                     view = RosterSuggestionView(self, member.id, suggestions)
                 else:
@@ -1455,14 +1279,12 @@ class OZYAdminBot(discord.Client):
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                 )
 
-        if approved_link and matched_name:
-            await self._send_post_verification_profile_prompt(member, matched_name, role_result=role_result)
-
         self.state.mark_welcomed(member.id)
         await self._audit(
             "Member joined",
             str(member),
             f"Discord ID: {member.id}\nExisting roster link: {matched_name if linked_rejoin else 'none'}\n"
+            f"Onboarding profile: {onboarding_profile}\n"
             f"Roster suggestions: {', '.join(suggestions) or 'none'}",
         )
 
@@ -1514,16 +1336,11 @@ class OZYAdminBot(discord.Client):
             await self._process_new_member(after)
 
         if {role.id for role in before.roles} != {role.id for role in after.roles}:
-            # Keep language selection post-verification. If an unlinked account
-            # receives a language/access role from stale Community Onboarding or
-            # a manual edit, normalize it back to Unverified. Approved members
-            # are normalized to the one preferred language stored in their profile.
+            # Discord Community Onboarding is the member-facing source for
+            # language + G/M/S. Mirror those metadata roles into structured state.
+            self._sync_profile_from_onboarding_roles(after)
             if self.state.get_link_record(after.id) is None:
                 await self._sync_access_roles(after, active_roster_member=False)
-            else:
-                profile = self.state.get_member_profile(after.id)
-                if profile and profile.preferred_language:
-                    await self._sync_language_role(after, profile.preferred_language)
 
         if before.display_name == after.display_name:
             return
@@ -2340,7 +2157,7 @@ class OZYAdminBot(discord.Client):
             matches = [x for x in items if not q or q in x["label"].casefold() or q in x["key"].casefold()]
             return [app_commands.Choice(name=x["label"], value=x["key"]) for x in matches[:25]]
 
-        @self.tree.command(name="verify", description="Submit your OZY name, language and G/M/S profile")
+        @self.tree.command(name="verify", description="Confirm your Total Battle roster name")
         @app_commands.describe(game_name="Optional roster name suggestion used to pre-fill the join form")
         async def verify(interaction: discord.Interaction, game_name: Optional[str] = None) -> None:
             if not isinstance(interaction.user, discord.Member):
@@ -2398,7 +2215,7 @@ class OZYAdminBot(discord.Client):
                     game_user_id=stable_id,
                 )
                 role_result = await self._sync_rank_role(member, canonical)
-                await self._send_post_verification_profile_prompt(member, canonical, role_result=role_result)
+                self._sync_profile_from_onboarding_roles(member)
                 if pending_request:
                     resolved = self.state.resolve_verification_request(
                         member.id,
@@ -2497,9 +2314,32 @@ class OZYAdminBot(discord.Client):
                 candidates += [m.name for m in suggestions if m.name not in candidates]
             return [app_commands.Choice(name=name[:100], value=name) for name in candidates[:25]]
 
-        @self.tree.command(name="profile", description="Complete or edit your OZY language and G/M/S profile")
+        @self.tree.command(name="profile", description="Show your OZY onboarding profile")
         async def profile(interaction: discord.Interaction) -> None:
-            await self._open_post_verification_profile(interaction)
+            member = self._member_from_interaction(interaction)
+            if member is None:
+                await interaction.response.send_message("I could not resolve your OZY server membership.", ephemeral=True)
+                return
+            sync_result = self._sync_profile_from_onboarding_roles(member)
+            profile_data = self.state.get_member_profile(member.id)
+            if not profile_data or not profile_data.profile_complete:
+                await interaction.response.send_message(
+                    "Your native Discord onboarding profile is incomplete. Open **Channels & Roles** and choose "
+                    "your language plus G/M/S levels, then run `/profile` again.\n\n"
+                    f"Current read: {sync_result}",
+                    ephemeral=True,
+                )
+                return
+            language_label = dict(PROFILE_LANGUAGES).get(
+                profile_data.preferred_language or "", profile_data.preferred_language or "Unknown"
+            )
+            await interaction.response.send_message(
+                f"**OZY profile**\n"
+                f"Language: **{language_label} ({profile_data.preferred_language})**\n"
+                f"Troops: **G{profile_data.guardsmen_level} / M{profile_data.monsters_level} / S{profile_data.specialists_level}**\n\n"
+                "To change these, update your answers in Discord **Channels & Roles**.",
+                ephemeral=True,
+            )
 
         @self.tree.command(name="member", description="Show roster/link status for yourself or a member")
         @app_commands.describe(member="Optional Discord member; leadership can inspect others")

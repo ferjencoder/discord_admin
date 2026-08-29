@@ -1,11 +1,10 @@
 {
-  "schema_version": 1,
-  "notes": "Core OZY roles only. G/M/S levels are member profile data, not Discord roles.",
-  "roles": [
+  "schema_version": 2,
+  "notes": "Access roles are separate from native-onboarding metadata roles. Language and G/M/S metadata roles have zero permissions and never grant clan access.",
+  "access_roles": [
     {
       "key": "unverified",
       "name": "Unverified",
-      "color": 0,
       "permissions": [],
       "hoist": false,
       "mentionable": false
@@ -13,7 +12,6 @@
     {
       "key": "verified",
       "name": "Verified",
-      "color": 0,
       "permissions": [],
       "hoist": false,
       "mentionable": false
@@ -21,7 +19,6 @@
     {
       "key": "special_access",
       "name": "Special Access",
-      "color": 0,
       "permissions": [],
       "hoist": false,
       "mentionable": false
@@ -29,31 +26,6 @@
     {
       "key": "away",
       "name": "Away",
-      "color": 0,
-      "permissions": [],
-      "hoist": false,
-      "mentionable": false
-    },
-    {
-      "key": "soldier",
-      "name": "Soldier",
-      "color": 0,
-      "permissions": [],
-      "hoist": false,
-      "mentionable": false
-    },
-    {
-      "key": "veteran",
-      "name": "Veteran",
-      "color": 0,
-      "permissions": [],
-      "hoist": false,
-      "mentionable": false
-    },
-    {
-      "key": "officer",
-      "name": "Officer",
-      "color": 0,
       "permissions": [],
       "hoist": false,
       "mentionable": false
@@ -61,7 +33,6 @@
     {
       "key": "superior",
       "name": "Superior",
-      "color": 0,
       "permissions": [],
       "hoist": true,
       "mentionable": false
@@ -69,10 +40,21 @@
     {
       "key": "leader",
       "name": "Leader",
-      "color": 0,
       "permissions": [],
       "hoist": true,
       "mentionable": false
     }
-  ]
+  ],
+  "metadata_roles": {
+    "languages": ["EN", "ES", "PT", "SV", "DE", "CEB", "FR", "RU", "AR", "NO"],
+    "guardsmen": ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9"],
+    "monsters": ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9"],
+    "specialists": ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"],
+    "rules": {
+      "permissions": [],
+      "hoist": false,
+      "mentionable": false,
+      "access_control": false
+    }
+  }
 }

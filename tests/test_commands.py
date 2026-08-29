@@ -22,6 +22,7 @@ def test_membership_verification_flow_is_registered():
     assert "class MembershipVerificationModal" in ui_source
     assert 'PROFILE_LANGUAGES = (' in constants_source
     assert 'PROFILE_LEVELS = tuple(range(1, 10))' in constants_source
+    assert 'from ozy.onboarding_profile import extract_onboarding_profile' in bot_source
     assert '@self.tree.command(name="profile"' in bot_source
     assert 'async def on_member_remove' in bot_source
     assert '"rejoin-existing-link"' in bot_source

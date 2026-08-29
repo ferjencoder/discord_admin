@@ -10,6 +10,7 @@ discord_admin/
 │   ├── data_provider.py   authoritative roster/chest/schedule reads
 │   ├── event_calendar.py  tournament/mini-event parsing and formatting logic
 │   ├── state.py           SQLite + OZY web snapshot persistence
+│   ├── onboarding_profile.py native Discord profile-role parser
 │   └── utils.py           presentation helpers
 ├── tools/discord/         manual server maintenance tools, never imported at runtime
 ├── config/discord/        onboarding/role/profile configuration artifacts
@@ -30,19 +31,21 @@ discord_admin/
 ## Membership flow
 
 ```text
-Join
--> Unverified
--> roster-name suggestions
--> exact roster claim
+Discord native Onboarding
+-> language + G/M/S metadata roles
+-> OZY Admin mirrors them into structured member_profiles
+-> roster-name suggestion / exact name fallback
 -> leadership approval
 -> Verified + Leader/Superior sync
--> post-verification profile
--> preferred language + G/M/S
 ```
 
-Roster suggestions are never proof of identity. Stable Total Battle `user_id` is the durable identity after approval.
+Discord owns the member-facing language/G/M/S choices. OZY Admin owns roster
+identity and authorization. Roster suggestions are never proof of identity.
+Stable Total Battle `user_id` is the durable identity after approval.
 
-G/M/S are profile data, not Discord roles. Language roles are granted only after verification.
+Language and G/M/S Discord roles are metadata only and grant no clan access.
+`Verified` / `Special Access` are the access gate. The database mirror is used
+for reports, verification cards and APIs.
 
 ## Data flow
 
