@@ -572,10 +572,11 @@ class VerificationReviewView(discord.ui.View):
         self.add_item(VerificationRejectButton(bot, target_user_id))
 
 class MembershipVerificationModal(discord.ui.Modal):
-    """Collect only the claimed Total Battle roster identity.
+    """Collect the complete member claim in one submission.
 
-    Language and G/M/S profile data are deliberately collected after leadership
-    approves the Discord -> Total Battle identity link.
+    Name, language and G/M/S are collected together so the member only has to
+    submit one form. Language access is not granted until leadership approves
+    the roster identity claim.
     """
 
     def __init__(
@@ -585,21 +586,71 @@ class MembershipVerificationModal(discord.ui.Modal):
         member: discord.Member,
         suggested_name: str | None = None,
     ):
-        super().__init__(title="Verify OZY Membership", timeout=300)
+        super().__init__(title="Join OZY", timeout=300)
         self.bot = bot
         self.member_id = member.id
+        profile = bot.state.get_member_profile(member.id)
 
-        # Keep the membership entry modal deliberately conservative.
-        # A plain TextInput is supported across Discord modal clients and avoids
-        # coupling this critical verification entry point to newer Label layouts.
         self.game_name = discord.ui.TextInput(
-            label="Exact Total Battle name",
             placeholder="Exact Total Battle name used in OZY",
-            default=(suggested_name or member.display_name)[:100],
+            default=(suggested_name or (profile.game_name if profile else None) or member.display_name)[:100],
             max_length=100,
             required=True,
         )
-        self.add_item(self.game_name)
+        self.add_item(
+            discord.ui.Label(
+                text="Total Battle name",
+                description="Use your exact current OZY roster name.",
+                component=self.game_name,
+            )
+        )
+
+        language_options = [
+            discord.SelectOption(
+                label=label,
+                value=code,
+                default=bool(profile and profile.preferred_language == code),
+            )
+            for code, label in PROFILE_LANGUAGES
+        ]
+        self.language = discord.ui.Select(
+            placeholder="Preferred language",
+            options=language_options,
+            min_values=1,
+            max_values=1,
+            required=True,
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="Preferred language",
+                description="Your language channel unlocks only after approval.",
+                component=self.language,
+            )
+        )
+
+        def level_select(prefix: str, current: int | None) -> discord.ui.Select:
+            return discord.ui.Select(
+                placeholder=f"{prefix} level",
+                options=[
+                    discord.SelectOption(
+                        label=f"{prefix}{level}",
+                        value=str(level),
+                        default=(current == level),
+                    )
+                    for level in PROFILE_LEVELS
+                ],
+                min_values=1,
+                max_values=1,
+                required=True,
+            )
+
+        self.guardsmen = level_select("G", profile.guardsmen_level if profile else None)
+        self.monsters = level_select("M", profile.monsters_level if profile else None)
+        self.specialists = level_select("S", profile.specialists_level if profile else None)
+
+        self.add_item(discord.ui.Label(text="Guardsmen level", component=self.guardsmen))
+        self.add_item(discord.ui.Label(text="Monsters level", component=self.monsters))
+        self.add_item(discord.ui.Label(text="Specialists level", component=self.specialists))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.member_id:
@@ -608,6 +659,10 @@ class MembershipVerificationModal(discord.ui.Modal):
         await self.bot._submit_membership_verification(
             interaction,
             game_name=str(self.game_name.value),
+            preferred_language=self.language.values[0],
+            guardsmen_level=int(self.guardsmen.values[0]),
+            monsters_level=int(self.monsters.values[0]),
+            specialists_level=int(self.specialists.values[0]),
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
@@ -634,8 +689,8 @@ class MembershipVerificationView(discord.ui.View):
         try:
             await self.bot._open_membership_verification(interaction)
         except Exception as exc:
-            log.exception("Could not open membership verification modal", exc_info=exc)
-            message = "I could not open the verification form. Try `/verify` or contact leadership."
+            log.exception("Could not open complete membership form", exc_info=exc)
+            message = "I could not open the OZY join form. Try `/verify` or contact leadership."
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
             else:
@@ -676,11 +731,11 @@ class RosterSuggestionSelect(discord.ui.Select):
             await interaction.response.send_message("These roster suggestions belong to another member.", ephemeral=True)
             return
         selected = self.values[0]
-        await self.bot._submit_suggested_roster_name(interaction, selected)
+        await self.bot._open_membership_verification(interaction, suggested_name=selected)
 
 
 class RosterSuggestionView(discord.ui.View):
-    """Join-time roster suggestions. Selecting one only creates a pending claim."""
+    """Join-time roster suggestions. Selecting one pre-fills the complete join form."""
 
     def __init__(self, bot: "OZYAdminBot", member_id: int, suggestions: list[str]):
         super().__init__(timeout=1800)

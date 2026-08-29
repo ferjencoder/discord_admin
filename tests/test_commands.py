@@ -19,7 +19,7 @@ def test_membership_verification_flow_is_registered():
     constants_source = _source("ozy/constants.py")
 
     assert 'custom_id="ozy:membership:verify"' in ui_source
-    assert 'title="Verify OZY Membership"' in ui_source
+    assert "class MembershipVerificationModal" in ui_source
     assert 'PROFILE_LANGUAGES = (' in constants_source
     assert 'PROFILE_LEVELS = tuple(range(1, 10))' in constants_source
     assert '@self.tree.command(name="profile"' in bot_source

@@ -482,6 +482,17 @@ class OZYAdminBot(discord.Client):
         )
         embed.add_field(name="Claimed OZY name", value=request.requested_game_name, inline=True)
         embed.add_field(name="Source", value=request.source, inline=True)
+        profile = self.state.get_member_profile(discord_user_id)
+        if profile and profile.profile_complete:
+            language_label = dict(PROFILE_LANGUAGES).get(profile.preferred_language or "", profile.preferred_language or "Unknown")
+            embed.add_field(
+                name="Submitted profile",
+                value=(
+                    f"Language: **{language_label} ({profile.preferred_language})**\n"
+                    f"Troops: **G{profile.guardsmen_level} / M{profile.monsters_level} / S{profile.specialists_level}**"
+                ),
+                inline=False,
+            )
         if request.requested_game_user_id:
             embed.set_footer(text=f"TB user ID: {request.requested_game_user_id}")
 
@@ -670,10 +681,18 @@ class OZYAdminBot(discord.Client):
                 role_result=role_result,
             )
         await self._send_post_verification_profile_prompt(target, canonical, role_result=role_result)
+        approved_profile = self.state.get_member_profile(target.id)
+        profile_text = ""
+        if approved_profile and approved_profile.profile_complete:
+            profile_text = (
+                f"\nProfile: {approved_profile.preferred_language} / "
+                f"G{approved_profile.guardsmen_level} / M{approved_profile.monsters_level} / "
+                f"S{approved_profile.specialists_level}"
+            )
         await self._audit(
             "Roster verification approved",
             str(reviewer),
-            f"Discord member: {target} ({target.id})\nGame name: {canonical}\nRole sync: {role_result}",
+            f"Discord member: {target} ({target.id})\nGame name: {canonical}{profile_text}\nRole sync: {role_result}",
         )
         if interaction.response.is_done():
             await interaction.followup.send(
@@ -1057,8 +1076,8 @@ class OZYAdminBot(discord.Client):
         )
         return (
             canonical,
-            f"Exact roster name found: **{canonical}**. Your request is waiting for leadership approval. "
-            "Normal server access stays locked until the Discord account is linked to that roster identity.",
+            f"Exact roster name found: **{canonical}**. Your name, language and troop levels were submitted together. "
+            "Your request is waiting for leadership approval; normal server access stays locked until approval.",
             "pending leadership approval",
         )
 
@@ -1067,10 +1086,22 @@ class OZYAdminBot(discord.Client):
         interaction: discord.Interaction,
         *,
         game_name: str,
+        preferred_language: str,
+        guardsmen_level: int,
+        monsters_level: int,
+        specialists_level: int,
     ) -> None:
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if member is None or member.guild.id != self.settings.server_id:
             await interaction.response.send_message("This verification only works inside the OZY server.", ephemeral=True)
+            return
+
+        language = preferred_language.strip().upper()
+        if language not in PROFILE_LANGUAGE_CODES:
+            await interaction.response.send_message("Select a supported OZY language.", ephemeral=True)
+            return
+        if any(level not in PROFILE_LEVELS for level in (guardsmen_level, monsters_level, specialists_level)):
+            await interaction.response.send_message("G, M and S levels must each be between 1 and 9.", ephemeral=True)
             return
 
         assert self.data is not None
@@ -1087,10 +1118,35 @@ class OZYAdminBot(discord.Client):
             )
             return
 
+        if canonical is not None:
+            info = await self.data.member_info(canonical)
+            stable_id = str((info or {}).get("user_id", "")).strip() or None
+            self.state.set_member_profile_details(
+                member.id,
+                preferred_language=language,
+                guardsmen_level=guardsmen_level,
+                monsters_level=monsters_level,
+                specialists_level=specialists_level,
+                source="verification-submission",
+                game_name=canonical,
+                game_user_id=stable_id,
+            )
+            # The claim is queued before profile persistence inside
+            # _process_verification_claim. Refresh the same queue message now so
+            # leadership reviews the complete submission in one card.
+            if self.state.get_verification_request_record(member.id) is not None:
+                await self._publish_verification_request(member.id)
+            elif outcome.startswith("already linked") or outcome.startswith("auto-approved"):
+                await self._sync_language_role(member, language)
+
         await self._audit(
             "Roster verification request",
             str(member),
-            f"Game name: {canonical or game_name.strip()}\nOutcome: {outcome}",
+            (
+                f"Game name: {canonical or game_name.strip()}\n"
+                f"Profile: {language} / G{guardsmen_level} / M{monsters_level} / S{specialists_level}\n"
+                f"Outcome: {outcome}"
+            ),
         )
 
         if canonical is None:
@@ -1376,7 +1432,7 @@ class OZYAdminBot(discord.Client):
                 )
                 embed.add_field(
                     name="Useful commands",
-                    value="`/verify` - roster identity\n`/profile` - language + G/M/S after approval\n`/chests` - your chest status\n`/away` - register an absence",
+                    value="`/verify` - submit name + language + G/M/S\n`/profile` - edit language or troop levels later\n`/chests` - your chest status\n`/away` - register an absence",
                     inline=False,
                 )
 
@@ -2284,39 +2340,13 @@ class OZYAdminBot(discord.Client):
             matches = [x for x in items if not q or q in x["label"].casefold() or q in x["key"].casefold()]
             return [app_commands.Choice(name=x["label"], value=x["key"]) for x in matches[:25]]
 
-        @self.tree.command(name="verify", description="Verify your OZY roster identity")
-        @app_commands.describe(game_name="Optional exact Total Battle name; leave blank to open the verification form")
+        @self.tree.command(name="verify", description="Submit your OZY name, language and G/M/S profile")
+        @app_commands.describe(game_name="Optional roster name suggestion used to pre-fill the join form")
         async def verify(interaction: discord.Interaction, game_name: Optional[str] = None) -> None:
             if not isinstance(interaction.user, discord.Member):
                 await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
                 return
-            if not game_name:
-                await self._open_membership_verification(interaction)
-                return
-            assert self.data is not None
-            try:
-                canonical, response, outcome = await self._process_verification_claim(
-                    interaction.user,
-                    game_name,
-                    source="self-verify",
-                )
-            except DataUnavailable as exc:
-                await interaction.response.send_message(f"Roster unavailable: {exc}", ephemeral=True)
-                return
-
-            await self._audit(
-                "Roster verification request",
-                str(interaction.user),
-                f"Game name: {canonical or game_name.strip()}\nOutcome: {outcome}",
-            )
-            if canonical is None:
-                await interaction.response.send_message(
-                    response,
-                    ephemeral=True,
-                    view=MembershipVerificationRetryView(self, interaction.user.id),
-                )
-            else:
-                await interaction.response.send_message(response, ephemeral=True)
+            await self._open_membership_verification(interaction, suggested_name=game_name)
 
         @verify.autocomplete("game_name")
         async def verify_autocomplete(interaction: discord.Interaction, current: str):
