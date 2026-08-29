@@ -48,8 +48,8 @@ There is no PostgreSQL backend in the current architecture.
 
 ## Persistence test
 
-1. Approve/link a test member.
-2. Confirm the profile/verification state exists.
+1. Link a test member with the game-name flow.
+2. Confirm the member link/profile state exists.
 3. Redeploy Render.
 4. Confirm the same state is restored after restart.
 

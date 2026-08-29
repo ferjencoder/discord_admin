@@ -13,25 +13,26 @@ def test_event_create_is_registered_and_required_in_sync():
     assert 'required_commands = {"event-create", "calendar", "today", "time"}' in source
 
 
-def test_membership_verification_flow_is_registered():
+def test_simple_member_setup_commands_are_registered():
     bot_source = _source("bot.py")
     ui_source = _source("ozy/discord_ui.py")
-    constants_source = _source("ozy/constants.py")
 
     assert 'custom_id="ozy:membership:verify"' in ui_source
-    assert "class MembershipVerificationModal" in ui_source
-    assert 'PROFILE_LANGUAGES = (' in constants_source
-    assert 'PROFILE_LEVELS = tuple(range(1, 10))' in constants_source
-    assert 'from ozy.onboarding_profile import extract_onboarding_profile' in bot_source
-    assert '@self.tree.command(name="profile"' in bot_source
-    assert 'async def on_member_remove' in bot_source
-    assert '"rejoin-existing-link"' in bot_source
+    assert 'label="Set game name"' in ui_source
+    assert '@self.tree.command(name="game-name"' in bot_source
+    assert '@self.tree.command(name="member-name"' in bot_source
+    assert '@self.tree.command(name="member-troops"' in bot_source
+    assert '@self.tree.command(name="members-json"' in bot_source
+    assert '@self.tree.command(name="pending-verifications"' not in bot_source
+    assert '@self.tree.command(name="verification-history"' not in bot_source
 
 
-def test_verification_review_ui_is_registered():
+def test_no_leadership_approval_ui_remains():
     bot_source = _source("bot.py")
     ui_source = _source("ozy/discord_ui.py")
 
-    assert 'custom_id=f"ozy:verification:approve:{target_user_id}"' in ui_source
-    assert 'custom_id=f"ozy:verification:reject:{target_user_id}"' in ui_source
-    assert '@self.tree.command(name="verification-history"' in bot_source
+    assert "VerificationReviewView" not in bot_source
+    assert "VerificationReviewView" not in ui_source
+    assert "VerificationApproveButton" not in ui_source
+    assert "VerificationRejectButton" not in ui_source
+    assert "pending leadership approval" not in bot_source

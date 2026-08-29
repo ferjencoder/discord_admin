@@ -1,10 +1,8 @@
-Delete these obsolete migration/old-flow files from the repository:
+Delete these obsolete files if they are still present:
 
+tests/test_one_form_wiring.py
+docs/MODAL_FIX_2026-08-28.md
+docs/ONE_FORM_VERIFICATION.md
 setup_ozy_native_onboarding.py
 setup_ozy_native_onboarding_v2.py
 setup_ozy_native_onboarding_v3.py
-docs/MODAL_FIX_2026-08-28.md
-docs/ONE_FORM_VERIFICATION.md
-tests/test_one_form_wiring.py
-
-They describe or test superseded onboarding flows and should not remain in main.

@@ -577,44 +577,6 @@
       "required": true,
       "in_onboarding": true,
       "type": 1
-    },
-    {
-      "id": "1536560623603814400",
-      "title": "Do you want ping notifications for events and announcements?",
-      "options": [
-        {
-          "id": "1536560623603814403",
-          "title": "YES",
-          "description": "",
-          "emoji": {
-            "id": null,
-            "name": "🔔",
-            "animated": false
-          },
-          "role_ids": [
-            "1536560870530879509"
-          ],
-          "channel_ids": []
-        },
-        {
-          "id": "1536562545366925427",
-          "title": "NO",
-          "description": "",
-          "emoji": {
-            "id": null,
-            "name": "🔕",
-            "animated": false
-          },
-          "role_ids": [
-            "1536561639388749955"
-          ],
-          "channel_ids": []
-        }
-      ],
-      "single_select": true,
-      "required": false,
-      "in_onboarding": false,
-      "type": 0
     }
   ],
   "default_channel_ids": [

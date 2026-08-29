@@ -16,6 +16,6 @@
     "EN/ES/etc and G1-G9/M1-M9/S1-S9 roles are zero-permission metadata roles, not access roles.",
     "OZY Admin mirrors a complete role selection into structured member_profiles fields.",
     "Verified/Special Access control clan access independently of profile metadata.",
-    "Use stable Total Battle user_id as the durable game identity after leadership approval."
+    "Use stable Total Battle user_id as the durable game identity after the first explicit roster-name link."
   ]
 }

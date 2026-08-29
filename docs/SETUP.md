@@ -52,7 +52,6 @@ Recommended channels:
 - Daily tournament summary -> `TODAY_CHANNEL_ID`
 - Absence log -> `AWAY_CHANNEL_ID`
 - Private bot audit log -> `AUDIT_CHANNEL_ID`
-- Private leadership roster-verification queue -> `VERIFICATION_CHANNEL_ID`
 
 One channel can technically serve more than one purpose, but separate announcement/audit channels are cleaner.
 
@@ -87,7 +86,7 @@ remain the access gate. Members edit language/G/M/S through Discord **Channels
 & Roles**; `/profile` only displays the mirrored structured profile.
 
 The authoritative flow is: native Onboarding -> roster identity claim ->
-leadership approval -> Verified.
+automatic roster-name match -> Verified.
 
 ## 6. Connect PeekABoo data
 
@@ -114,7 +113,7 @@ SERVER_ID=...
 
 Then add the channel/role/data variables above.
 
-For persistent production state, configure the authenticated `https://ozy.com.ar/api/ozy-admin/state` Netlify Blob endpoint and set `STATE_REMOTE_URL` plus `STATE_REMOTE_TOKEN` in Render. Create a private leadership text channel such as `#verification` and set `VERIFICATION_CHANNEL_ID` to that channel ID. See `docs/STATE_STORAGE.md`.
+For persistent production state, configure the authenticated `https://ozy.com.ar/api/ozy-admin/state` Netlify Blob endpoint and set `STATE_REMOTE_URL` plus `STATE_REMOTE_TOKEN` in Render. See `docs/STATE_STORAGE.md`.
 
 Recommended schedule/calendar defaults:
 
@@ -131,7 +130,6 @@ CALENDAR_REALM=Regular
 CALENDAR_DAYS=30
 TODAY_ENABLED=true
 
-TRUST_EXACT_DISPLAY_NAME=false
 AUTO_SYNC_NICKNAME=false
 ```
 
@@ -157,59 +155,41 @@ Health path:
 
 ## 8. First controlled test
 
-Test in this order:
+Test the simplified member flow in this order:
 
-1. `/chats`
-2. `/chat`
-3. `/verify` - confirm it creates a pending request rather than granting a rank role
-4. `/pending-verifications` as leadership
-5. Confirm the claim appears in the private verification queue with **Approve / Reject** buttons
-6. Approve one test claim from the button and reject another with a reason
-7. `/verification-history` and confirm both decisions are recorded
-8. `/member-link` as the manual fallback/override
-9. `/member`
-10. `/chests`
-11. `/away days:1 reason:Test`
-12. `/back`
-13. `/schedule`
-14. `/calendar-status`
-15. `/calendar`
-16. `/today`
-17. `/calendar-refresh`
-18. confirm the calendar channel is edited in place rather than spammed
-19. `/event-create` - the modal should open immediately; select category, event channel/location, and publish channel
-20. finish the second date/time step and confirm the Discord Scheduled Event is created and the event card is posted in the selected publish channel
-21. confirm a verified normal member can create an event, while an unverified outsider cannot target hidden channels
-22. Join with a test account and confirm it initially receives Unverified access.
-23. Click **Verify OZY membership** and deliberately enter a misspelled game name; confirm the bot rejects it and asks for the precise roster name.
-24. Enter an exact active-roster name; with `TRUST_EXACT_DISPLAY_NAME=false`, confirm it becomes a pending verification instead of instantly granting rank access.
-25. After approval, complete the profile and confirm preferred language plus G/M/S appear in `/member`.
-26. `/sync-roles apply:false`
-27. inspect the preview
-28. `/sync-roles apply:true`
-29. `/announce ping:false`
-30. only after that, test `/announce ping:true`
+1. Apply the current native onboarding config with `py tools/discord/onboarding.py apply config/discord/onboarding.json --apply`.
+2. Join with a spare Discord account and complete language + G/M/S.
+3. Confirm only the normal start/setup channels are visible before the game name is linked.
+4. Click **Set game name**.
+5. Enter a misspelled roster name and confirm the bot offers close active-roster suggestions based on what was typed.
+6. Select the correct name and confirm access opens immediately with no Leader/Superior approval.
+7. Confirm the chosen language channel and normal clan categories are visible.
+8. Confirm ADMIN and LEADERSHIP remain hidden from a normal member.
+9. Change G/M/S in Discord **Channels & Roles**, then run `/profile` and confirm the structured values update.
+10. Use `/game-name` to test a normal in-game rename with the same stable Total Battle `user_id`.
+11. As Leader/Superior, test `/member-name`, `/member-troops`, and `/members-json`.
+12. Run `/chests`, `/away`, `/back`, `/schedule`, `/calendar`, `/today`, and `/event-create` as normal regression checks.
 
-## 9. Test a new member
+## 9. Expected new-member behavior
 
-Use a test account if possible.
-
-Expected behavior:
-
-- the member receives Unverified access first;
-- the welcome post includes **Verify OZY membership**;
-- if the Discord server display name exactly matches an active roster name, the bot identifies it but keeps the link pending by default;
-- leadership approves the identity from the private verification queue; `/member-link` remains the manual fallback;
-- if the name is not an exact active-roster match, the verification form rejects it and asks for the precise Total Battle name, with close roster suggestions when available;
-- Discord Onboarding collects language + G/M/S; OZY Admin mirrors those metadata roles into structured profile fields;
-- an already-approved Discord account that leaves and rejoins keeps its stable Total Battle identity link; access is restored only if that identity is still in the active roster;
-- if Membership Screening leaves the member pending, the welcome workflow waits until screening is complete;
-- Discord Community Onboarding assigns language/G/M/S metadata roles; those roles grant no clan access.
-
+- Discord Community Onboarding collects language, Guardsmen, Monsters and Specialists.
+- OZY Admin mirrors those zero-permission metadata roles into structured profile state.
+- Discord cannot ask for a free-text game name natively, so one final bot field collects the Total Battle name.
+- An exact active-roster name that is not already linked is accepted immediately.
+- A non-exact name produces fuzzy roster suggestions from the text the member entered.
+- There is no normal approval queue and no Approve/Reject interaction.
+- `Verified` opens normal clan access. ADMIN/LEADERSHIP permissions remain governed by their category/leadership roles.
+- Existing stable Total Battle links survive normal leave/rejoin and are canonicalized by `user_id`.
+- Members update language/G/M/S through Discord **Channels & Roles**.
+- `/game-name` lets members update their own roster name. If they already have a stable Total Battle identity, self-service changes must keep the same `user_id`.
+- `/member-name` lets Leader/Superior correct a member's roster link.
+- `/member-troops` lets Leader/Superior correct G/M/S metadata.
+- `/members-json` exports the active roster with Discord/profile fields.
 
 ## Local verification
 
 ```bash
 py -m pip install -r requirements.txt
 py -m pytest -q
+py preflight_ozy_admin.py
 ```

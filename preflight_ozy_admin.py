@@ -13,6 +13,11 @@ DISCORD_API = "https://discord.com/api/v10"
 ADMINISTRATOR = 1 << 3
 VIEW_CHANNEL = 1 << 10
 
+RESTRICTED_CATEGORY_IDS = {
+    "ADMIN": 1540583740479381616,
+    "LEADERSHIP": 1540527295301816411,
+}
+
 LANGUAGE_CHANNEL_IDS = {
     "EN": 1536508569338253332,
     "ES": 1536508632785748108,
@@ -323,7 +328,6 @@ def check_discord(r: Result) -> None:
         "AWAY_CHANNEL_ID",
         "AUDIT_CHANNEL_ID",
         "CHEST_CHANNEL_ID",
-        "VERIFICATION_CHANNEL_ID",
     )
     configured_channels = {name: parse_id(name) for name in channel_envs}
     configured_channels = {k: v for k, v in configured_channels.items() if v}
@@ -359,6 +363,26 @@ def check_discord(r: Result) -> None:
             r.fail("Language channel access model is inconsistent: " + ", ".join(access_errors))
         else:
             r.ok("Language channels are Verified-gated; language roles are metadata only")
+
+    # Normal Verified members must never gain visibility into restricted staff categories.
+    if verified_id:
+        restricted_errors = []
+        for label, category_id in RESTRICTED_CATEGORY_IDS.items():
+            category = channel_by_id.get(category_id)
+            if not category:
+                restricted_errors.append(f"{label}:category-missing")
+                continue
+            overwrites = {str(o.get("id")): o for o in category.get("permission_overwrites", [])}
+            everyone_overwrite = overwrites.get(guild_id)
+            if not everyone_overwrite or not (int(everyone_overwrite.get("deny", "0")) & VIEW_CHANNEL):
+                restricted_errors.append(f"{label}:everyone-not-denied-view")
+            verified_overwrite = overwrites.get(str(verified_id))
+            if verified_overwrite and (int(verified_overwrite.get("allow", "0")) & VIEW_CHANNEL):
+                restricted_errors.append(f"{label}:Verified-explicitly-allows-view")
+        if restricted_errors:
+            r.fail("Restricted category access is inconsistent: " + ", ".join(restricted_errors))
+        else:
+            r.ok("ADMIN and LEADERSHIP remain hidden from normal Verified members")
 
 
 def main() -> int:

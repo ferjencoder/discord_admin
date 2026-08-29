@@ -166,7 +166,6 @@ class Settings:
     away_channel_id: int | None
     audit_channel_id: int | None
     chest_channel_id: int | None
-    verification_channel_id: int | None
 
     roster_url: str | None
     roster_file: Path
@@ -196,9 +195,7 @@ class Settings:
     today_enabled: bool
     calendar_min_actions: int
 
-    trust_exact_display_name: bool
     auto_sync_nickname: bool
-    roster_match_threshold: float
     state_db: Path
     state_remote_url: str | None
     state_remote_token: str | None
@@ -263,7 +260,6 @@ def load_settings() -> Settings:
         away_channel_id=_optional_id("AWAY_CHANNEL_ID"),
         audit_channel_id=_optional_id("AUDIT_CHANNEL_ID"),
         chest_channel_id=_optional_id("CHEST_CHANNEL_ID"),
-        verification_channel_id=_optional_id("VERIFICATION_CHANNEL_ID"),
 
         roster_url=os.getenv("ROSTER_URL", "").strip() or None,
         roster_file=Path(os.getenv("ROSTER_FILE", "data/roster.json")).expanduser(),
@@ -299,9 +295,7 @@ def load_settings() -> Settings:
         today_enabled=_env_bool("TODAY_ENABLED", True),
         calendar_min_actions=_env_int("CALENDAR_MIN_ACTIONS", 10, 1),
 
-        trust_exact_display_name=_env_bool("TRUST_EXACT_DISPLAY_NAME", False),
         auto_sync_nickname=_env_bool("AUTO_SYNC_NICKNAME", False),
-        roster_match_threshold=_env_float("ROSTER_MATCH_THRESHOLD", 0.78, 0.0),
         state_db=Path(os.getenv("STATE_DB", "data/ozy_admin.sqlite3")).expanduser(),
         state_remote_url=state_remote_url,
         state_remote_token=state_remote_token,

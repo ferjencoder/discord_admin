@@ -498,82 +498,10 @@ class EventScheduleView(discord.ui.View):
 
 
 
-class VerificationApproveButton(discord.ui.Button):
-    def __init__(self, bot: "OZYAdminBot", target_user_id: int):
-        super().__init__(
-            label="Approve",
-            style=discord.ButtonStyle.success,
-            custom_id=f"ozy:verification:approve:{target_user_id}",
-        )
-        self.bot = bot
-        self.target_user_id = target_user_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if not await self.bot._require_leadership(interaction):
-            return
-        await self.bot._review_verification_request(
-            interaction,
-            target_user_id=self.target_user_id,
-            decision="approved",
-            reason="Approved from verification queue",
-        )
-
-
-class VerificationRejectModal(discord.ui.Modal):
-    def __init__(self, bot: "OZYAdminBot", target_user_id: int):
-        super().__init__(title="Reject roster verification", timeout=300)
-        self.bot = bot
-        self.target_user_id = target_user_id
-        self.reason = discord.ui.TextInput(
-            label="Reason",
-            placeholder="Example: Wrong Total Battle name - please submit your exact OZY name.",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=500,
-        )
-        self.add_item(self.reason)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not await self.bot._require_leadership(interaction):
-            return
-        await self.bot._review_verification_request(
-            interaction,
-            target_user_id=self.target_user_id,
-            decision="rejected",
-            reason=str(self.reason.value or "").strip() or "Rejected by leadership",
-        )
-
-
-class VerificationRejectButton(discord.ui.Button):
-    def __init__(self, bot: "OZYAdminBot", target_user_id: int):
-        super().__init__(
-            label="Reject",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"ozy:verification:reject:{target_user_id}",
-        )
-        self.bot = bot
-        self.target_user_id = target_user_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if not await self.bot._require_leadership(interaction):
-            return
-        await interaction.response.send_modal(VerificationRejectModal(self.bot, self.target_user_id))
-
-
-class VerificationReviewView(discord.ui.View):
-    """Persistent approve/reject controls for one pending roster claim."""
-
-    def __init__(self, bot: "OZYAdminBot", target_user_id: int):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.target_user_id = target_user_id
-        self.add_item(VerificationApproveButton(bot, target_user_id))
-        self.add_item(VerificationRejectButton(bot, target_user_id))
-
-class MembershipVerificationModal(discord.ui.Modal):
+class GameNameModal(discord.ui.Modal):
     """Fallback form for entering the exact Total Battle roster name.
 
-    Discord Community Onboarding owns language and G/M/S. Verification only
+    Discord Community Onboarding owns language and G/M/S. The game-name step only
     establishes the Discord -> Total Battle identity link.
     """
 
@@ -584,14 +512,14 @@ class MembershipVerificationModal(discord.ui.Modal):
         member: discord.Member,
         suggested_name: str | None = None,
     ):
-        super().__init__(title="Verify OZY Membership", timeout=300)
+        super().__init__(title="Set your Total Battle name", timeout=300)
         self.bot = bot
         self.member_id = member.id
         profile = bot.state.get_member_profile(member.id)
 
         self.game_name = discord.ui.TextInput(
             label="Total Battle name",
-            placeholder="Exact current name used in OZY",
+            placeholder="Current name in the OZY roster",
             default=(suggested_name or (profile.game_name if profile else None) or member.display_name)[:100],
             max_length=100,
             required=True,
@@ -600,22 +528,22 @@ class MembershipVerificationModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.member_id:
-            await interaction.response.send_message("This verification form belongs to another member.", ephemeral=True)
+            await interaction.response.send_message("This setup form belongs to another member.", ephemeral=True)
             return
-        await self.bot._submit_membership_verification(
+        await self.bot._submit_game_name(
             interaction,
             game_name=str(self.game_name.value),
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        log.exception("Membership verification modal failed", exc_info=error)
+        log.exception("Game-name modal failed", exc_info=error)
         if interaction.response.is_done():
-            await interaction.followup.send("Verification failed. Try `/verify` or contact leadership.", ephemeral=True)
+            await interaction.followup.send("Game-name setup failed. Try `/game-name`.", ephemeral=True)
         else:
-            await interaction.response.send_message("Verification failed. Try `/verify` or contact leadership.", ephemeral=True)
+            await interaction.response.send_message("Game-name setup failed. Try `/game-name`.", ephemeral=True)
 
 
-class MembershipVerificationView(discord.ui.View):
+class GameNameView(discord.ui.View):
     """Persistent entry point for manually entering an exact roster name."""
 
     def __init__(self, bot: "OZYAdminBot"):
@@ -623,23 +551,23 @@ class MembershipVerificationView(discord.ui.View):
         self.bot = bot
 
     @discord.ui.button(
-        label="Verify OZY membership",
+        label="Set game name",
         style=discord.ButtonStyle.primary,
         custom_id="ozy:membership:verify",
     )
     async def verify_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         try:
-            await self.bot._open_membership_verification(interaction)
+            await self.bot._open_game_name(interaction)
         except Exception as exc:
-            log.exception("Could not open membership verification form", exc_info=exc)
-            message = "I could not open the roster-name form. Try `/verify` or contact leadership."
+            log.exception("Could not open game-name form", exc_info=exc)
+            message = "I could not open the game-name form. Try `/game-name`."
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
             else:
                 await interaction.response.send_message(message, ephemeral=True)
 
 
-class MembershipVerificationRetryView(discord.ui.View):
+class GameNameRetryView(discord.ui.View):
     def __init__(self, bot: "OZYAdminBot", member_id: int):
         super().__init__(timeout=300)
         self.bot = bot
@@ -648,9 +576,9 @@ class MembershipVerificationRetryView(discord.ui.View):
     @discord.ui.button(label="Enter exact name again", style=discord.ButtonStyle.primary)
     async def retry_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.user.id != self.member_id:
-            await interaction.response.send_message("This verification belongs to another member.", ephemeral=True)
+            await interaction.response.send_message("This setup belongs to another member.", ephemeral=True)
             return
-        await self.bot._open_membership_verification(interaction)
+        await self.bot._open_game_name(interaction)
 
 
 class RosterSuggestionSelect(discord.ui.Select):
@@ -660,7 +588,7 @@ class RosterSuggestionSelect(discord.ui.Select):
             for name in suggestions[:5]
         ]
         super().__init__(
-            placeholder="Is one of these your Total Battle name?",
+            placeholder="Is one of these your game name?",
             min_values=1,
             max_values=1,
             options=options,
@@ -677,7 +605,7 @@ class RosterSuggestionSelect(discord.ui.Select):
 
 
 class RosterSuggestionView(discord.ui.View):
-    """Join-time roster suggestions. One selection submits the identity claim."""
+    """Suggestions based on the game name the member entered."""
 
     def __init__(self, bot: "OZYAdminBot", member_id: int, suggestions: list[str]):
         super().__init__(timeout=1800)
@@ -686,12 +614,12 @@ class RosterSuggestionView(discord.ui.View):
         if suggestions:
             self.add_item(RosterSuggestionSelect(bot, member_id, suggestions))
 
-    @discord.ui.button(label="Enter a different name", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Try a different name", style=discord.ButtonStyle.secondary)
     async def manual_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if interaction.user.id != self.member_id:
-            await interaction.response.send_message("This verification belongs to another member.", ephemeral=True)
+            await interaction.response.send_message("This setup belongs to another member.", ephemeral=True)
             return
-        await self.bot._open_membership_verification(interaction)
+        await self.bot._open_game_name(interaction)
 
 
 class AnnouncementModal(discord.ui.Modal):
