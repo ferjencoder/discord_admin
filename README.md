@@ -1,5 +1,7 @@
 # OZY Admin
 
+> **Member entry:** OZY Admin does not verify members. Discord Community Onboarding owns entry/access; the bot only posts hello in `#welcome` and goodbye in `#goodbye`.
+
 Discord administration bot for the OZY Odyssey Total Battle clan.
 
 ## Simplified membership model
@@ -7,30 +9,27 @@ Discord administration bot for the OZY Odyssey Total Battle clan.
 ```text
 Discord Community Onboarding
   -> preferred language
-  -> Guardsmen G9-G1
-  -> Monsters M9-M1
-  -> Specialists S9-S1
-  -> normal member-access role
+  -> Guardsmen G1-G9
+  -> Monsters M1-M9
+  -> Specialists S1-S9
 
-OZY Admin member events
-  -> fun welcome in START HERE / #welcome
-  -> fun farewell in START HERE / #goodbye
-
-Member profile
-  -> game name = Discord server nickname
-  -> no roster verification
-  -> no approval queue
-  -> no stable Total Battle identity link
+OZY Admin
+  -> one final game-name field
+  -> exact active-roster match or fuzzy suggestions
+  -> immediate roster link
+  -> Verified access
+  -> Leader/Superior rank sync when applicable
 ```
 
-Discord Community Onboarding supports only predefined multiple-choice/dropdown
-answers, so it cannot collect an arbitrary Total Battle name. The zero-approval
-model uses the member's Discord server nickname as that field instead.
+There is no normal Leader/Superior approval queue.
 
-Members can update it with `/game-name` or Discord's normal nickname editor.
-Leaders/Superiors can correct it with `/member-name` and can update troop levels
-with `/member-troops`. `/members-json` exports current Discord members with
-nickname/game name, language and G/M/S.
+Discord cannot collect free-text answers in native Community Onboarding, so the
+Total Battle name is the only bot-assisted onboarding field. Language and G/M/S
+remain native Discord answers represented by zero-permission metadata roles.
+
+Members can update their own game name with `/game-name`. Leaders/Superiors can
+correct names with `/member-name` and troop levels with `/member-troops`.
+`/members-json` exports the active roster merged with Discord/profile data.
 
 ## Run locally
 
@@ -51,4 +50,6 @@ py tools/discord/onboarding.py apply config/discord/onboarding.json --apply
 Runtime architecture and deployment details are under `docs/`.
 
 
-Discord Server Guide branding is managed in the Discord UI. Keep its Welcome Sign branded OZY, never HOT.
+## Member-entry boundary
+
+Discord Community Onboarding owns member onboarding and normal access. OZY Admin never verifies a joining member or checks the roster for access. It only posts a themed hello in `START HERE/#welcome` and a themed goodbye in `START HERE/#goodbye`.

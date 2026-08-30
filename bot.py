@@ -247,7 +247,6 @@ class OZYAdminBot(discord.Client):
 
         configured_channels = {
             "WELCOME_CHANNEL_ID": self.settings.welcome_channel_id,
-            "GOODBYE_CHANNEL_ID": self.settings.goodbye_channel_id,
             "ANNOUNCEMENT_CHANNEL_ID": self.settings.announcement_channel_id,
             "SCHEDULE_CHANNEL_ID": self.settings.schedule_channel_id,
             "LEADERSHIP_SCHEDULE_CHANNEL_ID": self.settings.leadership_schedule_channel_id,
@@ -278,10 +277,6 @@ class OZYAdminBot(discord.Client):
             role_ids.add(self.settings.away_role_id)
         if self.settings.verified_role_id:
             role_ids.add(self.settings.verified_role_id)
-        if self.settings.unverified_role_id:
-            role_ids.add(self.settings.unverified_role_id)
-        if self.settings.special_access_role_id:
-            role_ids.add(self.settings.special_access_role_id)
         if self.settings.announcement_ping_role_id:
             role_ids.add(self.settings.announcement_ping_role_id)
         role_ids.update(self.settings.leadership_role_ids)
@@ -297,10 +292,6 @@ class OZYAdminBot(discord.Client):
             managed_role_ids.add(self.settings.away_role_id)
         if self.settings.verified_role_id:
             managed_role_ids.add(self.settings.verified_role_id)
-        if self.settings.unverified_role_id:
-            managed_role_ids.add(self.settings.unverified_role_id)
-        if self.settings.special_access_role_id:
-            managed_role_ids.add(self.settings.special_access_role_id)
         for role_id in managed_role_ids:
             role = guild.get_role(role_id)
             if role and role >= me.top_role:
@@ -322,10 +313,8 @@ class OZYAdminBot(discord.Client):
                     ping_role.name,
                 )
 
-        if not self.settings.verified_role_id:
-            log.warning(
-                "VERIFIED_ROLE_ID is not configured; normal member access will rely entirely on Discord channel defaults"
-            )
+        if not self.settings.rank_role_map:
+            log.warning("RANK_ROLE_MAP is empty; roster linking will work but rank roles will not be changed")
         if self.settings.chest_reset_post_enabled and not self.settings.chest_channel_id:
             log.warning("CHEST_RESET_POST_ENABLED=true but CHEST_CHANNEL_ID is not configured")
 
@@ -353,24 +342,20 @@ class OZYAdminBot(discord.Client):
         return False
 
     def _can_create_events(self, member: discord.Member | None) -> bool:
-        """Allow members who completed onboarding plus leadership."""
+        """Allow leadership or members who completed native Discord Onboarding."""
         if member is None:
             return False
         if self._is_leadership(member):
             return True
-
-        role_ids = {role.id for role in member.roles}
         if self.settings.verified_role_id:
-            return self.settings.verified_role_id in role_ids
-
-        # No bot-owned verification layer. Discord Onboarding is authoritative.
+            return any(role.id == self.settings.verified_role_id for role in member.roles)
         return True
 
     async def _require_event_creator(self, interaction: discord.Interaction) -> bool:
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if self._can_create_events(member):
             return True
-        message = "Complete Discord onboarding before creating events."
+        message = "Complete the OZY server onboarding before creating events."
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:
@@ -400,34 +385,6 @@ class OZYAdminBot(discord.Client):
         if guild is None:
             return None
         return guild.get_member(interaction.user.id)
-
-    @staticmethod
-    def _game_name_from_discord(member: discord.Member) -> str:
-        """Use the server nickname as the Total Battle name.
-
-        There is no roster identity/linking layer. If a member has no server
-        nickname yet, fall back to their Discord display name.
-        """
-        return (member.nick or member.display_name).strip()
-
-    def _find_named_text_channel(
-        self,
-        guild: discord.Guild,
-        *,
-        channel_name: str,
-        category_name: str | None = None,
-    ) -> discord.TextChannel | None:
-        wanted_channel = channel_name.strip().casefold()
-        wanted_category = category_name.strip().casefold() if category_name else None
-        for channel in guild.text_channels:
-            if channel.name.casefold() != wanted_channel:
-                continue
-            if wanted_category is not None:
-                category = channel.category
-                if category is None or category.name.casefold() != wanted_category:
-                    continue
-            return channel
-        return None
 
     def _sync_profile_from_onboarding_roles(self, member: discord.Member) -> str:
         """Mirror native Discord Onboarding metadata roles into OZY state.
@@ -467,7 +424,7 @@ class OZYAdminBot(discord.Client):
                 existing.monsters_level,
                 existing.specialists_level,
             )
-            if current == desired and existing.game_name == self._game_name_from_discord(member):
+            if current == desired:
                 return (
                     f"{selection.preferred_language} / G{selection.guardsmen_level} / "
                     f"M{selection.monsters_level} / S{selection.specialists_level}"
@@ -480,8 +437,8 @@ class OZYAdminBot(discord.Client):
             monsters_level=selection.monsters_level,
             specialists_level=selection.specialists_level,
             source="discord-onboarding",
-            game_name=self._game_name_from_discord(member),
-            game_user_id=None,
+            game_name=(existing.game_name if existing else None),
+            game_user_id=(existing.game_user_id if existing else None),
         )
         return (
             f"{selection.preferred_language} / G{selection.guardsmen_level} / "
@@ -534,17 +491,16 @@ class OZYAdminBot(discord.Client):
                 monsters_level=monsters,
                 specialists_level=specialists,
                 source="leadership-troop-update",
-                game_name=self._game_name_from_discord(member),
-                game_user_id=None,
+                game_name=(profile.game_name if profile else None),
+                game_user_id=(profile.game_user_id if profile else None),
             )
         return "profile updated"
 
     async def _build_members_json(self, guild: discord.Guild) -> dict:
-        """Export current Discord members with language and G/M/S profile data.
+        """Export current Discord members with native onboarding profile data.
 
-        Membership is never checked against the Total Battle roster. The member's
-        server nickname is the game-name field. If no nickname is set, Discord's
-        display name is used.
+        The website roster is intentionally not consulted. A game name is profile
+        information only and can be duplicated or changed freely.
         """
         members: list[dict] = []
         for member in guild.members:
@@ -552,12 +508,11 @@ class OZYAdminBot(discord.Client):
                 continue
             self._sync_profile_from_onboarding_roles(member)
             profile = self.state.get_member_profile(member.id)
-            game_name = self._game_name_from_discord(member)
+            game_name = self.state.get_link(member.id)
             members.append({
                 "discord_user_id": member.id,
                 "discord_username": str(member),
                 "discord_display_name": member.display_name,
-                "discord_nickname": member.nick,
                 "game_name": game_name,
                 "preferred_language": (profile.preferred_language if profile else None),
                 "guardsmen_level": (profile.guardsmen_level if profile else None),
@@ -565,74 +520,84 @@ class OZYAdminBot(discord.Client):
                 "specialists_level": (profile.specialists_level if profile else None),
             })
 
-        members.sort(key=lambda item: (item["game_name"] or "").casefold())
+        members.sort(key=lambda item: ((item["game_name"] or item["discord_display_name"] or "").casefold()))
         return {
-            "schema_version": 3,
+            "schema_version": 2,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "guild_id": guild.id,
             "member_count": len(members),
             "members": members,
         }
 
-    async def _set_game_name(
+    async def _submit_game_name(
         self,
-        member: discord.Member,
-        game_name: str,
+        interaction: discord.Interaction,
         *,
-        actor: str,
-    ) -> tuple[bool, str]:
-        """Set the Discord server nickname used as the member's game name."""
+        game_name: str,
+    ) -> None:
+        """Store the member's game name without roster validation or access logic."""
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None or member.guild.id != self.settings.server_id:
+            await interaction.response.send_message("This setup only works inside the OZY server.", ephemeral=True)
+            return
+
         entered = game_name.strip()
         if not entered:
-            return False, "Game name cannot be blank."
-        if len(entered) > 32:
-            return False, "Discord server nicknames are limited to 32 characters."
+            await interaction.response.send_message("Enter your current Total Battle name.", ephemeral=True)
+            return
 
-        previous = self._game_name_from_discord(member)
-        try:
-            await member.edit(nick=entered, reason=f"OZY game-name update by {actor}")
-        except discord.Forbidden:
-            return False, "I cannot change that nickname. Check role hierarchy / Manage Nicknames."
-        except discord.HTTPException as exc:
-            return False, f"Discord nickname update failed: {exc}"
-
-        profile = self.state.get_member_profile(member.id)
-        if profile and profile.profile_complete:
-            self.state.set_member_profile_details(
-                member.id,
-                preferred_language=profile.preferred_language,
-                guardsmen_level=profile.guardsmen_level,
-                monsters_level=profile.monsters_level,
-                specialists_level=profile.specialists_level,
-                source=profile.profile_source or "discord-onboarding",
-                game_name=entered,
-                game_user_id=None,
-            )
+        previous = self.state.get_link(member.id)
+        self.state.set_plain_game_name(member.id, entered, "self-game-name")
+        self._sync_profile_from_onboarding_roles(member)
 
         await self._audit(
-            "Member game name changed",
-            actor,
-            f"Discord member: {member} ({member.id})\nPrevious: {previous}\nNew: {entered}",
+            "Member game name",
+            str(member),
+            f"Previous: {previous or 'none'}\nNew: {entered}",
         )
-        return True, entered
+        await interaction.response.send_message(
+            f"Game name saved as **{entered}**. No roster check is performed.",
+            ephemeral=True,
+        )
 
     async def _resolve_member_game_name(self, member: discord.Member) -> str | None:
-        """Return the member's server nickname/display name.
+        """Return the member-maintained game-name profile field."""
+        return self.state.get_link(member.id)
 
-        This is profile data only and never a membership-verification result.
-        """
-        value = self._game_name_from_discord(member)
-        return value or None
+    # Normal member access is owned entirely by Discord Community Onboarding.
+    # OZY Admin never checks the Total Battle roster to grant/revoke access.
 
     # ------------------------------------------------------------------
-    # Welcome / roster identity
+    # Welcome / goodbye only
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_start_here_category_name(name: str) -> bool:
+        # The live category is branded (for example: "❖── 👋 START HERE").
+        # Match the semantic suffix instead of requiring the raw Discord name
+        # to be exactly "START HERE".
+        return str(name or "").strip().casefold().endswith("start here")
+
+    def _find_start_here_text_channel(self, guild: discord.Guild, name: str) -> discord.TextChannel | None:
+        wanted = name.casefold().lstrip("#")
+        matches: list[discord.TextChannel] = []
+        for channel in guild.text_channels:
+            if channel.name.casefold() != wanted:
+                continue
+            category = channel.category
+            if category and self._is_start_here_category_name(category.name):
+                matches.append(channel)
+
+        # Do not silently choose between duplicates. A single exact channel name
+        # under the branded START HERE category is the intended configuration.
+        return matches[0] if len(matches) == 1 else None
+
     async def _process_new_member(self, member: discord.Member) -> None:
-        """Say hello after Discord's native onboarding completes."""
+        """Post a themed hello only. Discord owns onboarding and access."""
         if member.guild.id != self.settings.server_id or member.bot:
             return
 
-        onboarding_profile = self._sync_profile_from_onboarding_roles(member)
+        # Keep profile metadata mirrored for admin/reporting features only.
+        self._sync_profile_from_onboarding_roles(member)
 
         channel: discord.TextChannel | None = None
         if self.settings.welcome_channel_id:
@@ -640,36 +605,26 @@ class OZYAdminBot(discord.Client):
             if isinstance(candidate, discord.TextChannel):
                 channel = candidate
         if channel is None:
-            channel = self._find_named_text_channel(
-                member.guild,
-                channel_name="welcome",
-                category_name="START HERE",
-            )
+            channel = self._find_start_here_text_channel(member.guild, "welcome")
 
         if channel is not None:
             embed = discord.Embed(
-                title="🦇 Welcome to the Madhouse",
+                title="🚂 ALL ABOARD THE CRAZY TRAIN!",
                 description=(
-                    f"{member.mention}, the gates are open, the bats are awake, "
-                    "and OZY just got a little louder. Welcome to Odyssey."
+                    f"Welcome {member.mention} to **[OZY] Odyssey**! 🤘\n\n"
+                    "The gates are open, the bats are awake, and the Madhouse just got louder. "
+                    "Grab a seat on the Crazy Train and make some noise. 🦇"
                 ),
-                color=0x7C3AED,
+                color=0xF59E0B,
             )
-            embed.set_footer(text="No trials. No paperwork. Just don't feed the bats after midnight.")
-            try:
-                await channel.send(
-                    embed=embed,
-                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-                )
-            except discord.HTTPException as exc:
-                log.warning("Welcome message failed for %s: %s", member.id, exc)
+            await channel.send(
+                content=member.mention,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
 
         self.state.mark_welcomed(member.id)
-        await self._audit(
-            "Member joined",
-            str(member),
-            f"Discord ID: {member.id}\nOnboarding profile: {onboarding_profile}",
-        )
+        await self._audit("Member joined", str(member), f"Discord ID: {member.id}")
 
     async def on_member_join(self, member: discord.Member) -> None:
         if member.guild.id != self.settings.server_id or member.bot:
@@ -680,57 +635,35 @@ class OZYAdminBot(discord.Client):
         await self._process_new_member(member)
 
     async def on_member_remove(self, member: discord.Member) -> None:
+        """Post a themed goodbye only. No identity/access logic runs on leave."""
         if member.guild.id != self.settings.server_id or member.bot:
             return
-
-        channel: discord.TextChannel | None = None
-        if self.settings.goodbye_channel_id:
-            candidate = self.get_channel(self.settings.goodbye_channel_id)
-            if isinstance(candidate, discord.TextChannel):
-                channel = candidate
-        if channel is None:
-            channel = self._find_named_text_channel(
-                member.guild,
-                channel_name="goodbye",
-                category_name="START HERE",
-            )
-
-        if channel is not None:
-            embed = discord.Embed(
-                title="🦇 Another Bat Leaves the Belfry",
-                description=(
-                    f"**{member.display_name}** has left the madhouse. "
-                    "The bats raise a wing in salute. Safe travels beyond the gates."
-                ),
-                color=0x4C1D95,
-            )
-            embed.set_footer(text="The OZY door stays loud.")
-            try:
-                await channel.send(
-                    embed=embed,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.HTTPException as exc:
-                log.warning("Goodbye message failed for %s: %s", member.id, exc)
 
         self.state.clear_welcomed(member.id)
         self.state.clear_away(member.id)
 
-        await self._audit(
-            "Member left Discord",
-            str(member),
-            f"Discord ID: {member.id}\nGame/display name: {self._game_name_from_discord(member)}",
-        )
+        channel = self._find_start_here_text_channel(member.guild, "goodbye")
+
+        if channel is not None:
+            display_name = discord.utils.escape_markdown(member.display_name)
+            embed = discord.Embed(
+                title="🦇 Another Bat Leaves the Belfry",
+                description=(
+                    f"**{display_name}** has left **[OZY] Odyssey**.\n\n"
+                    "The bats raise a wing in salute. Safe travels beyond the gates. 🤘"
+                ),
+                color=0x6B21A8,
+            )
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+        await self._audit("Member left Discord", str(member), f"Discord ID: {member.id}")
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         if after.guild.id != self.settings.server_id or after.bot:
             return
         if before.pending and not after.pending:
             await self._process_new_member(after)
-        if (
-            {role.id for role in before.roles} != {role.id for role in after.roles}
-            or before.nick != after.nick
-        ):
+        if {role.id for role in before.roles} != {role.id for role in after.roles}:
             self._sync_profile_from_onboarding_roles(after)
 
     # ------------------------------------------------------------------
@@ -1325,9 +1258,6 @@ class OZYAdminBot(discord.Client):
                 log.exception("Automatic tournament today post failed")
 
     # ------------------------------------------------------------------
-    # Authoritative roster/access synchronization
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
     # Away expiry
     # ------------------------------------------------------------------
     async def _away_expiry_loop(self) -> None:
@@ -1425,43 +1355,36 @@ class OZYAdminBot(discord.Client):
             matches = [x for x in items if not q or q in x["label"].casefold() or q in x["key"].casefold()]
             return [app_commands.Choice(name=x["label"], value=x["key"]) for x in matches[:25]]
 
-        @self.tree.command(name="game-name", description="Set your OZY nickname to your Total Battle name")
+        @self.tree.command(name="game-name", description="Set or update your Total Battle game name")
         @app_commands.describe(game_name="Your current Total Battle name")
         async def game_name_command(interaction: discord.Interaction, game_name: str) -> None:
             if not isinstance(interaction.user, discord.Member):
                 await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
                 return
-            ok, result = await self._set_game_name(
-                interaction.user,
-                game_name,
-                actor=str(interaction.user),
-            )
-            if ok:
-                await interaction.response.send_message(
-                    f"Your OZY server nickname is now **{result}**.",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.response.send_message(result, ephemeral=True)
+            await self._submit_game_name(interaction, game_name=game_name)
 
-        @self.tree.command(name="member-name", description="Leadership: change a member's OZY/game nickname")
+        @self.tree.command(name="member-name", description="Leadership: set/correct a member's Total Battle name")
         @app_commands.describe(member="Discord member", game_name="Current Total Battle name")
         async def member_name(interaction: discord.Interaction, member: discord.Member, game_name: str) -> None:
             if not await self._require_leadership(interaction):
                 return
-            ok, result = await self._set_game_name(
-                member,
-                game_name,
-                actor=str(interaction.user),
+            entered = game_name.strip()
+            if not entered:
+                await interaction.response.send_message("Game name cannot be blank.", ephemeral=True)
+                return
+            previous = self.state.get_link(member.id)
+            self.state.set_plain_game_name(member.id, entered, f"leadership-name:{interaction.user.id}")
+            self._sync_profile_from_onboarding_roles(member)
+            await self._audit(
+                "Member game name changed",
+                str(interaction.user),
+                f"Discord member: {member} ({member.id})\nPrevious: {previous or 'none'}\nNew: {entered}",
             )
-            if ok:
-                await interaction.response.send_message(
-                    f"{member.mention}'s OZY server nickname is now **{result}**.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await interaction.response.send_message(result, ephemeral=True)
+            await interaction.response.send_message(
+                f"{member.mention}'s game name is now **{entered}**.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
         @self.tree.command(name="member-troops", description="Leadership: update a member's G/M/S levels")
         @app_commands.describe(member="Discord member", guardsmen="1-9", monsters="1-9", specialists="1-9")
@@ -1543,7 +1466,7 @@ class OZYAdminBot(discord.Client):
 
             self._sync_profile_from_onboarding_roles(target)
             profile = self.state.get_member_profile(target.id)
-            game_name = self._game_name_from_discord(target)
+            game_name = self.state.get_link(target.id)
             embed = discord.Embed(title=(game_name or target.display_name), color=0xF59E0B)
             embed.add_field(name="Discord", value=target.mention, inline=False)
             embed.add_field(name="Game name", value=(game_name or "Not set"), inline=False)
@@ -1589,7 +1512,7 @@ class OZYAdminBot(discord.Client):
                     game_name = own_game_name
                 if not game_name:
                     await interaction.response.send_message(
-                        "I could not determine your game name. Set your OZY server nickname or use `/game-name`.",
+                        "Your Discord account is not linked to a roster player yet. Use `/game-name` with your current Total Battle name.",
                         ephemeral=True,
                     )
                     return
@@ -1721,293 +1644,6 @@ class OZYAdminBot(discord.Client):
                 lines.append(f"Chests: **FAILED** - {exc}")
 
             await interaction.followup.send("\n\n".join(lines), ephemeral=True)
-
-        @self.tree.command(name="away", description="Mark yourself away from clan activity")
-        @app_commands.describe(days="Number of days away (1-90)", reason="Short reason")
-        async def away(interaction: discord.Interaction, days: int, reason: str = "Away") -> None:
-            member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if member is None:
-                await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
-                return
-            if not (1 <= days <= 90):
-                await interaction.response.send_message("Days must be between 1 and 90.", ephemeral=True)
-                return
-            reason = reason.strip()[:200] or "Away"
-            game_name = None
-            try:
-                game_name = await self._resolve_member_game_name(member)
-            except DataUnavailable:
-                pass
-
-            local_now = datetime.now(self.settings.timezone)
-            until_local = datetime.combine(
-                local_now.date() + timedelta(days=days),
-                dt_time(23, 59, 59),
-                tzinfo=self.settings.timezone,
-            )
-            until_utc = until_local.astimezone(timezone.utc)
-            self.state.set_away(member.id, game_name, until_utc, reason)
-
-            role_result = "Away role not configured"
-            if self.settings.away_role_id:
-                role = member.guild.get_role(self.settings.away_role_id)
-                if role:
-                    try:
-                        if role not in member.roles:
-                            await member.add_roles(role, reason=f"Away until {until_local.date().isoformat()}")
-                        role_result = f"{role.name} assigned"
-                    except discord.HTTPException as exc:
-                        role_result = f"role update failed: {exc}"
-
-            if self.settings.away_channel_id:
-                channel = member.guild.get_channel(self.settings.away_channel_id)
-                if isinstance(channel, discord.TextChannel):
-                    embed = discord.Embed(title="Member Away", color=0x64748B)
-                    embed.description = member.mention
-                    embed.add_field(name="Game name", value=game_name or "Not linked", inline=True)
-                    embed.add_field(name="Until", value=discord.utils.format_dt(until_utc, style="D"), inline=True)
-                    embed.add_field(name="Reason", value=reason, inline=False)
-                    await channel.send(
-                        embed=embed,
-                        allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
-                    )
-
-            await self._audit(
-                "Away set",
-                str(member),
-                f"Game name: {game_name or 'unlinked'}\nUntil: {until_utc.isoformat()}\nReason: {reason}\n{role_result}",
-            )
-            await interaction.response.send_message(
-                f"Marked away until {discord.utils.format_dt(until_utc, style='D')}. {role_result}.",
-                ephemeral=True,
-            )
-
-        @self.tree.command(name="back", description="Clear your away status early")
-        async def back(interaction: discord.Interaction) -> None:
-            member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if member is None:
-                await interaction.response.send_message("This command only works inside the OZY server.", ephemeral=True)
-                return
-            record = self.state.get_away(member.id)
-            self.state.clear_away(member.id)
-            if self.settings.away_role_id:
-                role = member.guild.get_role(self.settings.away_role_id)
-                if role and role in member.roles:
-                    try:
-                        await member.remove_roles(role, reason="Member returned early")
-                    except discord.HTTPException:
-                        log.exception("Could not remove Away role from %s", member.id)
-            await self._audit("Away cleared", str(member), f"Previous record: {record or 'none'}")
-            await interaction.response.send_message("Away status cleared.", ephemeral=True)
-
-        @self.tree.command(name="schedule", description="Show today's OZY clan or leadership schedule")
-        @app_commands.describe(
-            audience="Clan schedule, Leadership schedule, or both",
-            public="Post publicly instead of only showing it to you",
-        )
-        @app_commands.choices(audience=SCHEDULE_AUDIENCE_CHOICES)
-        async def schedule(
-            interaction: discord.Interaction,
-            audience: Optional[app_commands.Choice[str]] = None,
-            public: bool = False,
-        ) -> None:
-            assert self.data is not None
-            selected = audience.value if audience else "clan"
-            member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if selected in {"leadership", "both"} and not self._is_leadership(member):
-                await interaction.response.send_message("Leadership schedule is restricted to Leader/Superior.", ephemeral=True)
-                return
-            if public and not self._is_leadership(member):
-                await interaction.response.send_message("Only leadership can post the schedule publicly.", ephemeral=True)
-                return
-
-            today = datetime.now(self.settings.timezone).date()
-            try:
-                if selected == "both":
-                    clan_items = await self.data.schedule_for_date(today, audience="clan")
-                    leadership_items = await self.data.schedule_for_date(today, audience="leadership")
-                    clan_text = format_schedule(today, clan_items)
-                    leadership_text = format_schedule(today, leadership_items).replace(
-                        "## OZY Schedule", "## OZY Leadership Schedule", 1
-                    )
-                    body = clan_text + "\n\n" + leadership_text
-                else:
-                    items = await self.data.schedule_for_date(today, audience=selected)
-                    body = format_schedule(today, items)
-                    if selected == "leadership":
-                        body = body.replace("## OZY Schedule", "## OZY Leadership Schedule", 1)
-            except DataUnavailable as exc:
-                await interaction.response.send_message(f"Schedule unavailable: {exc}", ephemeral=True)
-                return
-
-            await interaction.response.send_message(
-                body,
-                ephemeral=not public,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-
-        @self.tree.command(name="schedule-post", description="Leadership: post today's clan or leadership schedule")
-        @app_commands.describe(audience="Which configured schedule channel to publish")
-        @app_commands.choices(audience=SCHEDULE_AUDIENCE_CHOICES)
-        async def schedule_post(
-            interaction: discord.Interaction,
-            audience: Optional[app_commands.Choice[str]] = None,
-        ) -> None:
-            if not await self._require_leadership(interaction):
-                return
-            selected = audience.value if audience else "clan"
-            today = datetime.now(self.settings.timezone).date()
-            audiences = ("clan", "leadership") if selected == "both" else (selected,)
-            posted_labels = []
-            for item_audience in audiences:
-                posted = await self._post_schedule(
-                    today,
-                    force=True,
-                    actor=str(interaction.user),
-                    audience=item_audience,
-                )
-                if posted:
-                    posted_labels.append(item_audience)
-
-            if posted_labels:
-                await interaction.response.send_message(
-                    "Posted: " + ", ".join(posted_labels) + ".",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.response.send_message(
-                    "Nothing was posted. Check the configured schedule channel(s) and today's website schedule data.",
-                    ephemeral=True,
-                )
-
-        @self.tree.command(name="calendar", description="Show the next 30 days of tournament starts")
-        @app_commands.describe(public="Post publicly instead of only showing it to you")
-        async def calendar(interaction: discord.Interaction, public: bool = False) -> None:
-            if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
-                await interaction.response.send_message("Only leadership can post the calendar publicly.", ephemeral=True)
-                return
-            if self.calendar_client is None:
-                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
-                return
-            await interaction.response.defer(ephemeral=not public, thinking=True)
-            try:
-                if self.calendar_client.snapshot is None:
-                    await self.calendar_client.refresh(force=True)
-                snapshot = self.calendar_client.snapshot
-                if snapshot is None:
-                    raise CalendarSourceError("No calendar snapshot is available")
-                chunks = build_calendar_chunks(
-                    snapshot,
-                    start_date=datetime.now(timezone.utc).date(),
-                    days=self.settings.calendar_days,
-                    timezone_info=timezone.utc,
-                )
-                for chunk in chunks:
-                    await interaction.followup.send(
-                        chunk,
-                        ephemeral=not public,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-            except CalendarSourceError as exc:
-                await interaction.followup.send(f"Calendar unavailable: {exc}", ephemeral=True)
-
-        @self.tree.command(name="today", description="Show today's tournament activity")
-        @app_commands.describe(public="Post publicly instead of only showing it to you")
-        async def today(interaction: discord.Interaction, public: bool = False) -> None:
-            if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
-                await interaction.response.send_message("Only leadership can post today's schedule publicly.", ephemeral=True)
-                return
-            if self.calendar_client is None:
-                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
-                return
-            await interaction.response.defer(ephemeral=not public, thinking=True)
-            try:
-                if self.calendar_client.snapshot is None:
-                    await self.calendar_client.refresh(force=True)
-                snapshot = self.calendar_client.snapshot
-                if snapshot is None:
-                    raise CalendarSourceError("No calendar snapshot is available")
-                target_date = datetime.now(timezone.utc).date()
-                chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=timezone.utc)
-                for chunk in chunks:
-                    await interaction.followup.send(
-                        chunk,
-                        ephemeral=not public,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-            except CalendarSourceError as exc:
-                await interaction.followup.send(f"Today's calendar is unavailable: {exc}", ephemeral=True)
-
-        @self.tree.command(name="time", description="Show today's OZY events in your chosen local timezone")
-        @app_commands.describe(zone="Timezone to convert the current game-day schedule to")
-        @app_commands.choices(zone=TIMEZONE_CHOICES)
-        async def time_converter(interaction: discord.Interaction, zone: app_commands.Choice[str]) -> None:
-            if self.calendar_client is None:
-                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
-                return
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            try:
-                if self.calendar_client.snapshot is None:
-                    await self.calendar_client.refresh(force=True)
-                snapshot = self.calendar_client.snapshot
-                if snapshot is None:
-                    raise CalendarSourceError("No calendar snapshot is available")
-                target_date = datetime.now(timezone.utc).date()
-                chunks = build_today_local_chunks(
-                    snapshot,
-                    target_date=target_date,
-                    timezone_info=ZoneInfo(zone.value),
-                    timezone_label=zone.name,
-                )
-                for chunk in chunks:
-                    await interaction.followup.send(
-                        chunk,
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-            except Exception as exc:
-                await interaction.followup.send(f"Time conversion unavailable: {exc}", ephemeral=True)
-
-        @self.tree.command(name="calendar-refresh", description="Leadership: refresh the tournament calendar and update Discord")
-        async def calendar_refresh(interaction: discord.Interaction) -> None:
-            if not await self._require_leadership(interaction):
-                return
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            changed, status = await self._refresh_calendar(
-                force=True,
-                actor=str(interaction.user),
-                refresh_akurier=True,
-            )
-            if status != "ok":
-                await interaction.followup.send(f"Refresh failed: {status}", ephemeral=True)
-            else:
-                await interaction.followup.send(
-                    "Tournament calendar refreshed. " + ("Discord calendar updated." if changed else "No event changes detected."),
-                    ephemeral=True,
-                )
-
-        @self.tree.command(name="calendar-status", description="Leadership: show Tournament calendar integration status")
-        async def calendar_status(interaction: discord.Interaction) -> None:
-            if not await self._require_leadership(interaction):
-                return
-            snapshot = self.calendar_client.snapshot if self.calendar_client else None
-            last_success = self.calendar_client.last_success_utc if self.calendar_client else None
-            last_error = self.calendar_client.last_error if self.calendar_client else "client unavailable"
-            lines = [
-                f"Enabled: **{self.settings.calendar_enabled}**",
-                f"Realm: **{self.settings.calendar_realm}**",
-                "Calendar probes: **00:30, 06:30, 12:30, 18:30 UTC**",
-                "Akurier mini-events: **18:00 UTC / R+1, once daily**",
-                f"Cached actions: **{len(snapshot.actions) if snapshot else 0}**",
-                f"Cached mini tournaments: **{len(snapshot.mini_tournaments) if snapshot else 0}**",
-                f"Source last synced: **{self.calendar_client.last_meta_utc.isoformat() if self.calendar_client and self.calendar_client.last_meta_utc else 'unknown'}**",
-                f"Last metadata check: **{self.calendar_client.last_meta_checked_utc.isoformat() if self.calendar_client and self.calendar_client.last_meta_checked_utc else 'never'}**",
-                f"Last Akurier success: **{self.calendar_client.last_akurier_success_utc.isoformat() if self.calendar_client and self.calendar_client.last_akurier_success_utc else 'never'}**",
-                f"Last successful calendar fetch/probe: **{last_success.isoformat() if last_success else 'never'}**",
-                f"Last error: **{last_error or 'none'}**",
-            ]
-            await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
 
         @self.tree.command(name="event-create", description="Create and publish an OZY scheduled event")
         async def event_create(interaction: discord.Interaction) -> None:

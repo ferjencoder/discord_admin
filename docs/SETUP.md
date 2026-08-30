@@ -1,3 +1,11 @@
+# Current member-entry model
+
+OZY Admin performs **no membership verification**. Do not configure or test an approval queue. Discord Community Onboarding owns normal member access and language/G/M/S choices. The bot only posts a themed join message in `START HERE/#welcome` and a themed leave message in `START HERE/#goodbye`.
+
+The commands `/game-name`, `/member-name`, `/member-troops`, and `/members-json` are profile/admin utilities only and never grant or revoke access.
+
+---
+
 # OZY Admin - Setup Checklist
 
 ## 1. Create the Discord application
@@ -81,13 +89,12 @@ Specialists levels. Each answer assigns a zero-permission metadata role. OZY
 Admin mirrors those roles into `member_profiles` using
 `profile_source=discord-onboarding`.
 
-Language and G/M/S remain native onboarding metadata. The required language
-answer also grants the normal member-access role. Members edit language/G/M/S
-through Discord **Channels & Roles**; `/profile` only displays the mirrored
-structured profile.
+The metadata roles do not grant clan access. `Verified` / `Special Access`
+remain the access gate. Members edit language/G/M/S through Discord **Channels
+& Roles**; `/profile` only displays the mirrored structured profile.
 
-There is no roster identity claim or approval step. The Discord server nickname
-is used as the member's Total Battle name.
+The authoritative flow is: native Onboarding -> roster identity claim ->
+automatic roster-name match -> Verified.
 
 ## 6. Connect PeekABoo data
 
@@ -131,6 +138,7 @@ CALENDAR_REALM=Regular
 CALENDAR_DAYS=30
 TODAY_ENABLED=true
 
+AUTO_SYNC_NICKNAME=false
 ```
 
 The tournament-calendar integration does not require a source login, cookie, SignalR connection,

@@ -1,56 +1,70 @@
-# OZY onboarding - descending troop levels + branding check
+# OZY Admin - hello/goodbye only member lifecycle
 
-Changes:
+This patch removes OZY Admin from membership verification completely.
 
-- Guardsmen choices display G9 -> G1.
-- Monsters choices display M9 -> M1.
-- Specialists choices display S9 -> S1.
-- Onboarding lint now rejects stale `HOT` branding in the API-managed onboarding JSON.
-- Tests enforce the descending order.
-- Documentation explains the separate Discord Server Guide Welcome Sign.
+Automatic member lifecycle behavior becomes:
+
+- Join -> themed hello in `START HERE/#welcome`
+- Leave -> themed goodbye in `START HERE/#goodbye`
+
+There is no automatic:
+- roster lookup
+- fuzzy name matching
+- membership verification
+- approval/rejection
+- verification card
+- game-name popup
+- access-role synchronization from roster
+- Special Access workflow
+- roster `sync-roles` workflow
+
+Discord Community Onboarding owns normal member access and language/G/M/S.
+
+Profile/admin commands remain separate utilities:
+- `/game-name`
+- `/member-name`
+- `/member-troops`
+- `/members-json`
+
+They are not part of joining and never control normal access.
+
+## Important deployment check
+
+The old live messages:
+
+- `Verify OZY membership`
+- `Roster verification pending`
+- `After approval`
+- `already linked to another Discord account`
+
+do not exist in this source.
+
+If they appear after this patch is committed and pushed, Render is running an
+older deployment. Check the commit shown by Render against the local Git HEAD.
 
 ## Install
 
-Replace the included files preserving their paths.
+Replace the included files, preserving their paths.
 
-Run:
+Then run:
 
 ```bash
 py -m pytest -q
-py tools/discord/onboarding.py show config/discord/onboarding.json
-py tools/discord/onboarding.py apply config/discord/onboarding.json
+py preflight_ozy_admin.py
 ```
 
-Expected tests:
+Expected test result for this patch:
 
 ```text
-69 passed
+66 passed
 ```
 
-The dry run should show G9..G1, M9..M1, S9..S1.
+Commit and push, then confirm Render deploys that exact commit.
 
-Then apply:
+After redeploy, delete any historical verification messages/channels you no
+longer want. Old Discord messages are not rewritten by a code deployment.
 
-```bash
-py tools/discord/onboarding.py apply config/discord/onboarding.json --apply
-```
-
-## HOT Clan message
-
-The current API-managed onboarding JSON and recent onboarding exports contain no
-`HOT` branding.
-
-If new members still see `HOT Clan`, it is in Discord's separate **Server Guide
-Welcome Sign**, not the Guild Onboarding prompts JSON.
-
-Change it in Discord:
-
-`Server Settings -> Onboarding -> Server Guide -> Welcome Sign`
-
-Recommended:
-
-`Welcome to OZY - Odyssey. Enter the madhouse.`
-
-Discord's documented Guild Onboarding API exposes prompts, default channels,
-enabled state and mode. It does not expose the Server Guide Welcome Sign, so
-that text should be changed in the Discord UI.
+Recommended Discord cleanup:
+- delete `ADMIN/#verification`
+- rename `START HERE/#verification-help` to `#help` if you still want a public
+  help channel
