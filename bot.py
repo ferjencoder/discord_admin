@@ -1645,6 +1645,95 @@ class OZYAdminBot(discord.Client):
 
             await interaction.followup.send("\n\n".join(lines), ephemeral=True)
 
+        @self.tree.command(name="calendar", description="Show the next 30 days of tournament starts")
+        @app_commands.describe(public="Post publicly instead of only showing it to you")
+        async def calendar(interaction: discord.Interaction, public: bool = False) -> None:
+            if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
+                await interaction.response.send_message("Only leadership can post the calendar publicly.", ephemeral=True)
+                return
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=not public, thinking=True)
+            try:
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
+                if snapshot is None:
+                    raise CalendarSourceError("No calendar snapshot is available")
+                chunks = build_calendar_chunks(
+                    snapshot,
+                    start_date=datetime.now(timezone.utc).date(),
+                    days=self.settings.calendar_days,
+                    timezone_info=timezone.utc,
+                )
+                for chunk in chunks:
+                    await interaction.followup.send(
+                        chunk,
+                        ephemeral=not public,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except CalendarSourceError as exc:
+                await interaction.followup.send(f"Calendar unavailable: {exc}", ephemeral=True)
+
+        @self.tree.command(name="today", description="Show today's tournament activity")
+        @app_commands.describe(public="Post publicly instead of only showing it to you")
+        async def today(interaction: discord.Interaction, public: bool = False) -> None:
+            if public and not self._is_leadership(interaction.user if isinstance(interaction.user, discord.Member) else None):
+                await interaction.response.send_message("Only leadership can post today's schedule publicly.", ephemeral=True)
+                return
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=not public, thinking=True)
+            try:
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
+                if snapshot is None:
+                    raise CalendarSourceError("No calendar snapshot is available")
+                target_date = datetime.now(timezone.utc).date()
+                chunks = build_today_chunks(snapshot, target_date=target_date, timezone_info=timezone.utc)
+                for chunk in chunks:
+                    await interaction.followup.send(
+                        chunk,
+                        ephemeral=not public,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except CalendarSourceError as exc:
+                await interaction.followup.send(f"Today's calendar is unavailable: {exc}", ephemeral=True)
+
+        @self.tree.command(name="time", description="Show today's OZY events in your chosen local timezone")
+        @app_commands.describe(zone="Timezone to convert the current game-day schedule to")
+        @app_commands.choices(zone=TIMEZONE_CHOICES)
+        async def time_converter(interaction: discord.Interaction, zone: app_commands.Choice[str]) -> None:
+            if self.calendar_client is None:
+                await interaction.response.send_message("Tournament calendar integration is unavailable.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                if self.calendar_client.snapshot is None:
+                    await self.calendar_client.refresh(force=True)
+                snapshot = self.calendar_client.snapshot
+                if snapshot is None:
+                    raise CalendarSourceError("No calendar snapshot is available")
+                target_date = datetime.now(timezone.utc).date()
+                chunks = build_today_local_chunks(
+                    snapshot,
+                    target_date=target_date,
+                    timezone_info=ZoneInfo(zone.value),
+                    timezone_label=zone.name,
+                )
+                for chunk in chunks:
+                    await interaction.followup.send(
+                        chunk,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except Exception as exc:
+                await interaction.followup.send(f"Time conversion unavailable: {exc}", ephemeral=True)
+
+
         @self.tree.command(name="event-create", description="Create and publish an OZY scheduled event")
         async def event_create(interaction: discord.Interaction) -> None:
             if not await self._require_event_creator(interaction):

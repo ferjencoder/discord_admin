@@ -7,9 +7,13 @@ def _source(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
-def test_event_create_is_registered_and_required_in_sync():
+def test_required_commands_are_registered_and_required_in_sync():
     source = _source("bot.py")
-    assert '@self.tree.command(name="event-create"' in source
+    required = ("event-create", "calendar", "today", "time")
+
+    for command in required:
+        assert f'@self.tree.command(name="{command}"' in source
+
     assert 'required_commands = {"event-create", "calendar", "today", "time"}' in source
 
 
