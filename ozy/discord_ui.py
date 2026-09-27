@@ -352,12 +352,18 @@ class EventScheduleModal(discord.ui.Modal):
             description=description,
             reason=f"OZY event created by {interaction.user}",
         )
-        if isinstance(event_channel, (discord.VoiceChannel, discord.StageChannel)):
+        if isinstance(event_channel, discord.StageChannel):
+            # Discord's API now requires the scheduled-event entity type explicitly.
+            event_kwargs["entity_type"] = discord.EntityType.stage_instance
+            event_kwargs["channel"] = event_channel
+        elif isinstance(event_channel, discord.VoiceChannel):
+            event_kwargs["entity_type"] = discord.EntityType.voice
             event_kwargs["channel"] = event_channel
         else:
-            # Discord Scheduled Events only attach natively to voice/stage channels.
-            # Text/forum/thread/media selections are represented as an external
-            # location while still linking the selected channel in our announcement.
+            # Text/forum/thread/media selections cannot be attached natively to a
+            # Discord Scheduled Event, so create an external event and keep the
+            # selected Discord channel as its visible location.
+            event_kwargs["entity_type"] = discord.EntityType.external
             event_kwargs["location"] = f"#{getattr(event_channel, 'name', 'Discord channel')}"[:100]
 
         try:
