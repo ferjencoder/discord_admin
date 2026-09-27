@@ -593,6 +593,57 @@ class DataProvider:
         self.invalidate("schedule:leadership")
         return data if isinstance(data, dict) else {"ok": True}
 
+
+    async def upsert_announcement(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a Discord announcement in the OZY website announcement feed."""
+        if not self.settings.announcements_url:
+            raise DataUnavailable("ANNOUNCEMENTS_URL is not configured")
+        if not self.settings.ozy_data_api_token:
+            raise DataUnavailable("OZY_DATA_API_TOKEN is required to write announcement data")
+
+        timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
+        headers = {
+            "X-OZY-Admin-Token": self.settings.ozy_data_api_token,
+            "Content-Type": "application/json",
+        }
+        try:
+            async with self.session.post(
+                self.settings.announcements_url,
+                json=payload,
+                timeout=timeout,
+                headers=headers,
+            ) as response:
+                if response.status not in {200, 201}:
+                    body = (await response.text())[:300]
+                    raise DataUnavailable(
+                        f"announcement write returned HTTP {response.status}: {body or 'empty response'}"
+                    )
+                data = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            raise DataUnavailable(f"Could not write announcement to website: {exc}") from exc
+
+        return data if isinstance(data, dict) else {"ok": True}
+
+    async def delete_announcement(self, discord_message_id: int | str) -> bool:
+        if not self.settings.announcements_url or not self.settings.ozy_data_api_token:
+            return False
+        separator = "&" if "?" in self.settings.announcements_url else "?"
+        url = f"{self.settings.announcements_url}{separator}id={discord_message_id}"
+        timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
+        headers = {"X-OZY-Admin-Token": self.settings.ozy_data_api_token}
+        try:
+            async with self.session.delete(url, timeout=timeout, headers=headers) as response:
+                if response.status == 404:
+                    return False
+                if response.status not in {200, 204}:
+                    body = (await response.text())[:300]
+                    raise DataUnavailable(
+                        f"announcement delete returned HTTP {response.status}: {body or 'empty response'}"
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise DataUnavailable(f"Could not delete announcement from website: {exc}") from exc
+        return True
+
     async def delete_schedule_event(self, discord_event_id: int | str) -> bool:
         if not self.settings.schedule_url or not self.settings.ozy_data_api_token:
             return False

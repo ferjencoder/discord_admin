@@ -202,6 +202,7 @@ class Settings:
     state_remote_token: str | None
     state_remote_timeout_seconds: float
     leadership_schedule_channel_id: int | None = None
+    announcements_url: str | None = None
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -230,6 +231,11 @@ def load_settings() -> Settings:
     if calendar_enabled and not calendar_base_url:
         raise ConfigError("CALENDAR_BASE_URL is required when CALENDAR_ENABLED=true")
 
+    schedule_url = os.getenv("SCHEDULE_URL", "").strip() or None
+    announcements_url = os.getenv("ANNOUNCEMENTS_URL", "").strip() or None
+    if not announcements_url and schedule_url and "/schedule" in schedule_url:
+        announcements_url = schedule_url.replace("/schedule", "/announcements")
+
     state_remote_url = os.getenv("STATE_REMOTE_URL", "").strip() or None
     state_remote_token = os.getenv("STATE_REMOTE_TOKEN", "").strip() or None
     if state_remote_url and not state_remote_token:
@@ -257,6 +263,7 @@ def load_settings() -> Settings:
         announcement_ping_role_id=_optional_id("ANNOUNCEMENT_PING_ROLE_ID"),
         schedule_channel_id=_optional_id("SCHEDULE_CHANNEL_ID"),
         leadership_schedule_channel_id=_optional_id("LEADERSHIP_SCHEDULE_CHANNEL_ID"),
+        announcements_url=announcements_url,
         calendar_channel_id=_optional_id("CALENDAR_CHANNEL_ID"),
         today_channel_id=_optional_id("TODAY_CHANNEL_ID"),
         away_channel_id=_optional_id("AWAY_CHANNEL_ID"),
@@ -268,7 +275,7 @@ def load_settings() -> Settings:
         chest_data_url=os.getenv("CHEST_DATA_URL", "").strip() or None,
         chest_data_file=Path(os.getenv("CHEST_DATA_FILE", "data/chest_data.json")).expanduser(),
         ozy_data_api_token=os.getenv("OZY_DATA_API_TOKEN", "").strip() or None,
-        schedule_url=os.getenv("SCHEDULE_URL", "").strip() or None,
+        schedule_url=schedule_url,
         schedule_file=Path(os.getenv("SCHEDULE_FILE", "data/schedule.json")).expanduser(),
         chats_file=Path(os.getenv("CHATS_FILE", "data/chats.json")).expanduser(),
         data_cache_seconds=_env_int("DATA_CACHE_SECONDS", 60, 5),

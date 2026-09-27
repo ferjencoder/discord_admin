@@ -17,7 +17,7 @@ from discord import app_commands
 
 from ozy.data_provider import DataProvider, DataUnavailable
 from settings import ConfigError, Settings, load_settings
-from ozy.state import AdminState, EventReminderRecord
+from ozy.state import AdminState
 from ozy.utils import format_chat_directory, format_chest_ranking_blocks, format_schedule, safe_code_block, truncate
 from ozy.constants import PROFILE_LANGUAGES
 from ozy.onboarding_profile import extract_onboarding_profile
@@ -97,7 +97,6 @@ class OZYAdminBot(discord.Client):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.members = True
-        intents.guild_scheduled_events = True
 
         super().__init__(intents=intents)
         self.settings = settings
@@ -146,7 +145,6 @@ class OZYAdminBot(discord.Client):
 
         self.background_tasks.append(asyncio.create_task(self._daily_schedule_loop(), name="daily-schedule"))
         self.background_tasks.append(asyncio.create_task(self._away_expiry_loop(), name="away-expiry"))
-        self.background_tasks.append(asyncio.create_task(self._event_reminder_loop(), name="event-reminders"))
         if self.settings.chest_reset_post_enabled and self.settings.chest_channel_id:
             self.background_tasks.append(asyncio.create_task(self._daily_chest_ranking_loop(), name="daily-chest-ranking"))
         if self.settings.calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
@@ -188,11 +186,8 @@ class OZYAdminBot(discord.Client):
         log.info("OZY Admin operational as %s (%s)", self.user, self.user.id if self.user else "?")
 
     async def on_scheduled_event_delete(self, event: discord.ScheduledEvent) -> None:
-        """Remove deleted Discord events from the canonical website schedule and reminder queue."""
-        if event.guild_id != self.settings.server_id:
-            return
-        self.state.delete_event_reminders(event.id)
-        if self.data is None:
+        """Remove deleted Discord events from the canonical website schedule."""
+        if event.guild_id != self.settings.server_id or self.data is None:
             return
         try:
             removed = await self.data.delete_schedule_event(event.id)
@@ -202,19 +197,42 @@ class OZYAdminBot(discord.Client):
             log.warning("Could not remove Discord event %s from website schedule: %s", event.id, exc)
 
     async def on_scheduled_event_update(
-        self,
-        before: discord.ScheduledEvent,
-        after: discord.ScheduledEvent,
+        self, before: discord.ScheduledEvent, after: discord.ScheduledEvent
     ) -> None:
-        """Keep pending reminder times aligned with Discord event edits."""
-        if after.guild_id != self.settings.server_id:
+        """Keep Discord event edits synchronized to the website schedule."""
+        if after.guild_id != self.settings.server_id or self.data is None:
             return
-        if before.start_time != after.start_time:
-            count = self.state.reschedule_event_reminders(after.id, after.start_time)
-            if count:
-                log.info("Rescheduled %d pending reminders for Discord event %s", count, after.id)
-        if after.status in {discord.EventStatus.cancelled, discord.EventStatus.completed}:
-            self.state.delete_event_reminders(after.id)
+        if not after.start_time or not after.end_time:
+            return
+        duration_minutes = max(1, round((after.end_time - after.start_time).total_seconds() / 60))
+        payload = {
+            "id": str(after.id),
+            "discord_event_id": str(after.id),
+            "title": after.name,
+            "description": after.description or "",
+            "start_utc": after.start_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "end_utc": after.end_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "duration_minutes": duration_minutes,
+            "discord_event_url": after.url,
+        }
+        try:
+            await self.data.upsert_schedule_event(payload)
+            log.info("Updated Discord event %s in OZY website schedule", after.id)
+        except DataUnavailable as exc:
+            log.warning("Could not update Discord event %s in website schedule: %s", after.id, exc)
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        """Remove a deleted Discord announcement from the website feed."""
+        if payload.guild_id != self.settings.server_id or self.data is None:
+            return
+        if not self.settings.announcement_channel_id or payload.channel_id != self.settings.announcement_channel_id:
+            return
+        try:
+            removed = await self.data.delete_announcement(payload.message_id)
+            if removed:
+                log.info("Removed Discord announcement %s from OZY website feed", payload.message_id)
+        except DataUnavailable as exc:
+            log.warning("Could not remove Discord announcement %s from website feed: %s", payload.message_id, exc)
 
     async def _start_health_server(self) -> None:
         async def health(_: web.Request) -> web.Response:
@@ -744,6 +762,8 @@ class OZYAdminBot(discord.Client):
         body: str,
         tb_copy: str,
         ping: bool,
+        priority: str = "normal",
+        expires_hours: int | None = None,
     ) -> None:
         if not await self._require_leadership(interaction):
             return
@@ -755,9 +775,22 @@ class OZYAdminBot(discord.Client):
             await interaction.response.send_message("Configured announcement channel is unavailable.", ephemeral=True)
             return
 
-        embed = discord.Embed(title=title, description=body, color=0xF59E0B)
+        priority = str(priority or "normal").strip().casefold()
+        if priority not in {"info", "normal", "urgent"}:
+            priority = "normal"
+        color = {
+            "info": 0x4B5563,
+            "normal": 0xF59E0B,
+            "urgent": 0xB91C1C,
+        }[priority]
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        posted_at = datetime.now(timezone.utc)
+        expires_at = posted_at + timedelta(hours=expires_hours) if expires_hours else None
+        embed = discord.Embed(title=title, description=body, color=color)
         embed.set_footer(text=f"Posted by {interaction.user.display_name}")
-        embed.timestamp = datetime.now(timezone.utc)
+        embed.timestamp = posted_at
 
         content = None
         allowed = discord.AllowedMentions.none()
@@ -767,19 +800,68 @@ class OZYAdminBot(discord.Client):
                 content = role.mention
                 allowed = discord.AllowedMentions(everyone=False, users=False, roles=[role])
 
-        sent = await channel.send(content=content, embed=embed, allowed_mentions=allowed)
+        try:
+            sent = await channel.send(content=content, embed=embed, allowed_mentions=allowed)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.followup.send(f"Discord announcement could not be posted: {exc}", ephemeral=True)
+            return
+
+        tb_copy_error = None
         if tb_copy.strip():
-            await channel.send(
-                "### Total Battle copy\n" + safe_code_block(tb_copy.strip()),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            try:
+                await channel.send(
+                    "### Total Battle copy\n" + safe_code_block(tb_copy.strip()),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                tb_copy_error = str(exc)
+
+        website_sync_error = None
+        if self.data is not None:
+            payload = {
+                "id": str(sent.id),
+                "discord_message_id": str(sent.id),
+                "guild_id": str(interaction.guild.id) if interaction.guild else str(self.settings.server_id),
+                "channel_id": str(channel.id),
+                "title": title,
+                "body": body,
+                "tb_copy": tb_copy.strip(),
+                "priority": priority,
+                "pinged": bool(content),
+                "posted_at_utc": posted_at.isoformat().replace("+00:00", "Z"),
+                "expires_at_utc": expires_at.isoformat().replace("+00:00", "Z") if expires_at else None,
+                "discord_message_url": sent.jump_url,
+                "created_by_discord_id": str(interaction.user.id),
+                "created_by_name": interaction.user.display_name,
+            }
+            try:
+                await self.data.upsert_announcement(payload)
+            except DataUnavailable as exc:
+                website_sync_error = str(exc)
+                log.error("Could not persist announcement %s to OZY website: %s", sent.id, exc)
+        else:
+            website_sync_error = "data provider unavailable"
 
         await self._audit(
             "Announcement posted",
             str(interaction.user),
-            f"Channel: #{channel.name}\nMessage ID: {sent.id}\nTitle: {title}\nPing: {bool(content)}",
+            f"Channel: #{channel.name}\n"
+            f"Message ID: {sent.id}\n"
+            f"Title: {title}\n"
+            f"Priority: {priority}\n"
+            f"Expires: {expires_at.isoformat() if expires_at else 'never'}\n"
+            f"Ping: {bool(content)}\n"
+            f"Website: {'failed - ' + website_sync_error if website_sync_error else 'synced'}",
         )
-        await interaction.response.send_message(f"Announcement posted in {channel.mention}.", ephemeral=True)
+
+        lines = [f"Announcement posted in {channel.mention}."]
+        if tb_copy_error:
+            lines.append(f"Warning: Total Battle copy message failed: {tb_copy_error}")
+        if website_sync_error:
+            lines.append(f"Warning: website announcement sync failed: {website_sync_error}")
+        else:
+            lines.append("Website announcement: synced")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     # ------------------------------------------------------------------
     # Schedule
@@ -1327,116 +1409,6 @@ class OZYAdminBot(discord.Client):
     # ------------------------------------------------------------------
     # Away expiry
     # ------------------------------------------------------------------
-    @staticmethod
-    def _subscriber_mention_chunks(users, *, max_chars: int = 1500) -> list[str]:
-        mentions = [user.mention for user in users if not getattr(user, "bot", False)]
-        chunks: list[str] = []
-        current: list[str] = []
-        length = 0
-        for mention in mentions:
-            extra = len(mention) + (1 if current else 0)
-            if current and length + extra > max_chars:
-                chunks.append(" ".join(current))
-                current = []
-                length = 0
-            current.append(mention)
-            length += len(mention) + (1 if length else 0)
-        if current:
-            chunks.append(" ".join(current))
-        return chunks
-
-    async def _send_event_reminder(self, reminder: EventReminderRecord) -> None:
-        guild = self.get_guild(reminder.guild_id)
-        if guild is None:
-            raise RuntimeError(f"Guild {reminder.guild_id} is unavailable")
-
-        channel = guild.get_channel_or_thread(reminder.publish_channel_id)
-        if channel is None or not hasattr(channel, "send"):
-            raise RuntimeError(f"Publish channel {reminder.publish_channel_id} is unavailable")
-
-        event = guild.get_scheduled_event(reminder.discord_event_id)
-        if event is None:
-            event = await guild.fetch_scheduled_event(reminder.discord_event_id, with_counts=True)
-
-        if reminder.start_event and event.status == discord.EventStatus.scheduled:
-            event = await event.start(reason="OZY automatic event start reminder")
-
-        subscribers = []
-        # At offset 0 Discord's native event start already notifies Interested users.
-        # For the before/after reminders, explicitly ping those same subscribers.
-        if not reminder.start_event:
-            try:
-                async for user in event.users(limit=None):
-                    subscribers.append(user)
-            except discord.HTTPException as exc:
-                log.warning("Could not load subscribers for event %s: %s", event.id, exc)
-
-        header = f"## ⏰ {reminder.event_name}\n{reminder.message}\n\n{event.url}"
-        mention_chunks = self._subscriber_mention_chunks(subscribers)
-        if mention_chunks:
-            first = f"{header}\n\n{mention_chunks[0]}"
-            await channel.send(
-                first[:2000],
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-            )
-            for chunk in mention_chunks[1:]:
-                await channel.send(
-                    chunk,
-                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-                )
-        else:
-            await channel.send(
-                header[:2000],
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-
-    async def _event_reminder_loop(self) -> None:
-        await self.wait_until_ready()
-        while not self.is_closed():
-            now = datetime.now(timezone.utc)
-            for reminder in self.state.due_event_reminders(now, limit=25):
-                # Do not dump stale reminders into chat after a long outage.
-                # Three hours still allows useful catch-up for short service restarts.
-                if now - reminder.scheduled_for_utc > timedelta(hours=3):
-                    log.warning(
-                        "Skipping stale event reminder %s for event %s",
-                        reminder.reminder_id,
-                        reminder.discord_event_id,
-                    )
-                    self.state.mark_event_reminder_sent(reminder.reminder_id, sent_at_utc=now)
-                    continue
-                try:
-                    await self._send_event_reminder(reminder)
-                except asyncio.CancelledError:
-                    raise
-                except discord.NotFound:
-                    log.warning(
-                        "Scheduled event %s no longer exists; dropping reminder %s",
-                        reminder.discord_event_id,
-                        reminder.reminder_id,
-                    )
-                    self.state.mark_event_reminder_sent(reminder.reminder_id, sent_at_utc=now)
-                except Exception as exc:
-                    self.state.mark_event_reminder_failed(reminder.reminder_id, str(exc))
-                    log.exception(
-                        "Event reminder %s failed (attempt %d)",
-                        reminder.reminder_id,
-                        reminder.attempts + 1,
-                    )
-                else:
-                    self.state.mark_event_reminder_sent(reminder.reminder_id)
-                    log.info(
-                        "Sent event reminder %s for event %s at offset %+dm",
-                        reminder.reminder_id,
-                        reminder.discord_event_id,
-                        reminder.offset_minutes,
-                    )
-
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                raise
-
     async def _away_expiry_loop(self) -> None:
         await self.wait_until_ready()
         while not self.is_closed():

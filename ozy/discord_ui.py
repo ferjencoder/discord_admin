@@ -7,9 +7,8 @@ from datetime import datetime, time as dt_time, timedelta, timezone
 
 import discord
 
-from ozy.data_provider import DataUnavailable
 from ozy.event_calendar import reset_label
-from ozy.event_reminders import format_reminder_offsets, parse_reminder_plan
+from ozy.data_provider import DataUnavailable
 
 log = logging.getLogger("ozy-admin.ui")
 
@@ -272,13 +271,20 @@ class EventScheduleModal(discord.ui.Modal):
                 discord.SelectOption(label="Leadership", value="leadership", description="Leader / Superior schedule only"),
             ],
         )
-        reminder_default = "OMENS" if "omen" in draft.name.casefold() else None
-        self.reminders = discord.ui.TextInput(
-            placeholder="OMENS or -2h | Be ready; 0 | Start now; +1h | Follow-up",
-            default=reminder_default,
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=1800,
+        self.event_type = discord.ui.Select(
+            placeholder="What kind of clan activity is this?",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Power Hour", value="power_hour", description="Coordinated clan push / epic monster hour"),
+                discord.SelectOption(label="Clan Event", value="clan_event", description="General OZY activity"),
+                discord.SelectOption(label="Meeting", value="meeting"),
+                discord.SelectOption(label="Monster Hunt", value="hunt"),
+                discord.SelectOption(label="PvP", value="pvp"),
+                discord.SelectOption(label="Training", value="training"),
+                discord.SelectOption(label="Reminder", value="reminder"),
+                discord.SelectOption(label="Other", value="other"),
+            ],
         )
         self.add_item(discord.ui.Label(
             text="R+0 reset date",
@@ -288,11 +294,7 @@ class EventScheduleModal(discord.ui.Modal):
         self.add_item(discord.ui.Label(text="Game reset time", component=self.reset_time))
         self.add_item(discord.ui.Label(text="Duration in minutes", component=self.duration))
         self.add_item(discord.ui.Label(text="Audience", component=self.audience))
-        self.add_item(discord.ui.Label(
-            text="Reminders (optional)",
-            description="Use OMENS for the Day 1 preset, or offset | message entries separated by semicolons.",
-            component=self.reminders,
-        ))
+        self.add_item(discord.ui.Label(text="Event type", component=self.event_type))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.draft.creator_id:
@@ -307,6 +309,7 @@ class EventScheduleModal(discord.ui.Modal):
             return
 
         audience = (self.audience.values[0] if self.audience.values else "clan").strip().casefold()
+        event_type = (self.event_type.values[0] if self.event_type.values else "other").strip().casefold()
         if audience == "leadership" and not self.bot._is_leadership(member):
             await interaction.response.send_message(
                 "Only Leader/Superior can create Leadership schedule events.",
@@ -334,14 +337,6 @@ class EventScheduleModal(discord.ui.Modal):
                 raise ValueError("Duration must be between 15 and 720 minutes.")
             if start_time <= datetime.now(timezone.utc) + timedelta(minutes=1):
                 raise ValueError("The event start must be in the future.")
-            requested_reminders = parse_reminder_plan(str(self.reminders.value or ""))
-            reminder_cutoff = datetime.now(timezone.utc) + timedelta(seconds=30)
-            reminders = [
-                reminder
-                for reminder in requested_reminders
-                if start_time + timedelta(minutes=reminder.offset_minutes) > reminder_cutoff
-            ]
-            skipped_reminder_count = len(requested_reminders) - len(reminders)
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
@@ -390,8 +385,7 @@ class EventScheduleModal(discord.ui.Modal):
         embed.add_field(name="Category", value=category.name, inline=True)
         embed.add_field(name="Event channel", value=_channel_display(event_channel), inline=True)
         embed.add_field(name="Audience", value="Leadership" if audience == "leadership" else "Clan", inline=True)
-        if reminders:
-            embed.add_field(name="Reminders", value=format_reminder_offsets(reminders), inline=True)
+        embed.add_field(name="Event type", value=event_type.replace("_", " ").title(), inline=True)
         embed.add_field(name="Created by", value=interaction.user.mention, inline=True)
         embed.set_footer(text="OZY Event")
 
@@ -411,21 +405,6 @@ class EventScheduleModal(discord.ui.Modal):
         except discord.HTTPException as exc:
             publish_error = f"Publishing failed: {exc}"
 
-        reminder_store_error = None
-        if reminders:
-            try:
-                self.bot.state.replace_event_reminders(
-                    discord_event_id=event.id,
-                    guild_id=guild.id,
-                    publish_channel_id=publish_channel.id,
-                    event_name=self.draft.name,
-                    event_start_utc=start_time,
-                    reminders=reminders,
-                )
-            except Exception as exc:
-                reminder_store_error = str(exc)
-                log.exception("Could not persist reminders for Discord event %s", event.id)
-
         # The website is the canonical schedule store. Persist the Discord event
         # even if its announcement could not be posted, so schedule data is not lost.
         schedule_sync_error = None
@@ -437,6 +416,7 @@ class EventScheduleModal(discord.ui.Modal):
                 "title": self.draft.name,
                 "description": self.draft.notes,
                 "audience": audience,
+                "event_type": event_type,
                 "start_utc": start_time.isoformat().replace("+00:00", "Z"),
                 "end_utc": (start_time + timedelta(minutes=duration_minutes)).isoformat().replace("+00:00", "Z"),
                 "duration_minutes": duration_minutes,
@@ -466,19 +446,12 @@ class EventScheduleModal(discord.ui.Modal):
             "Event created.",
             f"**{self.draft.name}** - **{reset_text}**",
             f"Audience: **{'Leadership' if audience == 'leadership' else 'Clan'}**",
+            f"Type: **{event_type.replace('_', ' ').title()}**",
         ]
         if published is not None:
             status_lines.append(f"Published in {_channel_display(publish_channel)}")
         elif publish_error:
             status_lines.append(f"Warning: {publish_error}")
-        if reminders and reminder_store_error is None:
-            status_lines.append(f"Reminders: **{format_reminder_offsets(reminders)}**")
-        elif reminder_store_error:
-            status_lines.append(f"Warning: reminder scheduling failed: {reminder_store_error}")
-        if skipped_reminder_count:
-            status_lines.append(
-                f"Skipped **{skipped_reminder_count}** reminder(s) whose time had already passed."
-            )
         if schedule_sync_error:
             status_lines.append(f"Warning: website schedule sync failed: {schedule_sync_error}")
         else:
@@ -495,11 +468,11 @@ class EventScheduleModal(discord.ui.Modal):
             str(interaction.user),
             f"{self.draft.name}\n"
             f"Audience: {audience}\n"
+            f"Type: {event_type}\n"
             f"Category: {category.name}\n"
             f"Event channel: #{getattr(event_channel, 'name', event_channel.id)}\n"
             f"Published: {('#' + getattr(publish_channel, 'name', str(publish_channel.id)) + ' (' + str(published.id) + ')') if published is not None else 'failed'}\n"
             f"Website schedule: {'failed - ' + schedule_sync_error if schedule_sync_error else 'synced'}\n"
-            f"Reminders: {format_reminder_offsets(reminders) if reminders else 'none'}\n"
             f"Start: {start_time.isoformat()} ({reset_text})",
         )
 
@@ -571,17 +544,51 @@ class AnnouncementModal(discord.ui.Modal):
             required=False,
             max_length=1500,
         )
+        self.priority = discord.ui.Select(
+            placeholder="Announcement priority",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Normal", value="normal", description="Standard clan announcement", default=True),
+                discord.SelectOption(label="Information", value="info", description="Low-priority information"),
+                discord.SelectOption(label="Urgent", value="urgent", description="Immediate action required"),
+            ],
+        )
+        self.expires_hours = discord.ui.TextInput(
+            label="Expires after hours (optional)",
+            placeholder="Example: 24. Leave blank to keep it active.",
+            required=False,
+            max_length=4,
+        )
         self.add_item(self.heading)
         self.add_item(self.body)
         self.add_item(self.tb_copy)
+        self.add_item(discord.ui.Label(text="Priority", component=self.priority))
+        self.add_item(self.expires_hours)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw_expiry = str(self.expires_hours.value or "").strip()
+        expires_hours = None
+        if raw_expiry:
+            try:
+                expires_hours = int(raw_expiry)
+                if expires_hours < 1 or expires_hours > 720:
+                    raise ValueError
+            except ValueError:
+                await interaction.response.send_message(
+                    "Announcement expiry must be a whole number from 1 to 720 hours, or left blank.",
+                    ephemeral=True,
+                )
+                return
+
         await self.bot.publish_announcement(
             interaction,
             title=str(self.heading.value),
             body=str(self.body.value),
             tb_copy=str(self.tb_copy.value or ""),
             ping=self.ping,
+            priority=(self.priority.values[0] if self.priority.values else "normal"),
+            expires_hours=expires_hours,
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
