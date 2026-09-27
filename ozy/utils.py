@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 
 def safe_code_block(text: str, language: str = "text") -> str:
@@ -39,6 +39,10 @@ def truncate(text: str, limit: int) -> str:
 
 def _ranking_period(start: str, end: str, fallback: str) -> str:
     try:
+        if "T" in start and "T" in end:
+            a = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(timezone.utc)
+            b = datetime.fromisoformat(end.replace("Z", "+00:00")).astimezone(timezone.utc)
+            return f"{a:%d.%m %H:%M} TO {b:%d.%m %H:%M} UTC (end exclusive)"
         start_day = date.fromisoformat(start).strftime("%d.%m")
         end_day = date.fromisoformat(end).strftime("%d.%m")
         return f"{start_day} TO {end_day}"
@@ -59,6 +63,8 @@ def format_chest_ranking_blocks(leaderboard, chunk_size: int = 20) -> list[str]:
 
     for chunk_index, chunk in enumerate(chunks, start=1):
         lines = [f"{period} - OZY CHESTS - {chunk_index}/{len(chunks)}"]
+        if getattr(leaderboard, "source_note", ""):
+            lines.append(leaderboard.source_note)
         start_rank = (chunk_index - 1) * chunk_size + 1
         for offset, member in enumerate(chunk):
             rank = start_rank + offset

@@ -9,7 +9,7 @@ import urllib.request
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 
@@ -79,6 +79,22 @@ class VerificationHistoryRecord:
     reviewed_by_user_id: int
     reviewed_at_utc: datetime
     reason: str
+
+
+@dataclass(frozen=True)
+class EventReminderRecord:
+    reminder_id: str
+    discord_event_id: int
+    guild_id: int
+    publish_channel_id: int
+    event_name: str
+    offset_minutes: int
+    scheduled_for_utc: datetime
+    message: str
+    start_event: bool
+    sent_at_utc: datetime | None
+    attempts: int
+    last_error: str | None
 
 
 
@@ -305,6 +321,27 @@ class AdminState:
                     profile_source TEXT,
                     updated_at_utc TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS event_reminders (
+                    reminder_id TEXT PRIMARY KEY,
+                    discord_event_id INTEGER NOT NULL,
+                    guild_id INTEGER NOT NULL,
+                    publish_channel_id INTEGER NOT NULL,
+                    event_name TEXT NOT NULL,
+                    offset_minutes INTEGER NOT NULL,
+                    scheduled_for_utc TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    start_event INTEGER NOT NULL DEFAULT 0,
+                    sent_at_utc TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_event_reminders_due
+                ON event_reminders(sent_at_utc, scheduled_for_utc);
+
+                CREATE INDEX IF NOT EXISTS idx_event_reminders_event
+                ON event_reminders(discord_event_id);
 
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
@@ -825,6 +862,145 @@ class AdminState:
         with self._conn() as conn:
             row = conn.execute("SELECT 1 FROM daily_schedule_posts WHERE local_date=?", (local_date,)).fetchone()
         return row is not None
+
+    def replace_event_reminders(
+        self,
+        *,
+        discord_event_id: int,
+        guild_id: int,
+        publish_channel_id: int,
+        event_name: str,
+        event_start_utc: datetime,
+        reminders,
+    ) -> int:
+        if event_start_utc.tzinfo is None:
+            raise ValueError("event_start_utc must be timezone-aware")
+        start_utc = event_start_utc.astimezone(timezone.utc)
+        rows = []
+        for reminder in reminders:
+            offset_minutes = int(reminder.offset_minutes)
+            rows.append(
+                (
+                    uuid.uuid4().hex,
+                    int(discord_event_id),
+                    int(guild_id),
+                    int(publish_channel_id),
+                    event_name.strip(),
+                    offset_minutes,
+                    (start_utc + timedelta(minutes=offset_minutes)).isoformat(),
+                    str(reminder.message).strip(),
+                    1 if bool(reminder.start_event) else 0,
+                )
+            )
+
+        with self._conn() as conn:
+            conn.execute("DELETE FROM event_reminders WHERE discord_event_id=?", (int(discord_event_id),))
+            if rows:
+                conn.executemany(
+                    """INSERT INTO event_reminders(
+                           reminder_id, discord_event_id, guild_id, publish_channel_id, event_name,
+                           offset_minutes, scheduled_for_utc, message, start_event
+                       )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+        return len(rows)
+
+    @staticmethod
+    def _event_reminder_from_row(row) -> EventReminderRecord:
+        sent_at = row["sent_at_utc"]
+        return EventReminderRecord(
+            reminder_id=row["reminder_id"],
+            discord_event_id=int(row["discord_event_id"]),
+            guild_id=int(row["guild_id"]),
+            publish_channel_id=int(row["publish_channel_id"]),
+            event_name=row["event_name"],
+            offset_minutes=int(row["offset_minutes"]),
+            scheduled_for_utc=datetime.fromisoformat(row["scheduled_for_utc"]),
+            message=row["message"],
+            start_event=bool(row["start_event"]),
+            sent_at_utc=datetime.fromisoformat(sent_at) if sent_at else None,
+            attempts=int(row["attempts"]),
+            last_error=row["last_error"],
+        )
+
+    def due_event_reminders(self, now_utc: datetime, *, limit: int = 25) -> list[EventReminderRecord]:
+        if now_utc.tzinfo is None:
+            raise ValueError("now_utc must be timezone-aware")
+        limit = max(1, min(int(limit), 100))
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT reminder_id, discord_event_id, guild_id, publish_channel_id, event_name,
+                          offset_minutes, scheduled_for_utc, message, start_event, sent_at_utc,
+                          attempts, last_error
+                   FROM event_reminders
+                   WHERE sent_at_utc IS NULL AND scheduled_for_utc <= ?
+                   ORDER BY scheduled_for_utc ASC
+                   LIMIT ?""",
+                (now_utc.astimezone(timezone.utc).isoformat(), limit),
+            ).fetchall()
+        return [self._event_reminder_from_row(row) for row in rows]
+
+    def event_reminders_for_event(self, discord_event_id: int) -> list[EventReminderRecord]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT reminder_id, discord_event_id, guild_id, publish_channel_id, event_name,
+                          offset_minutes, scheduled_for_utc, message, start_event, sent_at_utc,
+                          attempts, last_error
+                   FROM event_reminders
+                   WHERE discord_event_id=?
+                   ORDER BY offset_minutes ASC""",
+                (int(discord_event_id),),
+            ).fetchall()
+        return [self._event_reminder_from_row(row) for row in rows]
+
+    def mark_event_reminder_sent(self, reminder_id: str, *, sent_at_utc: datetime | None = None) -> None:
+        sent = (sent_at_utc or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE event_reminders
+                   SET sent_at_utc=?, last_error=NULL
+                   WHERE reminder_id=?""",
+                (sent, reminder_id),
+            )
+
+    def mark_event_reminder_failed(self, reminder_id: str, error: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE event_reminders
+                   SET attempts=attempts+1, last_error=?
+                   WHERE reminder_id=?""",
+                (error[:500], reminder_id),
+            )
+
+    def reschedule_event_reminders(self, discord_event_id: int, new_start_utc: datetime) -> int:
+        if new_start_utc.tzinfo is None:
+            raise ValueError("new_start_utc must be timezone-aware")
+        start = new_start_utc.astimezone(timezone.utc)
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT reminder_id, offset_minutes
+                   FROM event_reminders
+                   WHERE discord_event_id=? AND sent_at_utc IS NULL""",
+                (int(discord_event_id),),
+            ).fetchall()
+            for row in rows:
+                scheduled = start + timedelta(minutes=int(row["offset_minutes"]))
+                conn.execute(
+                    """UPDATE event_reminders
+                       SET scheduled_for_utc=?, last_error=NULL
+                       WHERE reminder_id=?""",
+                    (scheduled.isoformat(), row["reminder_id"]),
+                )
+        return len(rows)
+
+    def delete_event_reminders(self, discord_event_id: int) -> int:
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM event_reminders WHERE discord_event_id=?",
+                (int(discord_event_id),),
+            )
+            return int(cursor.rowcount or 0)
 
     def set_value(self, key: str, value: str) -> None:
         now = datetime.now(timezone.utc).isoformat()

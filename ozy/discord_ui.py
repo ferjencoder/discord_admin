@@ -7,7 +7,9 @@ from datetime import datetime, time as dt_time, timedelta, timezone
 
 import discord
 
+from ozy.data_provider import DataUnavailable
 from ozy.event_calendar import reset_label
+from ozy.event_reminders import format_reminder_offsets, parse_reminder_plan
 
 log = logging.getLogger("ozy-admin.ui")
 
@@ -270,6 +272,14 @@ class EventScheduleModal(discord.ui.Modal):
                 discord.SelectOption(label="Leadership", value="leadership", description="Leader / Superior schedule only"),
             ],
         )
+        reminder_default = "OMENS" if "omen" in draft.name.casefold() else None
+        self.reminders = discord.ui.TextInput(
+            placeholder="OMENS or -2h | Be ready; 0 | Start now; +1h | Follow-up",
+            default=reminder_default,
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=1800,
+        )
         self.add_item(discord.ui.Label(
             text="R+0 reset date",
             description="The calendar date on which this game day starts at R+0.",
@@ -278,6 +288,11 @@ class EventScheduleModal(discord.ui.Modal):
         self.add_item(discord.ui.Label(text="Game reset time", component=self.reset_time))
         self.add_item(discord.ui.Label(text="Duration in minutes", component=self.duration))
         self.add_item(discord.ui.Label(text="Audience", component=self.audience))
+        self.add_item(discord.ui.Label(
+            text="Reminders (optional)",
+            description="Use OMENS for the Day 1 preset, or offset | message entries separated by semicolons.",
+            component=self.reminders,
+        ))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.draft.creator_id:
@@ -319,6 +334,14 @@ class EventScheduleModal(discord.ui.Modal):
                 raise ValueError("Duration must be between 15 and 720 minutes.")
             if start_time <= datetime.now(timezone.utc) + timedelta(minutes=1):
                 raise ValueError("The event start must be in the future.")
+            requested_reminders = parse_reminder_plan(str(self.reminders.value or ""))
+            reminder_cutoff = datetime.now(timezone.utc) + timedelta(seconds=30)
+            reminders = [
+                reminder
+                for reminder in requested_reminders
+                if start_time + timedelta(minutes=reminder.offset_minutes) > reminder_cutoff
+            ]
+            skipped_reminder_count = len(requested_reminders) - len(reminders)
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
@@ -367,6 +390,8 @@ class EventScheduleModal(discord.ui.Modal):
         embed.add_field(name="Category", value=category.name, inline=True)
         embed.add_field(name="Event channel", value=_channel_display(event_channel), inline=True)
         embed.add_field(name="Audience", value="Leadership" if audience == "leadership" else "Clan", inline=True)
+        if reminders:
+            embed.add_field(name="Reminders", value=format_reminder_offsets(reminders), inline=True)
         embed.add_field(name="Created by", value=interaction.user.mention, inline=True)
         embed.set_footer(text="OZY Event")
 
@@ -385,6 +410,21 @@ class EventScheduleModal(discord.ui.Modal):
             publish_error = "I cannot post in the selected publish channel."
         except discord.HTTPException as exc:
             publish_error = f"Publishing failed: {exc}"
+
+        reminder_store_error = None
+        if reminders:
+            try:
+                self.bot.state.replace_event_reminders(
+                    discord_event_id=event.id,
+                    guild_id=guild.id,
+                    publish_channel_id=publish_channel.id,
+                    event_name=self.draft.name,
+                    event_start_utc=start_time,
+                    reminders=reminders,
+                )
+            except Exception as exc:
+                reminder_store_error = str(exc)
+                log.exception("Could not persist reminders for Discord event %s", event.id)
 
         # The website is the canonical schedule store. Persist the Discord event
         # even if its announcement could not be posted, so schedule data is not lost.
@@ -431,6 +471,14 @@ class EventScheduleModal(discord.ui.Modal):
             status_lines.append(f"Published in {_channel_display(publish_channel)}")
         elif publish_error:
             status_lines.append(f"Warning: {publish_error}")
+        if reminders and reminder_store_error is None:
+            status_lines.append(f"Reminders: **{format_reminder_offsets(reminders)}**")
+        elif reminder_store_error:
+            status_lines.append(f"Warning: reminder scheduling failed: {reminder_store_error}")
+        if skipped_reminder_count:
+            status_lines.append(
+                f"Skipped **{skipped_reminder_count}** reminder(s) whose time had already passed."
+            )
         if schedule_sync_error:
             status_lines.append(f"Warning: website schedule sync failed: {schedule_sync_error}")
         else:
@@ -451,6 +499,7 @@ class EventScheduleModal(discord.ui.Modal):
             f"Event channel: #{getattr(event_channel, 'name', event_channel.id)}\n"
             f"Published: {('#' + getattr(publish_channel, 'name', str(publish_channel.id)) + ' (' + str(published.id) + ')') if published is not None else 'failed'}\n"
             f"Website schedule: {'failed - ' + schedule_sync_error if schedule_sync_error else 'synced'}\n"
+            f"Reminders: {format_reminder_offsets(reminders) if reminders else 'none'}\n"
             f"Start: {start_time.isoformat()} ({reset_text})",
         )
 

@@ -175,3 +175,41 @@ def test_web_snapshot_roundtrip_across_fresh_local_files(tmp_path, monkeypatch):
     assert profile.troop_level == "G9"
     assert "OZY Web snapshot" in second.storage_label
     second.close()
+
+
+def test_event_reminders_roundtrip_and_reschedule(tmp_path):
+    from ozy.event_reminders import ReminderSpec
+
+    state = AdminState(tmp_path / "state.sqlite3")
+    start = datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+    reminders = [
+        ReminderSpec(-120, "two hours"),
+        ReminderSpec(0, "start"),
+        ReminderSpec(60, "plus one"),
+    ]
+    assert state.replace_event_reminders(
+        discord_event_id=77,
+        guild_id=88,
+        publish_channel_id=99,
+        event_name="OMENS - DAY 1",
+        event_start_utc=start,
+        reminders=reminders,
+    ) == 3
+
+    saved = state.event_reminders_for_event(77)
+    assert [item.offset_minutes for item in saved] == [-120, 0, 60]
+    assert saved[1].start_event is True
+
+    due = state.due_event_reminders(start - timedelta(minutes=119))
+    assert [item.offset_minutes for item in due] == [-120]
+    state.mark_event_reminder_sent(due[0].reminder_id)
+
+    new_start = start + timedelta(hours=2)
+    assert state.reschedule_event_reminders(77, new_start) == 2
+    saved = state.event_reminders_for_event(77)
+    assert saved[0].sent_at_utc is not None
+    assert saved[1].scheduled_for_utc == new_start
+    assert saved[2].scheduled_for_utc == new_start + timedelta(hours=1)
+
+    assert state.delete_event_reminders(77) == 3
+    assert state.event_reminders_for_event(77) == []

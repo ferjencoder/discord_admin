@@ -103,6 +103,7 @@ def test_roster_identity_prefers_stable_user_id_after_rename(tmp_path):
 
 def test_current_chest_week(tmp_path):
     s = make_settings(tmp_path)
+    s.roster_file.write_text(json.dumps({"members": {"PeekABoo Death": {}}}), encoding="utf-8")
     s.chest_data_file.write_text(json.dumps({
         "weekly_target": 1000,
         "weeks": [{

@@ -17,10 +17,11 @@ from discord import app_commands
 
 from ozy.data_provider import DataProvider, DataUnavailable
 from settings import ConfigError, Settings, load_settings
-from ozy.state import AdminState
+from ozy.state import AdminState, EventReminderRecord
 from ozy.utils import format_chat_directory, format_chest_ranking_blocks, format_schedule, safe_code_block, truncate
 from ozy.constants import PROFILE_LANGUAGES
 from ozy.onboarding_profile import extract_onboarding_profile
+from ozy.member_messages import choose_goodbye, choose_welcome
 from ozy.discord_ui import (
     AnnouncementModal,
     EventScheduleView,
@@ -96,6 +97,7 @@ class OZYAdminBot(discord.Client):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.members = True
+        intents.guild_scheduled_events = True
 
         super().__init__(intents=intents)
         self.settings = settings
@@ -114,6 +116,7 @@ class OZYAdminBot(discord.Client):
         self.background_tasks: list[asyncio.Task] = []
         self._guild_validated = False
         self._message_series_lock = asyncio.Lock()
+        self._welcome_inflight: set[int] = set()
 
         self._register_commands()
 
@@ -143,6 +146,7 @@ class OZYAdminBot(discord.Client):
 
         self.background_tasks.append(asyncio.create_task(self._daily_schedule_loop(), name="daily-schedule"))
         self.background_tasks.append(asyncio.create_task(self._away_expiry_loop(), name="away-expiry"))
+        self.background_tasks.append(asyncio.create_task(self._event_reminder_loop(), name="event-reminders"))
         if self.settings.chest_reset_post_enabled and self.settings.chest_channel_id:
             self.background_tasks.append(asyncio.create_task(self._daily_chest_ranking_loop(), name="daily-chest-ranking"))
         if self.settings.calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
@@ -184,8 +188,11 @@ class OZYAdminBot(discord.Client):
         log.info("OZY Admin operational as %s (%s)", self.user, self.user.id if self.user else "?")
 
     async def on_scheduled_event_delete(self, event: discord.ScheduledEvent) -> None:
-        """Remove deleted Discord events from the canonical website schedule."""
-        if event.guild_id != self.settings.server_id or self.data is None:
+        """Remove deleted Discord events from the canonical website schedule and reminder queue."""
+        if event.guild_id != self.settings.server_id:
+            return
+        self.state.delete_event_reminders(event.id)
+        if self.data is None:
             return
         try:
             removed = await self.data.delete_schedule_event(event.id)
@@ -193,6 +200,21 @@ class OZYAdminBot(discord.Client):
                 log.info("Removed Discord event %s from OZY website schedule", event.id)
         except DataUnavailable as exc:
             log.warning("Could not remove Discord event %s from website schedule: %s", event.id, exc)
+
+    async def on_scheduled_event_update(
+        self,
+        before: discord.ScheduledEvent,
+        after: discord.ScheduledEvent,
+    ) -> None:
+        """Keep pending reminder times aligned with Discord event edits."""
+        if after.guild_id != self.settings.server_id:
+            return
+        if before.start_time != after.start_time:
+            count = self.state.reschedule_event_reminders(after.id, after.start_time)
+            if count:
+                log.info("Rescheduled %d pending reminders for Discord event %s", count, after.id)
+        if after.status in {discord.EventStatus.cancelled, discord.EventStatus.completed}:
+            self.state.delete_event_reminders(after.id)
 
     async def _start_health_server(self) -> None:
         async def health(_: web.Request) -> web.Response:
@@ -591,40 +613,73 @@ class OZYAdminBot(discord.Client):
         # under the branded START HERE category is the intended configuration.
         return matches[0] if len(matches) == 1 else None
 
+    def _onboarding_selection(self, member: discord.Member):
+        return extract_onboarding_profile(
+            ((role.id, role.name) for role in member.roles),
+            self.settings.language_role_map,
+        )
+
+    def _member_language_code(self, member: discord.Member) -> str:
+        selection = self._onboarding_selection(member)
+        if selection.preferred_language:
+            return selection.preferred_language
+
+        # Member removal events may arrive without every role still being useful.
+        # The durable profile mirror gives us the member's latest chosen language.
+        profile = self.state.get_member_profile(member.id)
+        if profile and profile.preferred_language:
+            return profile.preferred_language
+        return "EN"
+
     async def _process_new_member(self, member: discord.Member) -> None:
-        """Post a themed hello only. Discord owns onboarding and access."""
+        """Post one localized themed hello after native onboarding is complete."""
         if member.guild.id != self.settings.server_id or member.bot:
             return
+        if self.state.was_welcomed(member.id) or member.id in self._welcome_inflight:
+            return
 
-        # Keep profile metadata mirrored for admin/reporting features only.
-        self._sync_profile_from_onboarding_roles(member)
-
-        channel: discord.TextChannel | None = None
-        if self.settings.welcome_channel_id:
-            candidate = self.get_channel(self.settings.welcome_channel_id)
-            if isinstance(candidate, discord.TextChannel):
-                channel = candidate
-        if channel is None:
-            channel = self._find_start_here_text_channel(member.guild, "welcome")
-
-        if channel is not None:
-            embed = discord.Embed(
-                title="🚂 ALL ABOARD THE CRAZY TRAIN!",
-                description=(
-                    f"Welcome {member.mention} to **[OZY] Odyssey**! 🤘\n\n"
-                    "The gates are open, the bats are awake, and the Madhouse just got louder. "
-                    "Grab a seat on the Crazy Train and make some noise. 🦇"
-                ),
-                color=0xF59E0B,
+        selection = self._onboarding_selection(member)
+        if not selection.complete:
+            log.info(
+                "Member %s welcome deferred until native onboarding profile is complete",
+                member.id,
             )
-            await channel.send(
-                content=member.mention,
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-            )
+            return
 
-        self.state.mark_welcomed(member.id)
-        await self._audit("Member joined", str(member), f"Discord ID: {member.id}")
+        self._welcome_inflight.add(member.id)
+        try:
+            # Keep profile metadata mirrored for admin/reporting features only.
+            self._sync_profile_from_onboarding_roles(member)
+
+            channel: discord.TextChannel | None = None
+            if self.settings.welcome_channel_id:
+                candidate = self.get_channel(self.settings.welcome_channel_id)
+                if isinstance(candidate, discord.TextChannel):
+                    channel = candidate
+            if channel is None:
+                channel = self._find_start_here_text_channel(member.guild, "welcome")
+
+            if channel is not None:
+                message = choose_welcome(selection.preferred_language)
+                embed = discord.Embed(
+                    title=message.title,
+                    description=message.body.format(member=member.mention),
+                    color=0xF59E0B,
+                )
+                await channel.send(
+                    content=member.mention,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
+
+            self.state.mark_welcomed(member.id)
+            await self._audit(
+                "Member joined",
+                str(member),
+                f"Discord ID: {member.id} / language: {selection.preferred_language}",
+            )
+        finally:
+            self._welcome_inflight.discard(member.id)
 
     async def on_member_join(self, member: discord.Member) -> None:
         if member.guild.id != self.settings.server_id or member.bot:
@@ -632,13 +687,16 @@ class OZYAdminBot(discord.Client):
         if member.pending:
             log.info("Member %s joined pending screening; welcome deferred", member.id)
             return
+        # Native Community Onboarding may assign language/G/M/S after the join
+        # event. _process_new_member intentionally waits for all four selections.
         await self._process_new_member(member)
 
     async def on_member_remove(self, member: discord.Member) -> None:
-        """Post a themed goodbye only. No identity/access logic runs on leave."""
+        """Post a localized themed goodbye only. No identity/access logic runs."""
         if member.guild.id != self.settings.server_id or member.bot:
             return
 
+        language = self._member_language_code(member)
         self.state.clear_welcomed(member.id)
         self.state.clear_away(member.id)
 
@@ -646,25 +704,34 @@ class OZYAdminBot(discord.Client):
 
         if channel is not None:
             display_name = discord.utils.escape_markdown(member.display_name)
+            message = choose_goodbye(language)
             embed = discord.Embed(
-                title="🦇 Another Bat Leaves the Belfry",
-                description=(
-                    f"**{display_name}** has left **[OZY] Odyssey**.\n\n"
-                    "The bats raise a wing in salute. Safe travels beyond the gates. 🤘"
-                ),
+                title=message.title,
+                description=message.body.format(member=display_name),
                 color=0x6B21A8,
             )
             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
-        await self._audit("Member left Discord", str(member), f"Discord ID: {member.id}")
+        await self._audit(
+            "Member left Discord",
+            str(member),
+            f"Discord ID: {member.id} / language: {language}",
+        )
 
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         if after.guild.id != self.settings.server_id or after.bot:
             return
-        if before.pending and not after.pending:
-            await self._process_new_member(after)
-        if {role.id for role in before.roles} != {role.id for role in after.roles}:
+
+        roles_changed = {role.id for role in before.roles} != {role.id for role in after.roles}
+        if roles_changed:
             self._sync_profile_from_onboarding_roles(after)
+
+        # Community Onboarding role assignment can happen after on_member_join.
+        # As soon as language + G/M/S are all present, send exactly one welcome
+        # in the selected language. Later role/profile edits never re-welcome.
+        if (before.pending and not after.pending) or roles_changed:
+            if not self.state.was_welcomed(after.id):
+                await self._process_new_member(after)
 
     # ------------------------------------------------------------------
     # Announcements
@@ -826,7 +893,7 @@ class OZYAdminBot(discord.Client):
         self.data.invalidate("roster")
         self.data.invalidate("chests")
         try:
-            leaderboard = await self.data.chest_leaderboard(today=target_date)
+            leaderboard = await self.data.chest_leaderboard()
         except DataUnavailable as exc:
             log.warning("Chest ranking unavailable: %s", exc)
             return False
@@ -1260,6 +1327,116 @@ class OZYAdminBot(discord.Client):
     # ------------------------------------------------------------------
     # Away expiry
     # ------------------------------------------------------------------
+    @staticmethod
+    def _subscriber_mention_chunks(users, *, max_chars: int = 1500) -> list[str]:
+        mentions = [user.mention for user in users if not getattr(user, "bot", False)]
+        chunks: list[str] = []
+        current: list[str] = []
+        length = 0
+        for mention in mentions:
+            extra = len(mention) + (1 if current else 0)
+            if current and length + extra > max_chars:
+                chunks.append(" ".join(current))
+                current = []
+                length = 0
+            current.append(mention)
+            length += len(mention) + (1 if length else 0)
+        if current:
+            chunks.append(" ".join(current))
+        return chunks
+
+    async def _send_event_reminder(self, reminder: EventReminderRecord) -> None:
+        guild = self.get_guild(reminder.guild_id)
+        if guild is None:
+            raise RuntimeError(f"Guild {reminder.guild_id} is unavailable")
+
+        channel = guild.get_channel_or_thread(reminder.publish_channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            raise RuntimeError(f"Publish channel {reminder.publish_channel_id} is unavailable")
+
+        event = guild.get_scheduled_event(reminder.discord_event_id)
+        if event is None:
+            event = await guild.fetch_scheduled_event(reminder.discord_event_id, with_counts=True)
+
+        if reminder.start_event and event.status == discord.EventStatus.scheduled:
+            event = await event.start(reason="OZY automatic event start reminder")
+
+        subscribers = []
+        # At offset 0 Discord's native event start already notifies Interested users.
+        # For the before/after reminders, explicitly ping those same subscribers.
+        if not reminder.start_event:
+            try:
+                async for user in event.users(limit=None):
+                    subscribers.append(user)
+            except discord.HTTPException as exc:
+                log.warning("Could not load subscribers for event %s: %s", event.id, exc)
+
+        header = f"## ⏰ {reminder.event_name}\n{reminder.message}\n\n{event.url}"
+        mention_chunks = self._subscriber_mention_chunks(subscribers)
+        if mention_chunks:
+            first = f"{header}\n\n{mention_chunks[0]}"
+            await channel.send(
+                first[:2000],
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+            for chunk in mention_chunks[1:]:
+                await channel.send(
+                    chunk,
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
+        else:
+            await channel.send(
+                header[:2000],
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    async def _event_reminder_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            now = datetime.now(timezone.utc)
+            for reminder in self.state.due_event_reminders(now, limit=25):
+                # Do not dump stale reminders into chat after a long outage.
+                # Three hours still allows useful catch-up for short service restarts.
+                if now - reminder.scheduled_for_utc > timedelta(hours=3):
+                    log.warning(
+                        "Skipping stale event reminder %s for event %s",
+                        reminder.reminder_id,
+                        reminder.discord_event_id,
+                    )
+                    self.state.mark_event_reminder_sent(reminder.reminder_id, sent_at_utc=now)
+                    continue
+                try:
+                    await self._send_event_reminder(reminder)
+                except asyncio.CancelledError:
+                    raise
+                except discord.NotFound:
+                    log.warning(
+                        "Scheduled event %s no longer exists; dropping reminder %s",
+                        reminder.discord_event_id,
+                        reminder.reminder_id,
+                    )
+                    self.state.mark_event_reminder_sent(reminder.reminder_id, sent_at_utc=now)
+                except Exception as exc:
+                    self.state.mark_event_reminder_failed(reminder.reminder_id, str(exc))
+                    log.exception(
+                        "Event reminder %s failed (attempt %d)",
+                        reminder.reminder_id,
+                        reminder.attempts + 1,
+                    )
+                else:
+                    self.state.mark_event_reminder_sent(reminder.reminder_id)
+                    log.info(
+                        "Sent event reminder %s for event %s at offset %+dm",
+                        reminder.reminder_id,
+                        reminder.discord_event_id,
+                        reminder.offset_minutes,
+                    )
+
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
+
     async def _away_expiry_loop(self) -> None:
         await self.wait_until_ready()
         while not self.is_closed():
@@ -1533,6 +1710,7 @@ class OZYAdminBot(discord.Client):
             status = "Target met" if stats.met_target else (f"{missing:,} points remaining" if stats.target else "No target configured")
             embed = discord.Embed(title=f"Chest status - {stats.player}", color=0x10B981 if stats.met_target else 0xF59E0B)
             embed.description = stats.week_label
+            embed.set_footer(text=stats.source_note)
             embed.add_field(name="Points", value=target_text, inline=True)
             embed.add_field(name="Chests", value=f"{stats.chests:,}", inline=True)
             embed.add_field(name="Status", value=status, inline=False)
@@ -1587,7 +1765,7 @@ class OZYAdminBot(discord.Client):
             self.data.invalidate("roster")
             self.data.invalidate("chests")
             try:
-                leaderboard = await self.data.chest_leaderboard(today=target_date)
+                leaderboard = await self.data.chest_leaderboard()
             except DataUnavailable as exc:
                 await interaction.followup.send(f"Chest data unavailable: {exc}", ephemeral=True)
                 return
@@ -1630,7 +1808,7 @@ class OZYAdminBot(discord.Client):
                 lines.append(f"Roster: **FAILED** - {exc}")
 
             try:
-                board = await self.data.chest_leaderboard(today=datetime.now(self.settings.timezone).date())
+                board = await self.data.chest_leaderboard()
                 source = self.settings.chest_data_url or str(self.settings.chest_data_file)
                 if board is None:
                     lines.append(f"Chests: **NO CURRENT DATA**\nSource: `{source}`")
@@ -1638,7 +1816,7 @@ class OZYAdminBot(discord.Client):
                     lines.append(
                         f"Chests: **OK** - {board.week_label}\nSource: `{source}`\n"
                         f"Players ranked: {len(board.members)} - Points: {board.total_points:,} - Chests: {board.total_chests:,}\n"
-                        f"Generated: {board.generated or 'unknown'}"
+                        f"{board.source_note}"
                     )
             except DataUnavailable as exc:
                 lines.append(f"Chests: **FAILED** - {exc}")

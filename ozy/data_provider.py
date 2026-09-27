@@ -5,7 +5,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -34,6 +34,7 @@ class ChestStats:
     target: int
     met_target: bool
     breakdown: dict[str, int]
+    source_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class ChestLeaderboard:
     total_chests: int
     generated: str | None
     members: tuple[ChestRankEntry, ...]
+    source_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,25 +103,19 @@ class DataProvider:
                     headers = {}
                     if ozy_api_auth and self.settings.ozy_data_api_token:
                         headers["X-OZY-Admin-Token"] = self.settings.ozy_data_api_token
-                    async with self.session.get(url, timeout=timeout, headers=headers) as response:
+                    async with self.session.get(url, timeout=timeout, headers=headers, allow_redirects=False) as response:
                         if response.status != 200:
                             raise DataUnavailable(f"{key} source returned HTTP {response.status}")
                         data = await response.json(content_type=None)
                 except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
-                    if cached:
-                        return cached[1]
-                    raise DataUnavailable(f"Could not load {key} from URL: {exc}") from exc
+                    raise DataUnavailable(f"Could not load {key} from URL ({type(exc).__name__})") from exc
             else:
                 try:
                     text = await asyncio.to_thread(path.read_text, encoding="utf-8")
                     data = json.loads(text)
                 except FileNotFoundError as exc:
-                    if cached:
-                        return cached[1]
                     raise DataUnavailable(f"{key} file not found: {path}") from exc
                 except (OSError, json.JSONDecodeError) as exc:
-                    if cached:
-                        return cached[1]
                     raise DataUnavailable(f"Could not load {key} file {path}: {exc}") from exc
 
             self._cache[key] = (time.monotonic(), data)
@@ -138,6 +134,7 @@ class DataProvider:
             self.settings.roster_file,
             ozy_api_auth=True,
         )
+        self._validate_source(raw)
         members = raw.get("members", raw) if isinstance(raw, dict) else raw
 
         result: dict[str, dict[str, Any]] = {}
@@ -148,7 +145,7 @@ class DataProvider:
                 payload = dict(info) if isinstance(info, dict) else {}
                 if str(payload.get("status", "active")).casefold() == "removed":
                     continue
-                result[name] = payload
+                result[name] = {**payload, "name": name}
             return result
 
         if isinstance(members, list):
@@ -170,8 +167,8 @@ class DataProvider:
         if not candidate:
             return None
         roster = await self.roster()
-        lookup = {name.casefold(): name for name in roster}
-        return lookup.get(candidate.casefold())
+        matches = [name for name in roster if name.casefold() == candidate.casefold()]
+        return matches[0] if len(matches) == 1 else None
 
     async def roster_suggestions(self, candidate: str, limit: int = 3) -> list[RosterMatch]:
         """Return advisory roster-name suggestions only.
@@ -241,18 +238,103 @@ class DataProvider:
         if stable_id:
             for name, info in roster.items():
                 if str(info.get("user_id", "")).strip() == stable_id:
-                    return {"name": name, **info}
+                    return {**info, "name": name}
+            return None
 
         candidate = (game_name or "").strip()
         if not candidate:
             return None
-        lookup = {name.casefold(): name for name in roster}
-        canonical = lookup.get(candidate.casefold())
+        matches = [name for name in roster if name.casefold() == candidate.casefold()]
+        canonical = matches[0] if len(matches) == 1 else None
         if canonical is None:
             return None
         return {"name": canonical, **roster[canonical]}
 
-    async def chest_stats(self, game_name: str, today: date | None = None) -> ChestStats | None:
+    @staticmethod
+    def _count(value: Any) -> int:
+        if value is None:
+            return 0
+        try:
+            number = int(value)
+            if isinstance(value, bool) or number < 0 or float(value) != number:
+                raise ValueError
+            return number
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise DataUnavailable("Invalid website chest count or points") from exc
+
+    @staticmethod
+    def _validate_source(raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        meta = raw.get("roster_meta") or {}
+        for tag in (raw.get("clan_tag"), meta.get("clan")):
+            if tag and str(tag).upper() != "OZY":
+                raise DataUnavailable("Dataset belongs to a different clan")
+        if raw.get("clan_id") and str(raw["clan_id"]) != "4423816314895":
+            raise DataUnavailable("Dataset clan ID does not match OZY")
+        for source in (raw, raw.get("counter") or {}, raw.get("passive") or {}):
+            if str(source.get("mode", "")).lower() in {"shadow", "inactive", "preview"} or source.get("active") is False:
+                raise DataUnavailable("Website scoring is shadow/inactive; no official results available")
+        if raw.get("error"):
+            raise DataUnavailable("Website returned an error payload")
+
+    @staticmethod
+    def _timestamp(value: Any) -> datetime:
+        result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if result.tzinfo is None:
+            raise ValueError("Timestamp requires a timezone")
+        return result.astimezone(timezone.utc)
+
+    def _select_week(self, raw: dict, today: date | datetime | None) -> dict | None:
+        # Explicit dates are a legacy testing interface, interpreted at R+0 UTC.
+        now = today or datetime.now(timezone.utc)
+        if not isinstance(now, datetime):
+            now = datetime.combine(now, dt_time(17), tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            raise DataUnavailable("Reporting instant requires a timezone")
+        weeks = raw.get("weeks", [])
+        if not isinstance(weeks, list):
+            raise DataUnavailable("Chest weeks must be a list")
+        matches = []
+        for week in weeks:
+            if not isinstance(week, dict):
+                raise DataUnavailable("Invalid chest week")
+            try:
+                if week.get("start_at") or week.get("end_at"):
+                    start, end = self._timestamp(week.get("start_at")), self._timestamp(week.get("end_at"))
+                else:
+                    start_day, end_day = date.fromisoformat(week["start"]), date.fromisoformat(week["end"])
+                    start = datetime.combine(start_day, dt_time(17), tzinfo=timezone.utc)
+                    # Legacy exports label the last included day; newer dates label the boundary.
+                    if (end_day - start_day).days == 6:
+                        end_day += timedelta(days=1)
+                    end = datetime.combine(end_day, dt_time(17), tzinfo=timezone.utc)
+                if end <= start:
+                    raise ValueError
+            except (TypeError, ValueError, KeyError) as exc:
+                raise DataUnavailable("Invalid website reporting period") from exc
+            if start <= now < end:
+                if not isinstance(week.get("members"), list) or any(not isinstance(m, dict) for m in week["members"]):
+                    raise DataUnavailable("Invalid chest members")
+                matches.append(week)
+        if len(matches) > 1:
+            raise DataUnavailable("Overlapping website reporting periods")
+        return matches[0] if matches else None
+
+    def _source_note(self, raw: dict) -> str:
+        generated = raw.get("generated")
+        try:
+            stamp = self._timestamp(generated)
+            age = datetime.now(timezone.utc) - stamp
+            freshness = " (older than 24 hours)" if age > timedelta(hours=24) else ""
+            updated = stamp.strftime("%Y-%m-%d %H:%M UTC") + freshness
+        except (TypeError, ValueError):
+            updated = "unknown"
+        active = (raw.get("counter") or {}).get("activeAt")
+        state = "Website counter active" if active else "Published website snapshot; live activation unconfirmed"
+        return f"{state}. Source updated: {updated}"
+
+    async def chest_stats(self, game_name: str, today: date | datetime | None = None) -> ChestStats | None:
         raw = await self._load_json(
             "chests",
             self.settings.chest_data_url,
@@ -262,45 +344,28 @@ class DataProvider:
         if not isinstance(raw, dict):
             raise DataUnavailable("Chest data must be a JSON object")
 
-        weeks = raw.get("weeks") or []
-        if not isinstance(weeks, list) or not weeks:
-            return None
-
-        today = today or datetime.now(self.settings.timezone).date()
-        selected = None
-        for week in weeks:
-            if not isinstance(week, dict):
-                continue
-            try:
-                start = date.fromisoformat(str(week.get("start")))
-                end = date.fromisoformat(str(week.get("end")))
-            except (TypeError, ValueError):
-                continue
-            if start <= today <= end:
-                selected = week
-                break
-        if selected is None:
-            selected = next((w for w in weeks if isinstance(w, dict)), None)
+        self._validate_source(raw)
+        selected = self._select_week(raw, today)
         if selected is None:
             return None
-
-        target = int(raw.get("weekly_target") or selected.get("weekly_target") or 0)
-        lookup_name = game_name.casefold()
-        for member in selected.get("members") or []:
-            if not isinstance(member, dict):
-                continue
-            name = str(member.get("name", ""))
-            if name.casefold() != lookup_name:
-                continue
+        target = self._count(selected.get("weekly_target", raw.get("weekly_target", 0)))
+        info = await self.resolve_roster_member(game_name=game_name)
+        if info is None:
+            return None
+        name = info["name"]
+        member = self._chest_member(selected, name, info.get("user_id"))
+        if member is not None:
             breakdown_raw = member.get("breakdown") or {}
+            if not isinstance(breakdown_raw, dict):
+                raise DataUnavailable("Invalid website chest breakdown")
             breakdown = {
-                str(k): int(v or 0)
+                str(k): self._count(v)
                 for k, v in breakdown_raw.items()
-                if isinstance(v, (int, float)) and int(v or 0) > 0
+                if self._count(v) > 0
             }
-            points = int(member.get("points") or 0)
-            chests = int(member.get("chests") or 0)
-            met_target = bool(member.get("met_target")) or (target > 0 and points >= target)
+            points = self._count(member.get("points"))
+            chests = self._count(member.get("chests"))
+            met_target = target > 0 and points >= target
             return ChestStats(
                 player=name,
                 week_label=str(selected.get("label") or f"{selected.get('start', '')} - {selected.get('end', '')}"),
@@ -309,10 +374,25 @@ class DataProvider:
                 target=target,
                 met_target=met_target,
                 breakdown=breakdown,
+                source_note=self._source_note(raw),
             )
         return None
 
-    async def chest_leaderboard(self, today: date | None = None) -> ChestLeaderboard | None:
+    @staticmethod
+    def _chest_member(week: dict, name: str, user_id: Any) -> dict:
+        rows = week["members"]
+        stable_id = str(user_id or "").strip()
+        identified = [row for row in rows if stable_id and str(row.get("user_id") or "").strip() == stable_id]
+        exact = [row for row in rows if str(row.get("name", "")).strip() == name]
+        matches = identified or exact or [row for row in rows if str(row.get("name", "")).strip().casefold() == name.casefold()]
+        if len(matches) > 1:
+            raise DataUnavailable("Ambiguous chest player identity")
+        item = matches[0] if matches else {}
+        if item.get("user_id") and stable_id and str(item["user_id"]).strip() != stable_id:
+            raise DataUnavailable("Chest and roster player IDs disagree")
+        return item
+
+    async def chest_leaderboard(self, today: date | datetime | None = None) -> ChestLeaderboard | None:
         """Return the current chest ranking using the active roster as authority.
 
         Players missing from chest_data.json are included with zero points. Players
@@ -327,44 +407,18 @@ class DataProvider:
         if not isinstance(raw, dict):
             raise DataUnavailable("Chest data must be a JSON object")
 
-        weeks = raw.get("weeks") or []
-        if not isinstance(weeks, list) or not weeks:
-            return None
-
-        today = today or datetime.now(self.settings.timezone).date()
-        selected = None
-        for week in weeks:
-            if not isinstance(week, dict):
-                continue
-            try:
-                start = date.fromisoformat(str(week.get("start")))
-                end = date.fromisoformat(str(week.get("end")))
-            except (TypeError, ValueError):
-                continue
-            if start <= today <= end:
-                selected = week
-                break
-        if selected is None:
-            selected = next((w for w in weeks if isinstance(w, dict)), None)
+        self._validate_source(raw)
+        selected = self._select_week(raw, today)
         if selected is None:
             return None
-
-        target = int(raw.get("weekly_target") or selected.get("weekly_target") or 0)
-        chest_lookup: dict[str, dict[str, Any]] = {}
-        for item in selected.get("members") or []:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            if name:
-                chest_lookup[name.casefold()] = item
-
+        target = self._count(selected.get("weekly_target", raw.get("weekly_target", 0)))
         roster = await self.roster()
         entries: list[ChestRankEntry] = []
-        for roster_name in roster:
-            item = chest_lookup.get(roster_name.casefold(), {})
-            points = int(item.get("points") or 0)
-            chests = int(item.get("chests") or 0)
-            met_target = bool(item.get("met_target")) or (target > 0 and points >= target)
+        for roster_name, info in roster.items():
+            item = self._chest_member(selected, roster_name, info.get("user_id"))
+            points = self._count(item.get("points"))
+            chests = self._count(item.get("chests"))
+            met_target = target > 0 and points >= target
             entries.append(
                 ChestRankEntry(
                     name=roster_name,
@@ -380,13 +434,14 @@ class DataProvider:
 
         return ChestLeaderboard(
             week_label=str(selected.get("label") or f"{selected.get('start', '')} - {selected.get('end', '')}"),
-            start=str(selected.get("start") or ""),
-            end=str(selected.get("end") or ""),
+            start=str(selected.get("start_at") or selected.get("start") or ""),
+            end=str(selected.get("end_at") or selected.get("end") or ""),
             target=target,
             total_points=total_points,
             total_chests=total_chests,
             generated=str(raw.get("generated")) if raw.get("generated") not in (None, "") else None,
             members=tuple(entries),
+            source_note=self._source_note(raw),
         )
 
     async def chats(self) -> list[dict[str, str]]:

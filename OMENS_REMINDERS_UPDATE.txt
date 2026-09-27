@@ -1,0 +1,42 @@
+OZY Discord Admin - OMENS reminder update
+
+Replace/add these files in the existing discord_admin project:
+- bot.py
+- ozy/discord_ui.py
+- ozy/state.py
+- ozy/event_reminders.py (new)
+- docs/CALENDAR.md
+
+Tests included:
+- tests/test_state.py
+- tests/test_event_reminders.py (new)
+
+Usage
+1. Deploy/restart the bot after replacing the files.
+2. Run /event-create.
+3. Event name: OMENS - DAY 1
+4. Description:
+   Day 1
+   Essence: deposit @Period 4 (IV)
+   Summons: HOLD and stay tuned to Clan Chat
+   Present: Period IV @-2 and @+1
+
+   Day 2
+   Strategy to be posted
+5. Set the event start to Period IV.
+6. The Reminders field auto-fills OMENS because the event name contains OMEN.
+7. Publish the event. Members use Discord's native Interested button.
+
+OMENS preset behavior
+- -2h: posts PRESENT reminder and pings Interested users.
+-  0h: starts the Discord Scheduled Event and posts ESSENCE/SUMMONS reminder.
+- +1h: posts PRESENT +1 reminder and pings Interested users.
+
+Notes
+- Reminder jobs persist in AdminState and survive normal bot restarts.
+- Pending reminders move if the Discord event start time is edited.
+- Pending reminders are removed if the event is cancelled/completed/deleted.
+- Past reminder offsets are skipped at creation time.
+- Bot now enables guild_scheduled_events intent for scheduled-event lifecycle updates.
+
+Validation: full test suite passed, 100 tests.

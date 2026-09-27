@@ -137,3 +137,28 @@ Leadership:
 7. Confirm mini events include post-midnight UTC events until the next R+0.
 8. Run `/event-create` and create a test Discord scheduled event.
 9. Restart the Render service and confirm the canonical calendar/Today messages are recovered and edited rather than duplicated.
+
+## Event reminders
+
+`/event-create` supports persistent relative reminders in the second scheduling form.
+
+- Leave **Reminders** blank for a normal Discord Scheduled Event.
+- Enter `OMENS` for the built-in OMENS Day 1 plan: `-2h`, event start, and `+1h`.
+- Custom format: `-2h | Be ready; 0 | Start now; +1h | Follow-up`.
+- A `0` reminder automatically starts the native Discord Scheduled Event. Discord handles its normal Interested-user start notification.
+- Non-zero reminders also ping the users who marked themselves **Interested** in that Discord event.
+- Reminder jobs are stored in the same persistent AdminState snapshot as the rest of the bot, so Render restarts do not lose them.
+- If an event start time is edited in Discord, pending reminders are shifted with it. If the event is cancelled, completed, or deleted, pending reminders are removed.
+- Reminder times already in the past when the event is created are skipped instead of being posted late.
+
+For OMENS Day 1, use an event name containing `OMEN` or `OMENS`; the reminder field will prefill with `OMENS` automatically. The event description can be:
+
+```text
+Day 1
+Essence: deposit @Period 4 (IV)
+Summons: HOLD and stay tuned to Clan Chat
+Present: Period IV @-2 and @+1
+
+Day 2
+Strategy to be posted
+```

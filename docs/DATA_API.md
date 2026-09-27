@@ -63,7 +63,7 @@ The preferred normalized schema is:
 {
   "generated": "2026-08-23T16:55:00Z",
   "clan_tag": "OZY",
-  "kingdom": 1030,
+  "kingdom": 233,
   "members": {
     "Prince": {
       "status": "active",
@@ -149,3 +149,40 @@ The display timezone used by calendar/onboarding features must not change the ch
 - Do not give the bot write access to the website data store.
 - Keep the bot token in Netlify/Render environment variables only.
 - Rotate the read token independently of the PeekABoo sync token and Discord bot token.
+
+
+## Extraction correctness (September 2026)
+
+The authoritative OZY binding is clan 4423816314895, observer 4423816316525,
+kingdom 233. Reject explicit foreign clan tags/IDs. Older published APIs omit
+these IDs; absence is not proof of a verified network binding.
+
+Use `start_at` / `end_at` offsets in website weeks, start inclusive and end
+exclusive. OZY weeks run Sunday 17:00 UTC to Sunday 17:00 UTC. Member display
+timezones never select a reporting week. A missing current week yields no
+current result, never the first historical week. Legacy date-only fixtures
+use the 17:00 UTC boundary (six-day end labels remain supported).
+
+Both personal results and rankings resolve chest rows by stable `user_id`
+when supplied, then exact roster spelling, then an unambiguous case-insensitive
+name. Conflicting supplied IDs and ambiguous matches fail. Never merge case
+variants without authoritative identity evidence. Active roster members with
+no chest row receive zero; removed/non-roster rows are excluded.
+
+Website `points`, `chests`, and category `breakdown` are authoritative. `chests`
+is quantity, not unique gift-ID count. Do not rescore source labels in the bot,
+or reclassify Union of Triumph personal rewards as Bank/Triumphal gifts.
+The selected week's target overrides the dataset default, including explicit
+zero. Target status derives from those points and target.
+
+Expired cache entries are not served after failed refreshes. Fetch failures
+become DataUnavailable without including potentially sensitive request URLs.
+Authenticated reads do not follow redirects. Published snapshot timestamps
+appear in personal and ranking output; snapshots older than 24 hours are
+marked. This is a freshness warning, not a claim that no gifts were collected.
+Explicit shadow/inactive/preview payloads cannot be displayed as official
+results. Legacy snapshots without activation metadata say live activation is
+unconfirmed. The bot does not activate a counter or read shadow observations.
+
+Validated with isolated unit tests and saved read-only production API responses.
+Do not start the bot for extraction tests: bot startup can trigger Discord writes.
