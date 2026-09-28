@@ -344,38 +344,73 @@ class EventScheduleModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         description = self.draft.notes[:1000] or None
-        event_kwargs = dict(
-            name=self.draft.name,
-            start_time=start_time,
-            end_time=start_time + timedelta(minutes=duration_minutes),
-            privacy_level=discord.PrivacyLevel.guild_only,
-            description=description,
-            reason=f"OZY event created by {interaction.user}",
-        )
+        end_time = start_time + timedelta(minutes=duration_minutes)
+        reason = f"OZY event created by {interaction.user}"
+
+        # Build the Discord API payload explicitly instead of relying on
+        # Guild.create_scheduled_event() to infer/serialize entity_type.
+        #
+        # Discord's current scheduled-event endpoint requires entity_type in
+        # the JSON body.  Some library/runtime combinations have been observed
+        # to drop that discriminator and Discord then rejects the request with
+        # TAG_FIELD_MISSING.  Using the HTTP client's scheduled-event endpoint
+        # directly keeps the payload unambiguous while still using discord.py's
+        # authenticated/rate-limited HTTP session.
+        event_payload = {
+            "name": self.draft.name,
+            "privacy_level": int(discord.PrivacyLevel.guild_only.value),
+            "scheduled_start_time": start_time.isoformat(),
+            "scheduled_end_time": end_time.isoformat(),
+        }
+        if description:
+            event_payload["description"] = description
+
         if isinstance(event_channel, discord.StageChannel):
-            # Discord's API now requires the scheduled-event entity type explicitly.
-            event_kwargs["entity_type"] = discord.EntityType.stage_instance
-            event_kwargs["channel"] = event_channel
+            event_payload["entity_type"] = int(discord.EntityType.stage_instance.value)
+            event_payload["channel_id"] = int(event_channel.id)
         elif isinstance(event_channel, discord.VoiceChannel):
-            event_kwargs["entity_type"] = discord.EntityType.voice
-            event_kwargs["channel"] = event_channel
+            event_payload["entity_type"] = int(discord.EntityType.voice.value)
+            event_payload["channel_id"] = int(event_channel.id)
         else:
-            # Text/forum/thread/media selections cannot be attached natively to a
-            # Discord Scheduled Event, so create an external event and keep the
-            # selected Discord channel as its visible location.
-            event_kwargs["entity_type"] = discord.EntityType.external
-            event_kwargs["location"] = f"#{getattr(event_channel, 'name', 'Discord channel')}"[:100]
+            # Text/forum/thread/media selections become EXTERNAL scheduled
+            # events. Keep the selected Discord channel as the visible
+            # location while the announcement itself is posted separately.
+            event_payload["entity_type"] = int(discord.EntityType.external.value)
+            event_payload["channel_id"] = None
+            event_payload["entity_metadata"] = {
+                "location": f"#{getattr(event_channel, 'name', 'Discord channel')}"[:100]
+            }
+
+        log.info(
+            "Creating Discord scheduled event name=%r entity_type=%s channel_id=%s start=%s",
+            self.draft.name,
+            event_payload["entity_type"],
+            event_payload.get("channel_id"),
+            event_payload["scheduled_start_time"],
+        )
 
         try:
-            event = await guild.create_scheduled_event(**event_kwargs)
+            data = await guild._state.http.create_guild_scheduled_event(
+                guild.id,
+                reason=reason,
+                **event_payload,
+            )
+            event = await guild.fetch_scheduled_event(int(data["id"]), with_counts=False)
         except discord.Forbidden:
             await interaction.followup.send(
                 "I cannot create the Discord Scheduled Event. OZY Admin needs **Create Events / Manage Events** and access to the selected location.",
                 ephemeral=True,
             )
             return
-        except (discord.HTTPException, TypeError, ValueError) as exc:
-            await interaction.followup.send(f"Discord could not create the event: {exc}", ephemeral=True)
+        except (discord.HTTPException, TypeError, ValueError, KeyError) as exc:
+            await interaction.followup.send(
+                "Discord could not create the event: "
+                f"{exc}\n"
+                f"`discord.py {getattr(discord, '__version__', 'unknown')} · "
+                f"entity_type={event_payload.get('entity_type')} · "
+                f"channel_id={event_payload.get('channel_id')}`",
+                ephemeral=True,
+            )
             return
 
         event_url = event.url
