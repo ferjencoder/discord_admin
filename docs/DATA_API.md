@@ -24,7 +24,8 @@ Recommended environment variable on the bot:
 OZY_DATA_API_TOKEN=<secret>
 ```
 
-OZY Admin sends it only to `ROSTER_URL` and `CHEST_DATA_URL` as:
+OZY Admin sends it to its configured OZY data integrations and the fixed
+`https://ozy.com.ar/api/v1/mercs/current` endpoint as:
 
 ```http
 X-OZY-Admin-Token: <secret>

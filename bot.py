@@ -18,6 +18,7 @@ from discord import app_commands
 from ozy.data_provider import DataProvider, DataUnavailable
 from settings import ConfigError, Settings, load_settings
 from ozy.state import AdminState
+from ozy.mercs import MercFeed
 from ozy.utils import format_chat_directory, format_chest_ranking_blocks, format_schedule, safe_code_block, truncate
 from ozy.constants import PROFILE_LANGUAGES
 from ozy.onboarding_profile import extract_onboarding_profile
@@ -145,6 +146,8 @@ class OZYAdminBot(discord.Client):
 
         self.background_tasks.append(asyncio.create_task(self._daily_schedule_loop(), name="daily-schedule"))
         self.background_tasks.append(asyncio.create_task(self._away_expiry_loop(), name="away-expiry"))
+        if self.settings.mercs_channel_id:
+            self.background_tasks.append(asyncio.create_task(self._mercs_loop(), name="mercs-feed"))
         if self.settings.chest_reset_post_enabled and self.settings.chest_channel_id:
             self.background_tasks.append(asyncio.create_task(self._daily_chest_ranking_loop(), name="daily-chest-ranking"))
         if self.settings.calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
@@ -155,6 +158,49 @@ class OZYAdminBot(discord.Client):
 
         if self.settings.self_ping_enabled and self.settings.render_external_url:
             self.background_tasks.append(asyncio.create_task(self._self_ping_loop(), name="self-ping"))
+
+    async def _mercs_loop(self) -> None:
+        feed = MercFeed(self.state, self.settings.mercs_channel_id)
+        last_health = None
+        last_log = 0.0
+        failures = 0
+        while not self.is_closed():
+            await self.wait_until_ready()
+            try:
+                rows = await self.data.current_mercs()
+                channel = self.get_channel(self.settings.mercs_channel_id)
+                if channel is None:
+                    channel = await self.fetch_channel(self.settings.mercs_channel_id)
+                if (not isinstance(channel, (discord.TextChannel, discord.Thread))
+                        or channel.guild.id != self.settings.server_id):
+                    raise ValueError("Merc channel must be a text channel/thread in SERVER_ID")
+
+                async def send(content):
+                    await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+
+                posted, invalid = await feed.publish(rows, send)
+                health = "ok" if rows else "empty"
+                if invalid:
+                    health = "invalid-records"
+                failures = 0
+                if posted:
+                    log.info("Merc feed posted %d fresh sightings", posted)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Never log response bodies, request headers or arbitrary exceptions.
+                health = str(exc) if isinstance(exc, DataUnavailable) else type(exc).__name__
+                failures += 1
+            clock = asyncio.get_running_loop().time()
+            if health != last_health or clock - last_log >= 300:
+                if failures:
+                    log.warning("Merc feed health: %s; retrying", health)
+                else:
+                    log.info("Merc API health: %s (%d records, %d invalid); empty does not prove scanner failure",
+                             health, len(rows), invalid)
+                last_health, last_log = health, clock
+            delay = min(300, self.settings.mercs_poll_seconds * 2 ** min(failures, 5))
+            await asyncio.sleep(delay)
 
     async def close(self) -> None:
         for task in self.background_tasks:

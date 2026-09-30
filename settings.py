@@ -203,6 +203,8 @@ class Settings:
     state_remote_timeout_seconds: float
     leadership_schedule_channel_id: int | None = None
     announcements_url: str | None = None
+    mercs_channel_id: int | None = None
+    mercs_poll_seconds: int = 15
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -241,7 +243,13 @@ def load_settings() -> Settings:
     if state_remote_url and not state_remote_token:
         raise ConfigError("STATE_REMOTE_TOKEN is required when STATE_REMOTE_URL is configured")
 
+    mercs_poll_seconds = _env_int("MERCS_POLL_SECONDS", 15, 5)
+    if mercs_poll_seconds > 60:
+        raise ConfigError("MERCS_POLL_SECONDS must be <= 60 (90-second freshness window)")
+
     return Settings(
+        mercs_channel_id=_optional_id("MERCS_CHANNEL_ID"),
+        mercs_poll_seconds=mercs_poll_seconds,
         discord_token=token,
         server_id=server_id,
         port=_env_int("PORT", 10000, 1),

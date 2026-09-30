@@ -53,3 +53,8 @@ Runtime architecture and deployment details are under `docs/`.
 ## Member-entry boundary
 
 Discord Community Onboarding owns member onboarding and normal access. OZY Admin never verifies a joining member or checks the roster for access. It only posts a themed hello in `START HERE/#welcome` and a themed goodbye in `START HERE/#goodbye`.
+
+## Mercenary Exchange feed
+
+Set `MERCS_CHANNEL_ID` to enable fresh OZY map locations in Discord. See
+[Merc feed setup and delivery semantics](docs/MERCS.md).

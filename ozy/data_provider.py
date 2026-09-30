@@ -127,6 +127,26 @@ class DataProvider:
         else:
             self._cache.pop(key, None)
 
+    async def current_mercs(self) -> list[dict]:
+        """Always fetch fresh map data; never use the general dataset cache."""
+        if not self.settings.ozy_data_api_token:
+            raise DataUnavailable("Merc API: OZY_DATA_API_TOKEN is not configured")
+        try:
+            async with self.session.get(
+                "https://ozy.com.ar/api/v1/mercs/current",
+                headers={"X-OZY-Admin-Token": self.settings.ozy_data_api_token},
+                timeout=aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds),
+                allow_redirects=False,
+            ) as response:
+                if response.status != 200:
+                    raise DataUnavailable(f"Merc API HTTP {response.status}")
+                payload = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            raise DataUnavailable(f"Merc API request failed ({type(exc).__name__})") from None
+        if not isinstance(payload, dict) or not isinstance(payload.get("mercs"), list):
+            raise DataUnavailable("Merc API returned an invalid mercs list")
+        return payload["mercs"]
+
     async def roster(self) -> dict[str, dict[str, Any]]:
         raw = await self._load_json(
             "roster",
@@ -666,4 +686,3 @@ class DataProvider:
         self.invalidate("schedule:clan")
         self.invalidate("schedule:leadership")
         return True
-

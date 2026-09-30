@@ -38,6 +38,21 @@ def test_load_minimal_settings(monkeypatch):
     assert settings.goodbye_channel_id is None
 
 
+def test_merc_settings(monkeypatch):
+    base_env(monkeypatch)
+    monkeypatch.setenv("MERCS_CHANNEL_ID", "123456")
+    monkeypatch.setenv("MERCS_POLL_SECONDS", "15")
+    settings = load_settings()
+    assert settings.mercs_channel_id == 123456
+    assert settings.mercs_poll_seconds == 15
+    monkeypatch.setenv("MERCS_CHANNEL_ID", "")
+    assert load_settings().mercs_channel_id is None
+    for interval in ("0", "61", "nan"):
+        monkeypatch.setenv("MERCS_POLL_SECONDS", interval)
+        with pytest.raises(ConfigError):
+            load_settings()
+
+
 def test_rank_role_map(monkeypatch):
     base_env(monkeypatch)
     monkeypatch.setenv("RANK_ROLE_MAP", "Leader:111,Superior:222")
