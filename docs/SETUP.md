@@ -133,19 +133,16 @@ DAILY_SCHEDULE_TIME=08:00
 CALENDAR_CHANNEL_ID=...
 TODAY_CHANNEL_ID=...
 CALENDAR_ENABLED=true
-CALENDAR_BASE_URL=...
-CALENDAR_REALM=Regular
+GAME_EVENTS_API_URL=https://ozy.com.ar/api/ozy/events
 CALENDAR_DAYS=30
 TODAY_ENABLED=true
 
 AUTO_SYNC_NICKNAME=false
 ```
 
-The tournament-calendar integration does not require a source login, cookie, SignalR connection,
-or personal account token. It uses the public calendar endpoints exposed by the source.
-Automatic source traffic is intentionally sparse: four lightweight metadata probes per UTC
-day while the source cadence is learned, full content only when metadata changes, and one
-Akurier mini-event fetch per day at 18:00 UTC (R+1).
+The tournament calendar reads the public OZY canonical API without authentication.
+All calendar and mini-event refresh jobs use this one endpoint; provider downloads and
+freshness tracking are handled by the website. See CALENDAR.md for deployment and contract details.
 The 30-day calendar lists tournament STARTS; the daily post includes starts, continues,
 ends, and the mini-tournament schedule for that day.
 

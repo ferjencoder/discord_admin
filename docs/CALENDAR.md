@@ -1,164 +1,29 @@
-# OZY Admin - Tournament Calendar Setup
+# Canonical OZY game calendar
 
-## What this integration does
-
-OZY Admin maintains two Discord outputs from a configured read-only tournament calendar source:
-
-- `CALENDAR_CHANNEL_ID`: rolling next-30-days tournament calendar.
-- `TODAY_CHANNEL_ID`: one canonical `OZY Today` post for the current Total Battle game day.
-
-The bot does not need a source-site login, browser cookie, personal account token, browser automation, or websocket client.
-
-The source base URL is supplied through `CALENDAR_BASE_URL`. The bot reads:
-
-```text
-/api/calendar/snapshot-meta?realm=Regular
-/api/calendar/content?realm=Regular
-```
-
-The lightweight metadata request is used for automatic change detection. After a good snapshot exists, a temporary metadata failure keeps the cached calendar and does not trigger an unnecessary full download.
-
-## Discord channels
-
-Create or choose two normal text channels, for example:
-
-```text
-#calendar
-#today
-```
-
-Add the IDs to Render:
+Deploy the website changes first. The bot now reads only the public OZY endpoint:
 
 ```env
+GAME_EVENTS_API_URL=https://ozy.com.ar/api/ozy/events
+CALENDAR_ENABLED=true
 CALENDAR_CHANNEL_ID=123456789012345678
 TODAY_CHANNEL_ID=234567890123456789
-```
-
-OZY Admin needs in both channels:
-
-- View Channel
-- Send Messages
-- Read Message History
-
-`Read Message History` is required so the bot can recover its canonical posts after a restart and edit them instead of creating duplicates.
-
-## Render variables
-
-```env
-CALENDAR_ENABLED=true
-CALENDAR_BASE_URL=<calendar source base URL>
-CALENDAR_REALM=Regular
+CALENDAR_REFRESH_MINUTES=30
 CALENDAR_DAYS=30
 TODAY_ENABLED=true
-CALENDAR_MIN_ACTIONS=10
 ```
 
-`OZY Today` is not scheduled by civil midnight. It rolls automatically at the Total Battle reset:
+GAME_EVENTS_API_URL defaults to the production URL. CALENDAR_BASE_URL and CALENDAR_REALM are legacy settings and no longer choose a provider; existing Render values can be removed. CALENDAR_MIN_ACTIONS no longer rejects short but valid canonical calendars.
+
+The bot converts schema_version=1 events into the existing CalendarSnapshot. Nexus STARTS/CONTINUE/ENDS and event details survive unchanged. Events without provider actions generate starts, known ends and daily continuation actions at the 17:00 UTC reset. Unknown mini ends use start as the internal display sentinel; the API's end remains null.
+
+Calendar and Today rendering, copyable code blocks, persistent message tracking and scheduling remain in place. A game day is [17:00 UTC, next 17:00 UTC), using R+0 notation. Calendar shows starts over the next 30 days; Today groups starts, continuations, ends and mini events. Discord permissions remain View Channel, Send Messages and Read Message History.
+
+Every scheduled refresh, leadership refresh and legacy once-daily mini refresh reads the same canonical API. No bot path fetches Akurier or Nexus directly. Semantic comparison excludes request/freshness timestamps, so unchanged schedules do not cause calendar reposts. The website caches provider downloads for five minutes. The bot retains its last good snapshot on HTTP/schema failures and records last_error; degraded API responses are usable and recorded as degraded.
+
+Clan-created events and Power Hours continue through SCHEDULE_URL and /api/ozy/schedule, with their existing audiences, authorization and persistent storage.
+
+Run calendar checks with:
 
 ```text
-17:00 UTC = R+0
-```
-
-The current game day is the half-open interval:
-
-```text
-[today R+0, tomorrow R+0)
-```
-
-So an event at exactly tomorrow's R+0 belongs to the next game day.
-
-## Calendar channel behavior
-
-- Shows the next 30 days.
-- Lists tournament starts and regular mini events.
-- Uses Total Battle reset-clock notation.
-- **Every day is its own triple-backtick code block** for clean copy/paste.
-- Uses multiple Discord messages only when necessary to stay below the 2,000-character limit.
-- Existing messages are edited in place.
-- Old extra chunks are removed when the calendar becomes shorter.
-
-Example structure:
-
-````text
-OZY Tournament Calendar - Next 30 Days
-
-```
-Sun 23 Aug
-- R+0 Ancients' Treasure
-- R+0 Ruthless Slaughter
-```
-
-```
-Mon 24 Aug
-- R+0 Clash for the Throne
-- R+0 Conquerors' Revival
-```
-````
-
-## Today channel behavior
-
-One canonical post is created for each Total Battle game day and contains:
-
-- tournament starts in the reset-to-reset window;
-- multi-day tournament continue markers in the window;
-- tournament end markers in the window;
-- **all regular mini events from the current R+0 until the next R+0**.
-
-Mini-event source times are already UTC and are parsed as UTC exactly as published. The parser ignores the dynamic `Time till start` column and keeps the `Bonus` column when present. The separate `for SK below` section remains ignored.
-
-If source data changes later in the same game day, the existing Today message is edited rather than duplicated.
-
-## Commands
-
-Everyone:
-
-```text
-/calendar
-/today
-/time
-```
-
-Leadership:
-
-```text
-/calendar-refresh
-/calendar-status
-/event-create
-```
-
-## First deployment test
-
-1. Deploy OZY Admin with `CALENDAR_BASE_URL`, `CALENDAR_CHANNEL_ID`, and `TODAY_CHANNEL_ID`.
-2. Confirm Render startup logs say `event-create` was included in the synchronized command list.
-3. Run `/calendar-status`.
-4. Run `/calendar-refresh`.
-5. Confirm `#calendar` uses one copyable code block per day.
-6. Run `/today`.
-7. Confirm mini events include post-midnight UTC events until the next R+0.
-8. Run `/event-create` and create a test Discord scheduled event.
-9. Restart the Render service and confirm the canonical calendar/Today messages are recovered and edited rather than duplicated.
-
-## Event reminders
-
-`/event-create` supports persistent relative reminders in the second scheduling form.
-
-- Leave **Reminders** blank for a normal Discord Scheduled Event.
-- Enter `OMENS` for the built-in OMENS Day 1 plan: `-2h`, event start, and `+1h`.
-- Custom format: `-2h | Be ready; 0 | Start now; +1h | Follow-up`.
-- A `0` reminder automatically starts the native Discord Scheduled Event. Discord handles its normal Interested-user start notification.
-- Non-zero reminders also ping the users who marked themselves **Interested** in that Discord event.
-- Reminder jobs are stored in the same persistent AdminState snapshot as the rest of the bot, so Render restarts do not lose them.
-- If an event start time is edited in Discord, pending reminders are shifted with it. If the event is cancelled, completed, or deleted, pending reminders are removed.
-- Reminder times already in the past when the event is created are skipped instead of being posted late.
-
-For OMENS Day 1, use an event name containing `OMEN` or `OMENS`; the reminder field will prefill with `OMENS` automatically. The event description can be:
-
-```text
-Day 1
-Essence: deposit @Period 4 (IV)
-Summons: HOLD and stay tuned to Clan Chat
-Present: Period IV @-2 and @+1
-
-Day 2
-Strategy to be posted
+python -m pytest tests/test_event_calendar.py tests/test_canonical_calendar.py
 ```

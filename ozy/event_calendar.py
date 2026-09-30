@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
 import hashlib
 import json
 import logging
 import re
-import zlib
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from html.parser import HTMLParser
@@ -384,6 +382,52 @@ def _parse_last_synced(value: object) -> datetime | None:
     return _parse_iso_utc(value)
 
 
+def parse_canonical_calendar(payload: object) -> CalendarSnapshot:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise CalendarSourceError("Unsupported canonical calendar schema")
+    events = payload.get("events")
+    if not isinstance(events, list) or not events:
+        raise CalendarSourceError("Canonical API returned no events; retaining snapshot")
+    actions: list[CalendarAction] = []
+    minis: list[MiniTournament] = []
+    for event in events:
+        if not isinstance(event, dict) or not event.get("name"):
+            raise CalendarSourceError("Invalid canonical event")
+        title = event["name"]
+        details = event.get("details", "")
+        start = _parse_iso_utc(event.get("starts_at") or "")
+        end = _parse_iso_utc(event.get("ends_at") or "")
+        if event.get("kind") == "mini":
+            if start:
+                minis.append(MiniTournament(start, end or start, title, event.get("bonus", "")))
+            continue
+        source_actions = event.get("actions") or []
+        if source_actions:
+            for action in source_actions:
+                timestamp = _parse_iso_utc(action.get("timestamp") or "")
+                if timestamp is None or action.get("action") not in {"STARTS", "CONTINUE", "ENDS"}:
+                    raise CalendarSourceError("Invalid canonical timeline action")
+                actions.append(CalendarAction(timestamp, action["action"], title, details))
+        else:
+            if start:
+                actions.append(CalendarAction(start, "STARTS", title, details))
+            if end:
+                actions.append(CalendarAction(end, "ENDS", title, details))
+            if start and end:
+                day = start.replace(hour=17, minute=0, second=0, microsecond=0)
+                if day <= start:
+                    day += timedelta(days=1)
+                while day < end:
+                    actions.append(CalendarAction(day, "CONTINUE", title, details))
+                    day += timedelta(days=1)
+    actions = sorted(set(actions), key=lambda a: (a.timestamp_utc, a.action, a.title, a.details))
+    minis = sorted(set(minis), key=lambda m: (m.start_utc, m.title, m.bonus))
+    if not actions and not minis:
+        raise CalendarSourceError("Canonical API has no usable calendar timings")
+    synced = _parse_last_synced(payload.get("fetched_at"))
+    return CalendarSnapshot(tuple(actions), tuple(minis), _semantic_hash(actions, minis), synced, synced)
+
+
 class TournamentCalendarClient:
     def __init__(self, settings: Settings, session: aiohttp.ClientSession):
         self.settings = settings
@@ -403,220 +447,43 @@ class TournamentCalendarClient:
 
     @property
     def content_url(self) -> str:
-        return self.settings.calendar_base_url.rstrip("/") + "/api/calendar/content"
+        return self.settings.calendar_base_url
 
     @property
     def meta_url(self) -> str:
-        return self.settings.calendar_base_url.rstrip("/") + "/api/calendar/snapshot-meta"
-
-    async def _fetch_akurier_mini_events(self) -> list[MiniTournament]:
-        try:
-            async with self.session.get(
-                AKURIER_EVENTS_URL,
-                headers={
-                    "Accept": "text/html",
-                    # Ask for plain HTML. Some upstream/CDN responses have still
-                    # arrived as zstd, so decompression is disabled below and any
-                    # returned encoding is handled explicitly.
-                    "Accept-Encoding": "identity",
-                },
-                auto_decompress=False,
-            ) as response:
-                if response.status != 200:
-                    raise CalendarSourceError(f"Mini-events source returned HTTP {response.status}")
-                body = await response.read()
-                content_encoding = (response.headers.get("Content-Encoding") or "").strip().casefold()
-                if content_encoding in {"", "identity"}:
-                    pass
-                elif content_encoding == "gzip":
-                    body = gzip.decompress(body)
-                elif content_encoding == "deflate":
-                    try:
-                        body = zlib.decompress(body)
-                    except zlib.error:
-                        body = zlib.decompress(body, -zlib.MAX_WBITS)
-                elif content_encoding == "zstd":
-                    try:
-                        from compression import zstd  # Python 3.14+ (Render runtime)
-                    except ImportError as exc:
-                        raise CalendarSourceError(
-                            "Mini-events source returned zstd but this Python runtime has no zstd decoder"
-                        ) from exc
-                    body = zstd.decompress(body)
-                else:
-                    raise CalendarSourceError(
-                        f"Unsupported mini-events content encoding: {content_encoding}"
-                    )
-
-                charset = response.charset or "utf-8"
-                html = body.decode(charset, errors="replace")
-            events = parse_akurier_mini_events_html(html)
-            if not events:
-                raise CalendarSourceError("Mini-events parser returned no regular events")
-            self.last_akurier_success_utc = datetime.now(timezone.utc)
-            self.last_akurier_error = None
-            return events
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.last_akurier_error = str(exc)
-            log.warning("Akurier mini-events refresh failed; keeping cached/fallback mini events: %s", exc)
-            return []
-
-    async def _fetch_meta(self) -> datetime | None:
-        timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
-        self.last_meta_checked_utc = datetime.now(timezone.utc)
-        try:
-            async with self.session.get(
-                self.meta_url,
-                params={"realm": self.settings.calendar_realm},
-                timeout=timeout,
-                headers={"Accept": "application/json"},
-            ) as response:
-                if response.status != 200:
-                    return None
-                payload = await response.json(content_type=None)
-        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
-            return None
-        if isinstance(payload, dict):
-            value = _parse_last_synced(payload.get("lastSynced"))
-            if value is not None:
-                self.last_meta_utc = value
-            return value
-        return None
-
-    async def _fetch_content(self) -> str:
-        timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
-        async with self.session.get(
-            self.content_url,
-            params={"realm": self.settings.calendar_realm},
-            timeout=timeout,
-            headers={"Accept": "text/html"},
-        ) as response:
-            if response.status != 200:
-                raise CalendarSourceError(f"Tournament calendar source returned HTTP {response.status}")
-            return await response.text()
+        return self.content_url
 
     async def refresh(self, *, force: bool = False, refresh_akurier: bool = False) -> RefreshResult:
-        """Refresh the cached tournament snapshot with minimal source traffic.
-
-        Automatic probes first read only snapshot-meta. If a snapshot already exists
-        and metadata is unchanged (or temporarily unavailable), no full calendar
-        download is made. Full content is fetched on startup, when metadata changes,
-        or when a leadership user explicitly forces a refresh.
-        """
+        """Read the canonical API; the legacy refresh flags remain call-compatible."""
         async with self._lock:
             try:
-                previous_source = self._snapshot.last_synced_utc if self._snapshot else None
-                last_synced = await self._fetch_meta()
-                source_changed = (
-                    last_synced is not None
-                    and previous_source is not None
-                    and last_synced != previous_source
-                )
-
-                if not force and self._snapshot is not None:
-                    # Minimal-impact behavior: if metadata is temporarily unavailable,
-                    # keep the last good snapshot rather than downloading full content.
-                    if last_synced is None:
-                        self.last_success_utc = datetime.now(timezone.utc)
-                        self.last_error = None
-                        return RefreshResult(
-                            self._snapshot, False,
-                            source_last_synced_utc=None,
-                            source_changed=False,
-                        )
-
-                    if (
-                        self._snapshot.last_synced_utc is not None
-                        and last_synced == self._snapshot.last_synced_utc
-                    ):
-                        self.last_success_utc = datetime.now(timezone.utc)
-                        self.last_error = None
-                        return RefreshResult(
-                            self._snapshot, False,
-                            source_last_synced_utc=last_synced,
-                            source_changed=False,
-                        )
-
-                html = await self._fetch_content()
-                parsed = parse_tournament_calendar_html(html)
-                if len(parsed.actions) < self.settings.calendar_min_actions:
-                    raise CalendarSourceError(
-                        f"Tournament parser produced only {len(parsed.actions)} calendar actions; refusing snapshot"
-                    )
-
-                # The mini-event source is intentionally NOT contacted on normal
-                # tournament-calendar probes.
-                # Its regular mini-event table has its own once-daily scheduler.
-                # A forced leadership refresh may explicitly refresh it as well.
-                if refresh_akurier:
-                    akurier_minis = await self._fetch_akurier_mini_events()
-                    if akurier_minis:
-                        parsed = replace(
-                            parsed,
-                            mini_tournaments=tuple(akurier_minis),
-                            semantic_hash=_semantic_hash(parsed.actions, akurier_minis),
-                        )
-                elif self._snapshot is not None and self._snapshot.mini_tournaments:
-                    # Preserve the latest independently cached mini-events when the
-                    # tournament calendar itself changes.
-                    parsed = replace(
-                        parsed,
-                        mini_tournaments=self._snapshot.mini_tournaments,
-                        semantic_hash=_semantic_hash(parsed.actions, self._snapshot.mini_tournaments),
-                    )
-
-                parsed = replace(parsed, last_synced_utc=last_synced)
+                timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
+                async with self.session.get(self.content_url, timeout=timeout, headers={"Accept": "application/json"}) as response:
+                    if response.status != 200:
+                        raise CalendarSourceError(f"OZY events API returned HTTP {response.status}")
+                    payload = await response.json(content_type=None)
+                parsed = parse_canonical_calendar(payload)
                 changed = self._snapshot is None or parsed.semantic_hash != self._snapshot.semantic_hash
                 self._snapshot = parsed
                 self.last_success_utc = datetime.now(timezone.utc)
-                self.last_error = None
-                return RefreshResult(
-                    parsed, changed,
-                    source_last_synced_utc=last_synced,
-                    source_changed=source_changed,
-                )
+                provider_health = payload.get("health", {}).get("providers", {})
+                mini_health = provider_health.get("akurier", {})
+                self.last_akurier_error = mini_health.get("error")
+                self.last_akurier_success_utc = _parse_last_synced(mini_health.get("fetched_at"))
+                self.last_error = "Canonical calendar is degraded" if payload.get("health", {}).get("status") == "degraded" else None
+                return RefreshResult(parsed, changed, source_last_synced_utc=parsed.last_synced_utc, source_changed=changed)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.last_error = str(exc)
                 if self._snapshot is not None:
-                    log.warning("Tournament calendar refresh failed; retaining last good snapshot: %s", exc)
+                    log.warning("OZY calendar refresh failed; retaining last good snapshot: %s", exc)
                     return RefreshResult(self._snapshot, False)
-                if isinstance(exc, CalendarSourceError):
-                    raise
                 raise CalendarSourceError(str(exc)) from exc
 
     async def refresh_akurier(self) -> RefreshResult:
-        """Refresh only the regular Akurier mini-event table.
-
-        This is scheduled once per UTC day at 18:00 (R+1). It never downloads
-        tournament-calendar content. If the mini-event source is unavailable, the current snapshot
-        and its existing mini-event fallback are retained.
-        """
-        async with self._lock:
-            if self._snapshot is None:
-                raise CalendarSourceError("No tournament snapshot is available for mini-event update")
-
-            minis = await self._fetch_akurier_mini_events()
-            if not minis:
-                return RefreshResult(self._snapshot, False)
-
-            new_hash = _semantic_hash(self._snapshot.actions, minis)
-            changed = new_hash != self._snapshot.semantic_hash
-            self._snapshot = replace(
-                self._snapshot,
-                mini_tournaments=tuple(minis),
-                semantic_hash=new_hash,
-                fetched_at_utc=datetime.now(timezone.utc),
-            )
-            return RefreshResult(
-                self._snapshot,
-                changed,
-                source_last_synced_utc=self._snapshot.last_synced_utc,
-                source_changed=False,
-            )
+        """Legacy scheduler entry point; mini data now comes from the same OZY API."""
+        return await self.refresh()
 
 
 GAME_RESET_UTC_HOUR = 17

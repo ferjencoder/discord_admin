@@ -12,6 +12,7 @@ def base_env(monkeypatch):
     monkeypatch.delenv("LANGUAGE_ROLE_MAP", raising=False)
     monkeypatch.delenv("LEADERSHIP_ROLE_IDS", raising=False)
     monkeypatch.setenv("CALENDAR_BASE_URL", "https://calendar.example.test")
+    monkeypatch.delenv("GAME_EVENTS_API_URL", raising=False)
     for name in (
         "VERIFIED_ROLE_ID", "UNVERIFIED_ROLE_ID", "SPECIAL_ACCESS_ROLE_ID",
         "GOODBYE_CHANNEL_ID", "CHEST_CHANNEL_ID", "CHEST_RESET_POST_ENABLED", "CHEST_RESET_POST_TIME_UTC",
@@ -86,7 +87,7 @@ def test_calendar_defaults(monkeypatch):
     base_env(monkeypatch)
     settings = load_settings()
     assert settings.calendar_enabled is True
-    assert settings.calendar_base_url == "https://calendar.example.test"
+    assert settings.calendar_base_url == "https://ozy.com.ar/api/ozy/events"
     assert settings.calendar_realm == "Regular"
     assert settings.calendar_refresh_minutes == 30
     assert settings.calendar_days == 30
@@ -146,3 +147,9 @@ def test_goodbye_channel_setting(monkeypatch):
     monkeypatch.setenv("GOODBYE_CHANNEL_ID", "987654321")
     settings = load_settings()
     assert settings.goodbye_channel_id == 987654321
+
+
+def test_canonical_calendar_url_override(monkeypatch):
+    base_env(monkeypatch)
+    monkeypatch.setenv("GAME_EVENTS_API_URL", "https://staging.ozy.com.ar/api/ozy/events")
+    assert load_settings().calendar_base_url == "https://staging.ozy.com.ar/api/ozy/events"

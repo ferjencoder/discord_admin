@@ -229,9 +229,8 @@ def load_settings() -> Settings:
 
     render_external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip() or None
     calendar_enabled = _env_bool("CALENDAR_ENABLED", True)
-    calendar_base_url = os.getenv("CALENDAR_BASE_URL", "").strip().rstrip("/")
-    if calendar_enabled and not calendar_base_url:
-        raise ConfigError("CALENDAR_BASE_URL is required when CALENDAR_ENABLED=true")
+    # CALENDAR_BASE_URL remains a legacy setting; calendar reads use the OZY API.
+    calendar_base_url = (os.getenv("GAME_EVENTS_API_URL", "").strip() or "https://ozy.com.ar/api/ozy/events")
 
     schedule_url = os.getenv("SCHEDULE_URL", "").strip() or None
     announcements_url = os.getenv("ANNOUNCEMENTS_URL", "").strip() or None
