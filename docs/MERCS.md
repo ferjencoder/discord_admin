@@ -19,14 +19,13 @@ returns sightings from the last 90 seconds. Old queued records are not posted.
 Example message:
 
 ```text
-Mercenary Exchange | Level 10
 K:35 X:843 Y:603
-Seen [relative Discord time] ([local Discord time])
 ```
 
-Coordinates appear inside a triple-backtick code block for easy copying.
+Posts contain only coordinates inside a triple-backtick code block for easy copying.
 They are Total Battle-style text, not a game deep link.
-Level is omitted when unavailable. `seen_at` must be an ISO timestamp with a
+Level and seen time are used internally, not displayed. The API's `last_seen` (with `seen_at` accepted
+as a compatibility fallback) must be an ISO timestamp with a
 timezone; invalid records are skipped and reflected in health logs.
 
 ## Deduplication and delivery

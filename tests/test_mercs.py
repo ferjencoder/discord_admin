@@ -14,7 +14,20 @@ from test_data_provider import make_settings
 
 def row(at, **changes):
     return dict(object_id="123", kingdom=35, x=843, y=603, level=10,
-                seen_at=datetime.fromtimestamp(at, timezone.utc).isoformat(), **changes)
+                last_seen=datetime.fromtimestamp(at, timezone.utc).isoformat(), **changes)
+
+
+def test_read_api_timestamp_takes_precedence():
+    from ozy.mercs import Merc
+    record = dict(object_id="1374476599231", kind="merc", kingdom=320,
+                  x=156, y=312, static_id=400, level=10,
+                  first_seen="2026-09-30T01:39:10Z", last_seen="2026-09-30T01:39:10Z",
+                  seen_count=1, scanner_id="scanner-02", age_seconds=25)
+    merc = Merc.parse(record)
+    assert "K:320 X:156 Y:312" in merc.message()
+    assert Merc.parse({**record, "seen_at": "2020-01-01T00:00:00Z"}).seen == merc.seen
+    record["seen_at"] = record.pop("last_seen")
+    assert Merc.parse(record).seen == merc.seen
 
 
 def test_dedup_updates_restart_and_destination(tmp_path):
@@ -26,8 +39,7 @@ def test_dedup_updates_restart_and_destination(tmp_path):
         original = row(now)
         await feed.publish([original, original], send, now=now)
         assert send.await_count == 1
-        assert "```\nK:35 X:843 Y:603\n```" in send.call_args.args[0]
-        assert "Level 10" in send.call_args.args[0]
+        assert send.call_args.args[0] == "```\nK:35 X:843 Y:603\n```"
         # Continuous scanner refresh and a process restart don't repeat the post.
         await MercFeed(state, 1).publish([row(now + 15)], send, now=now + 15)
         assert send.await_count == 1

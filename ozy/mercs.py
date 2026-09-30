@@ -24,9 +24,11 @@ class Merc:
                 raise ValueError("Invalid numeric Merc field")
             return int(value)
 
-        seen = datetime.fromisoformat(row["seen_at"].replace("Z", "+00:00"))
+        # The read API normalizes publisher seen_at into last_seen.
+        timestamp = row.get("last_seen") or row.get("seen_at")
+        seen = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         if seen.tzinfo is None:
-            raise ValueError("seen_at must include a timezone")
+            raise ValueError("Merc seen timestamp must include a timezone")
         return cls(str(row.get("object_id") or ""), number("kingdom"), number("x"),
                    number("y"), number("level") if row.get("level") is not None else None,
                    seen.timestamp())
@@ -43,10 +45,7 @@ class Merc:
         return [self.kingdom, self.x, self.y, self.level]
 
     def message(self):
-        level = f" | Level {self.level}" if self.level is not None else ""
-        return (f"**Mercenary Exchange**{level}\n"
-                f"```\nK:{self.kingdom} X:{self.x} Y:{self.y}\n```\n"
-                f"Seen <t:{int(self.seen)}:R> (<t:{int(self.seen)}:T>)")
+        return f"```\nK:{self.kingdom} X:{self.x} Y:{self.y}\n```"
 
 
 class MercFeed:
