@@ -15,6 +15,7 @@ import discord
 from aiohttp import web
 from discord import app_commands
 
+from ozy.website_sync import WebsiteSync
 from ozy.data_provider import DataProvider, DataUnavailable
 from settings import ConfigError, Settings, load_settings
 from ozy.state import AdminState
@@ -98,6 +99,8 @@ class OZYAdminBot(discord.Client):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.members = True
+        intents.guild_scheduled_events = True
+        intents.guild_messages = True
 
         super().__init__(intents=intents)
         self.settings = settings
@@ -128,6 +131,8 @@ class OZYAdminBot(discord.Client):
         # in outbound read-only source requests.
         self.http_session = aiohttp.ClientSession()
         self.data = DataProvider(self.settings, self.http_session)
+        self.website_sync = WebsiteSync(self.state, self.data)
+        self.background_tasks.append(asyncio.create_task(self._website_sync_loop(), name="website-sync"))
         self.calendar_client = TournamentCalendarClient(self.settings, self.http_session)
 
         await self._start_health_server()
@@ -158,6 +163,17 @@ class OZYAdminBot(discord.Client):
 
         if self.settings.self_ping_enabled and self.settings.render_external_url:
             self.background_tasks.append(asyncio.create_task(self._self_ping_loop(), name="self-ping"))
+
+    async def _website_sync_loop(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                pending = await self.website_sync.retry()
+                if pending:
+                    log.warning("Website communications awaiting retry: %s", pending)
+            except Exception:
+                log.exception("Website communications retry failed")
+            await asyncio.sleep(60)
 
     async def _mercs_loop(self) -> None:
         feed = MercFeed(self.state, self.settings.mercs_channel_id)
@@ -236,7 +252,7 @@ class OZYAdminBot(discord.Client):
         if event.guild_id != self.settings.server_id or self.data is None:
             return
         try:
-            removed = await self.data.delete_schedule_event(event.id)
+            removed = await self.website_sync.submit("delete_schedule_event", event.id)
             if removed:
                 log.info("Removed Discord event %s from OZY website schedule", event.id)
         except DataUnavailable as exc:
@@ -247,6 +263,12 @@ class OZYAdminBot(discord.Client):
     ) -> None:
         """Keep Discord event edits synchronized to the website schedule."""
         if after.guild_id != self.settings.server_id or self.data is None:
+            return
+        if after.status in (discord.EventStatus.cancelled, discord.EventStatus.completed):
+            try:
+                await self.website_sync.submit("delete_schedule_event", after.id)
+            except DataUnavailable as exc:
+                log.warning("Event removal queued for retry: %s", exc)
             return
         if not after.start_time or not after.end_time:
             return
@@ -262,7 +284,7 @@ class OZYAdminBot(discord.Client):
             "discord_event_url": after.url,
         }
         try:
-            await self.data.upsert_schedule_event(payload)
+            await self.website_sync.submit("upsert_schedule_event", payload)
             log.info("Updated Discord event %s in OZY website schedule", after.id)
         except DataUnavailable as exc:
             log.warning("Could not update Discord event %s in website schedule: %s", after.id, exc)
@@ -274,7 +296,7 @@ class OZYAdminBot(discord.Client):
         if not self.settings.announcement_channel_id or payload.channel_id != self.settings.announcement_channel_id:
             return
         try:
-            removed = await self.data.delete_announcement(payload.message_id)
+            removed = await self.website_sync.submit("delete_announcement", payload.message_id)
             if removed:
                 log.info("Removed Discord announcement %s from OZY website feed", payload.message_id)
         except DataUnavailable as exc:
@@ -881,7 +903,7 @@ class OZYAdminBot(discord.Client):
                 "created_by_name": interaction.user.display_name,
             }
             try:
-                await self.data.upsert_announcement(payload)
+                await self.website_sync.submit("upsert_announcement", payload)
             except DataUnavailable as exc:
                 website_sync_error = str(exc)
                 log.error("Could not persist announcement %s to OZY website: %s", sent.id, exc)

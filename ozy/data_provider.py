@@ -646,7 +646,7 @@ class DataProvider:
 
     async def delete_announcement(self, discord_message_id: int | str) -> bool:
         if not self.settings.announcements_url or not self.settings.ozy_data_api_token:
-            return False
+            raise DataUnavailable("Announcement website sync is not configured")
         separator = "&" if "?" in self.settings.announcements_url else "?"
         url = f"{self.settings.announcements_url}{separator}id={discord_message_id}"
         timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)
@@ -666,7 +666,7 @@ class DataProvider:
 
     async def delete_schedule_event(self, discord_event_id: int | str) -> bool:
         if not self.settings.schedule_url or not self.settings.ozy_data_api_token:
-            return False
+            raise DataUnavailable("Schedule website sync is not configured")
         separator = "&" if "?" in self.settings.schedule_url else "?"
         url = f"{self.settings.schedule_url}{separator}id={discord_event_id}"
         timeout = aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds)

@@ -476,7 +476,7 @@ class EventScheduleModal(discord.ui.Modal):
                 "created_by_name": interaction.user.display_name,
             }
             try:
-                await self.bot.data.upsert_schedule_event(payload)
+                await self.bot.website_sync.submit("upsert_schedule_event", payload)
             except DataUnavailable as exc:
                 schedule_sync_error = str(exc)
                 log.error("Could not persist Discord event %s to OZY website schedule: %s", event.id, exc)
