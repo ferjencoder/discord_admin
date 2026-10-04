@@ -277,6 +277,7 @@ class EventScheduleModal(discord.ui.Modal):
             max_values=1,
             options=[
                 discord.SelectOption(label="Power Hour", value="power_hour", description="Coordinated clan push / epic monster hour"),
+                discord.SelectOption(label="CP Run", value="cp_run", description="Coordinated clan CP run"),
                 discord.SelectOption(label="Clan Event", value="clan_event", description="General OZY activity"),
                 discord.SelectOption(label="Meeting", value="meeting"),
                 discord.SelectOption(label="Monster Hunt", value="hunt"),
