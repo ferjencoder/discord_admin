@@ -16,6 +16,7 @@ from aiohttp import web
 from discord import app_commands
 
 from ozy.website_sync import WebsiteSync
+from ozy.war_room_sync import WarRoomSync, event_description
 from ozy.data_provider import DataProvider, DataUnavailable
 from settings import ConfigError, Settings, load_settings
 from ozy.state import AdminState
@@ -132,6 +133,7 @@ class OZYAdminBot(discord.Client):
         self.http_session = aiohttp.ClientSession()
         self.data = DataProvider(self.settings, self.http_session)
         self.website_sync = WebsiteSync(self.state, self.data)
+        self.war_room_sync = WarRoomSync(self)
         self.background_tasks.append(asyncio.create_task(self._website_sync_loop(), name="website-sync"))
         self.calendar_client = TournamentCalendarClient(self.settings, self.http_session)
 
@@ -169,6 +171,7 @@ class OZYAdminBot(discord.Client):
         while not self.is_closed():
             try:
                 pending = await self.website_sync.retry()
+                await self.war_room_sync.run()
                 if pending:
                     log.warning("Website communications awaiting retry: %s", pending)
             except Exception:
@@ -277,7 +280,9 @@ class OZYAdminBot(discord.Client):
             "id": str(after.id),
             "discord_event_id": str(after.id),
             "title": after.name,
-            "description": after.description or "",
+            "description": event_description(after.description),
+            "guild_id": str(after.guild_id),
+            "event_channel_name": str(after.location or getattr(after.channel, "name", "")),
             "start_utc": after.start_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "end_utc": after.end_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "duration_minutes": duration_minutes,
