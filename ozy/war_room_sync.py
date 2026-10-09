@@ -6,6 +6,7 @@ Local mappings and stable markers recover creates after interrupted responses.
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit
@@ -25,6 +26,7 @@ class WarRoomSync:
     def __init__(self, bot):
         self.bot = bot
         self.lock = asyncio.Lock()
+        self.retry_after = {}
 
     async def api(self, body=None):
         settings = self.bot.settings
@@ -45,13 +47,21 @@ class WarRoomSync:
             return
         async with self.lock:
             pending = await self.api()
+            active_ids = {e['id'] for e in pending.get('events', [])}
+            self.retry_after = {k:v for k,v in self.retry_after.items() if k in active_ids}
             for event in pending.get('events', []):
+                prior = self.retry_after.get(event['id'])
+                if prior and prior['version'] == event['version'] and prior['until'] > time.monotonic():
+                    continue
                 lease = str(uuid.uuid4())
                 try:
                     await self.api({'action':'claim','id':event['id'],'version':event['version'],'lease':lease})
                     link = await self.apply(event)
                     await self.api({'id': event['id'], 'version': event['version'], 'discord': link,'lease':lease})
+                    self.retry_after.pop(event['id'], None)
                 except Exception as exc:
+                    attempts = prior['attempts'] + 1 if prior and prior['version'] == event['version'] else 1
+                    self.retry_after[event['id']] = {'version':event['version'],'attempts':attempts,'until':time.monotonic()+min(3600,60*2**min(attempts-1,6))}
                     log.warning('War Room sync failed for %s: %s', event.get('id'), exc)
                     try:
                         await self.api({'id': event['id'], 'version': event['version'],
@@ -98,11 +108,15 @@ class WarRoomSync:
                 pass
         elif link.get('attempt_started'):
             after = datetime.fromisoformat(link['attempt_started']) - timedelta(minutes=1) if link.get('attempt_started') else None
+            searched = 0
             async for candidate in channel.history(limit=200, after=after):
+                searched += 1
                 if candidate.author.id == bot.user.id and any(marker == embed.footer.text for embed in candidate.embeds):
                     message = candidate
                     link['message_id'] = str(candidate.id)
                     break
+            if message is None and searched >= 200:
+                raise RuntimeError('Post recovery is ambiguous; refusing a duplicate announcement')
         if item['status'] == 'deleted':
             if event:
                 await event.delete(reason='Deleted in OZY War Room')

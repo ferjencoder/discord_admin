@@ -135,3 +135,17 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             operation,payload=fake.website_sync.submit.call_args.args
             self.assertEqual(operation,'upsert_schedule_event')
             self.assertEqual(payload['status'],status.name)
+
+    async def test_retry_backoff_skips_repeated_failed_work_but_new_version_retries(self):
+        from unittest.mock import AsyncMock
+        bridge,item,counts,failures,events,messages=self.fixture()
+        async def api(body=None):
+            return {'events':[item]} if body is None else {'ok':True}
+        bridge.api=api
+        bridge.apply=AsyncMock(side_effect=PermissionError('Fixture permission failure'))
+        await bridge.run()
+        await bridge.run()
+        self.assertEqual(bridge.apply.await_count,1)
+        item['version']=2
+        await bridge.run()
+        self.assertEqual(bridge.apply.await_count,2)
