@@ -13,7 +13,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         state_values,events,messages={},[],[]
         state=SimpleNamespace(get_value=lambda key:state_values.get(key),set_value=lambda key,value:state_values.__setitem__(key,value),delete_event_reminders=Mock(),reschedule_event_reminders=Mock())
         guild=SimpleNamespace(id=123456)
-        counts={'create':0,'send':0,'edit':0,'post_edit':0}
+        counts={'create':0,'send':0,'edit':0,'post_edit':0,'history':0}
         failures={'create':False,'send':False}
         async def create(guild_id,**payload):
             counts['create']+=1
@@ -50,6 +50,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             if not messages:raise missing()
             return messages[0]
         async def history(**kwargs):
+            counts["history"]+=1
+            self.assertEqual(kwargs["limit"],200)
             for message in messages:yield message
         channel.send,channel.fetch_message,channel.history=send,fetch_message,history
         guild.get_channel_or_thread=lambda id:channel
@@ -61,6 +63,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_edit_delete_reuse_original_ids_and_post(self):
         bridge,item,counts,failures,events,messages=self.fixture()
         link=await bridge.apply(item)
+        self.assertEqual(counts['history'],0)
         item.update(title='Updated CP',version=2,discord=link)
         second=await bridge.apply(item)
         self.assertEqual(link,second);self.assertEqual(counts['create'],1);self.assertEqual(counts['send'],1)
@@ -110,3 +113,25 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_description_marker_is_removed_from_member_content(self):
         self.assertEqual(event_description('Notes\nOZY-WAR-ID:web-abc'),'Notes')
+
+    async def test_completion_updates_original_post_without_deleting_or_recreating(self):
+        bridge,item,counts,failures,events,messages=self.fixture()
+        await bridge.apply(item)
+        events[0].status=discord.EventStatus.active
+        item.update(status='completed',version=2)
+        await bridge.apply(item)
+        self.assertEqual(events[0].status,discord.EventStatus.completed)
+        self.assertEqual(counts['create'],1)
+        self.assertEqual(counts['send'],1)
+        self.assertEqual(messages[0].embeds[0].fields[2].value,'Ended')
+
+    async def test_terminal_gateway_updates_send_status_not_destructive_deletion(self):
+        from unittest.mock import AsyncMock
+        from bot import OZYAdminBot
+        fake=SimpleNamespace(settings=SimpleNamespace(server_id=123456),data=object(),website_sync=SimpleNamespace(submit=AsyncMock()))
+        for status in (discord.EventStatus.cancelled,discord.EventStatus.completed):
+            after=SimpleNamespace(id=223456,guild_id=123456,status=status,start_time=datetime(2026,10,4,17,tzinfo=timezone.utc),end_time=datetime(2026,10,4,18,tzinfo=timezone.utc),name='Fixture only',description='Notes',location='Test',channel=None,url='https://discord.com/events/123456/223456')
+            await OZYAdminBot.on_scheduled_event_update(fake,None,after)
+            operation,payload=fake.website_sync.submit.call_args.args
+            self.assertEqual(operation,'upsert_schedule_event')
+            self.assertEqual(payload['status'],status.name)

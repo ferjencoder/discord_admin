@@ -32,7 +32,7 @@ class WarRoomSync:
         url = urlunsplit((parsed.scheme, parsed.netloc, '/.netlify/functions/war-room-sync', '', ''))
         headers = {'X-OZY-Admin-Token': settings.ozy_data_api_token}
         async with self.bot.data.session.request('POST' if body else 'GET', url,
-                json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                json=body, headers=headers, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=30)) as response:
             if response.status != 200:
                 raise RuntimeError(f'War Room sync returned HTTP {response.status}')
             return await response.json()
@@ -96,9 +96,9 @@ class WarRoomSync:
                 message = await channel.fetch_message(int(link['message_id']))
             except discord.NotFound:
                 pass
-        else:
+        elif link.get('attempt_started'):
             after = datetime.fromisoformat(link['attempt_started']) - timedelta(minutes=1) if link.get('attempt_started') else None
-            async for candidate in channel.history(limit=None, after=after):
+            async for candidate in channel.history(limit=200, after=after):
                 if candidate.author.id == bot.user.id and any(marker == embed.footer.text for embed in candidate.embeds):
                     message = candidate
                     link['message_id'] = str(candidate.id)
@@ -118,7 +118,7 @@ class WarRoomSync:
         start = datetime.fromisoformat(item['start_utc'].replace('Z', '+00:00'))
         end = datetime.fromisoformat(item['end_utc'].replace('Z', '+00:00'))
         description = (item.get('description', '')[:900] + '\n' + marker) if item['id'].startswith('web-') else item.get('description', '')[:1000]
-        if item['status'] == 'cancelled':
+        if item['status'] in ('cancelled', 'completed'):
             if event and event.status not in (discord.EventStatus.cancelled, discord.EventStatus.completed):
                 if event.status == discord.EventStatus.active:
                     await event.edit(status=discord.EventStatus.completed)
@@ -147,12 +147,12 @@ class WarRoomSync:
             links[item['id']] = link
             self.save(links)
             event = await guild.fetch_scheduled_event(int(created['id']))
-        if link.get('event_id') and item['status'] != 'cancelled':
+        if link.get('event_id') and item['status'] not in ('cancelled', 'completed'):
             bot.state.reschedule_event_reminders(int(link['event_id']), start)
         embed = discord.Embed(title=item['title'], description=item.get('description') or 'No notes.', color=0xEF8634)
         embed.add_field(name='Starts', value=f'<t:{int(start.timestamp())}:F>\n<t:{int(start.timestamp())}:R>')
         embed.add_field(name='Duration', value=f"{round((end-start).total_seconds()/60)} min")
-        embed.add_field(name='Status', value={'cancelled':'Cancelled','closed':'Sign-ups closed'}.get(item['status'],'Open for sign-ups'))
+        embed.add_field(name='Status', value={'cancelled':'Cancelled','completed':'Ended','closed':'Sign-ups closed'}.get(item['status'],'Open for sign-ups'))
         embed.add_field(name='Meeting point', value=item.get('location') or 'OZY War Room')
         embed.add_field(name='Places', value=str(item.get('capacity') or 'Unlimited'))
         embed.set_footer(text=marker)
@@ -160,7 +160,7 @@ class WarRoomSync:
         origin = urlsplit(bot.settings.schedule_url)
         view.add_item(discord.ui.Button(label='War Room · details & sign-up', style=discord.ButtonStyle.link,
             url=urlunsplit((origin.scheme,origin.netloc,'/war-room','',item['id']))))
-        if link.get('event_id') and item['status'] != 'cancelled':
+        if link.get('event_id') and item['status'] not in ('cancelled', 'completed'):
             view.add_item(discord.ui.Button(label='Discord event',style=discord.ButtonStyle.link,
                 url=f"https://discord.com/events/{guild.id}/{link['event_id']}"))
         if message:

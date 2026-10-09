@@ -115,6 +115,7 @@ class OZYAdminBot(discord.Client):
         )
 
         self.http_session: aiohttp.ClientSession | None = None
+        self.website_sync_ready = False
         self.data: DataProvider | None = None
         self.calendar_client: TournamentCalendarClient | None = None
         self.health_runner: web.AppRunner | None = None
@@ -131,7 +132,7 @@ class OZYAdminBot(discord.Client):
     async def setup_hook(self) -> None:
         # Use aiohttp's normal client defaults. Do not advertise project/bot names
         # in outbound read-only source requests.
-        self.http_session = aiohttp.ClientSession()
+        self.http_session = aiohttp.ClientSession(headers={"User-Agent": "OZYAdmin/1.0"})
         self.data = DataProvider(self.settings, self.http_session)
         self.website_sync = WebsiteSync(self.state, self.data)
         self.war_room_sync = WarRoomSync(self)
@@ -173,9 +174,11 @@ class OZYAdminBot(discord.Client):
             try:
                 pending = await self.website_sync.retry()
                 await self.war_room_sync.run()
+                self.website_sync_ready = pending == 0
                 if pending:
                     log.warning("Website communications awaiting retry: %s", pending)
             except Exception:
+                self.website_sync_ready = False
                 log.exception("Website communications retry failed")
             await asyncio.sleep(60)
 
@@ -268,12 +271,6 @@ class OZYAdminBot(discord.Client):
         """Keep Discord event edits synchronized to the website schedule."""
         if after.guild_id != self.settings.server_id or self.data is None:
             return
-        if after.status in (discord.EventStatus.cancelled, discord.EventStatus.completed):
-            try:
-                await self.website_sync.submit("delete_schedule_event", after.id)
-            except DataUnavailable as exc:
-                log.warning("Event removal queued for retry: %s", exc)
-            return
         if not after.start_time or not after.end_time:
             return
         duration_minutes = max(1, round((after.end_time - after.start_time).total_seconds() / 60))
@@ -288,6 +285,7 @@ class OZYAdminBot(discord.Client):
             "end_utc": after.end_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "duration_minutes": duration_minutes,
             "discord_event_url": after.url,
+            "status": after.status.name,
         }
         try:
             await self.website_sync.submit("upsert_schedule_event", payload)
@@ -314,6 +312,7 @@ class OZYAdminBot(discord.Client):
                 {
                     "status": "ok",
                     "discord_ready": self.is_ready(),
+                    "website_sync_ready": self.website_sync_ready,
                     "guild": self.settings.server_id,
                     "state_backend": self.state.backend,
                     "utc": datetime.now(timezone.utc).isoformat(),
