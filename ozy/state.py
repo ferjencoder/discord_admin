@@ -151,6 +151,7 @@ class AdminState:
         headers = {
             "X-OZY-State-Token": self.remote_token,
             "Accept": "application/octet-stream",
+            "User-Agent": "OZYAdmin/1.0",
         }
         if body is not None:
             headers["Content-Type"] = "application/octet-stream"
