@@ -10,6 +10,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from urllib.parse import urlsplit, urlunsplit
+
 import aiohttp
 
 from settings import Settings
@@ -133,7 +135,7 @@ class DataProvider:
             raise DataUnavailable("Merc API: OZY_DATA_API_TOKEN is not configured")
         try:
             async with self.session.get(
-                "https://ozy.com.ar/api/v1/mercs/current",
+                urlunsplit((*urlsplit(getattr(self.settings, "roster_url", None) or "https://ozy.com.ar")[:2], "/api/v1/mercs/current", "", "")),
                 headers={"X-OZY-Admin-Token": self.settings.ozy_data_api_token},
                 timeout=aiohttp.ClientTimeout(total=self.settings.http_timeout_seconds),
                 allow_redirects=False,
