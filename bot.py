@@ -15,6 +15,7 @@ import discord
 from aiohttp import web
 from discord import app_commands
 
+from ozy.auth_verifier import install_auth_verifier
 from ozy.website_sync import WebsiteSync
 from ozy.war_room_sync import WarRoomSync, event_description
 from ozy.data_provider import DataProvider, DataUnavailable
@@ -320,6 +321,7 @@ class OZYAdminBot(discord.Client):
             )
 
         app = web.Application()
+        install_auth_verifier(app)
         app.router.add_get("/", health)
         app.router.add_get("/healthz", health)
         self.health_runner = web.AppRunner(app, access_log=None)
