@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from html import unescape
 from aiohttp import ClientSession, ClientTimeout, web
 from ozy.event_calendar import parse_tournament_calendar_html, parse_akurier_mini_events_html
+from ozy.calendar_payload import canonical
 
 SOURCES = {'nexus': 'https://nexusportal.voltron.me/api/calendar/content?realm=Regular',
            'akurier': 'https://www.akurier.pl/events',
@@ -102,5 +103,5 @@ def install_calendar_sources(app, token=None, fetch_html=None, clock=time.time):
                         pass
                 await asyncio.gather(*(load(n, u) for n, u in SOURCES.items()))
                 last_refresh = clock()
-            return web.json_response({'providers': snapshots}, headers={'Cache-Control': 'no-store'})
+            return web.json_response(canonical(snapshots, SOURCES) if request.query.get('view') == 'canonical' else {'providers': snapshots}, headers={'Cache-Control': 'no-store'})
     app.router.add_get('/internal/calendar/v1', handler)
