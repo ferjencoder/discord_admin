@@ -1,4 +1,5 @@
 from __future__ import annotations
+from ozy.calendar_sources import install_calendar_sources
 
 import asyncio
 import io
@@ -321,6 +322,7 @@ class OZYAdminBot(discord.Client):
 
         app = web.Application()
         install_auth_verifier(app)
+        install_calendar_sources(app)
         app.router.add_get("/", health)
         app.router.add_get("/healthz", health)
         self.health_runner = web.AppRunner(app, access_log=None)
