@@ -27,3 +27,23 @@ Run calendar checks with:
 ```text
 python -m pytest tests/test_event_calendar.py tests/test_canonical_calendar.py
 ```
+
+
+## Free-tier traffic policy
+
+Cloudflare refreshes the canonical sources once daily at 17:00 UTC (14:00
+Argentina). The bot reads the cached website calendar at startup and at 17:01
+UTC, without probing providers between resets. Explicit leadership refresh
+commands remain available. The separate automatic Akurier job is disabled.
+
+The integrated Merc feed makes no website requests unless the cached calendar
+has a confirmed Mercenary Exchange start/end window containing the current time.
+Missing, stale (>26 hours), or unknown event timing leaves the feed paused.
+The local timer does not perform network/database work while paused.
+
+Website event mutations notify the authenticated `/internal/website-changed`
+route on the existing Render server. The bot drains pending work once on restart
+and after notifications; it then waits without polling. Failed changes use
+bounded exponential backoff. Website notifications retry briefly, and durable
+pending events remain recoverable using the manager's Retry Discord sync action
+or after a bot restart. Do not add public wake-up routes or log their token.

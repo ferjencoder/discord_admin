@@ -9,8 +9,9 @@ class WebsiteSync:
     KEY = 'website_sync_pending'
     OPERATIONS = {'upsert_announcement', 'delete_announcement', 'upsert_schedule_event', 'delete_schedule_event'}
 
-    def __init__(self, state, provider):
+    def __init__(self, state, provider, on_pending=None):
         self.state, self.provider = state, provider
+        self.on_pending = on_pending
         self.lock = asyncio.Lock()
 
     async def submit(self, operation, payload):
@@ -26,7 +27,12 @@ class WebsiteSync:
                 payload = {**previous['payload'], **payload}
             pending[key] = {'operation': operation, 'payload': payload}
             self.state.set_value(self.KEY, json.dumps(pending))
-            result = await getattr(self.provider, operation)(payload)
+            try:
+                result = await getattr(self.provider, operation)(payload)
+            except Exception:
+                if self.on_pending:
+                    self.on_pending()
+                raise
             pending.pop(key)
             self.state.set_value(self.KEY, json.dumps(pending))
             return result

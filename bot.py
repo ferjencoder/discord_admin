@@ -1,5 +1,6 @@
 from __future__ import annotations
 from ozy.calendar_sources import install_calendar_sources
+from ozy.sync_signals import merc_event_active, install_sync_signal, run_changes
 
 import asyncio
 import io
@@ -74,10 +75,9 @@ SCHEDULE_AUDIENCE_CHOICES = [
     app_commands.Choice(name="Both", value="both"),
 ]
 
-# Minimal-impact source schedule. Public calendar metadata is checked only four
-# times per UTC day while we learn the calendar source refresh cadence.
-# Akurier regular mini-events are fetched once daily at R+1 (18:00 UTC).
-CALENDAR_META_PROBE_TIMES_UTC = ((0, 30), (6, 30), (12, 30), (18, 30))
+# Website source refresh is at 17:00 UTC (14:00 Argentina). Read the updated
+# cached calendar once, one minute later. No automatic source probing.
+CALENDAR_META_PROBE_TIMES_UTC = ((17, 1),)
 AKURIER_REFRESH_TIME_UTC = (18, 0)
 
 
@@ -117,6 +117,7 @@ class OZYAdminBot(discord.Client):
 
         self.http_session: aiohttp.ClientSession | None = None
         self.website_sync_ready = False
+        self._sync_wake = asyncio.Event()
         self.data: DataProvider | None = None
         self.calendar_client: TournamentCalendarClient | None = None
         self.health_runner: web.AppRunner | None = None
@@ -135,7 +136,7 @@ class OZYAdminBot(discord.Client):
         # in outbound read-only source requests.
         self.http_session = aiohttp.ClientSession(headers={"User-Agent": "OZYAdmin/1.0"})
         self.data = DataProvider(self.settings, self.http_session)
-        self.website_sync = WebsiteSync(self.state, self.data)
+        self.website_sync = WebsiteSync(self.state, self.data, on_pending=self._sync_wake.set)
         self.war_room_sync = WarRoomSync(self)
         self.background_tasks.append(asyncio.create_task(self._website_sync_loop(), name="website-sync"))
         self.calendar_client = TournamentCalendarClient(self.settings, self.http_session)
@@ -162,7 +163,7 @@ class OZYAdminBot(discord.Client):
             self.background_tasks.append(asyncio.create_task(self._daily_chest_ranking_loop(), name="daily-chest-ranking"))
         if self.settings.calendar_enabled and (self.settings.calendar_channel_id or self.settings.today_channel_id):
             self.background_tasks.append(asyncio.create_task(self._calendar_refresh_loop(), name="calendar-refresh"))
-            self.background_tasks.append(asyncio.create_task(self._akurier_refresh_loop(), name="akurier-refresh"))
+            # All three sources are refreshed together by the website at reset.
             if self.settings.today_enabled and self.settings.today_channel_id:
                 self.background_tasks.append(asyncio.create_task(self._calendar_today_loop(), name="calendar-today"))
 
@@ -171,17 +172,17 @@ class OZYAdminBot(discord.Client):
 
     async def _website_sync_loop(self):
         await self.wait_until_ready()
-        while not self.is_closed():
+        async def drain():
             try:
                 pending = await self.website_sync.retry()
-                await self.war_room_sync.run()
-                self.website_sync_ready = pending == 0
-                if pending:
-                    log.warning("Website communications awaiting retry: %s", pending)
+                discord_pending = await self.war_room_sync.run()
+                self.website_sync_ready = not pending and not discord_pending
+                return pending or discord_pending
             except Exception:
                 self.website_sync_ready = False
-                log.exception("Website communications retry failed")
-            await asyncio.sleep(60)
+                log.warning("Website changes awaiting recovery; backing off")
+                raise
+        await run_changes(self._sync_wake, drain, self.is_closed)
 
     async def _mercs_loop(self) -> None:
         feed = MercFeed(self.state, self.settings.mercs_channel_id)
@@ -190,6 +191,11 @@ class OZYAdminBot(discord.Client):
         failures = 0
         while not self.is_closed():
             await self.wait_until_ready()
+            if not merc_event_active(self.calendar_client.snapshot if self.calendar_client else None):
+                failures = 0
+                # Local timer only: no HTTP or database queries outside the event.
+                await asyncio.sleep(30)
+                continue
             try:
                 rows = await self.data.current_mercs()
                 channel = self.get_channel(self.settings.mercs_channel_id)
@@ -314,6 +320,8 @@ class OZYAdminBot(discord.Client):
                     "status": "ok",
                     "discord_ready": self.is_ready(),
                     "website_sync_ready": self.website_sync_ready,
+                    "website_sync_mode": "changes_only",
+                    "merc_feed_active": merc_event_active(self.calendar_client.snapshot if self.calendar_client else None),
                     "guild": self.settings.server_id,
                     "state_backend": self.state.backend,
                     "utc": datetime.now(timezone.utc).isoformat(),
@@ -323,6 +331,7 @@ class OZYAdminBot(discord.Client):
         app = web.Application()
         install_auth_verifier(app)
         install_calendar_sources(app)
+        install_sync_signal(app, self._sync_wake)
         app.router.add_get("/", health)
         app.router.add_get("/healthz", health)
         self.health_runner = web.AppRunner(app, access_log=None)
@@ -1395,10 +1404,10 @@ class OZYAdminBot(discord.Client):
                 raise
 
             try:
-                log.info("Running lightweight calendar metadata probe at %s", target.isoformat())
+                log.info("Reading the daily cached calendar at %s", target.isoformat())
                 await self._refresh_calendar(
                     force=False,
-                    actor="automatic metadata probe",
+                    actor="daily cached calendar",
                     refresh_akurier=False,
                 )
             except asyncio.CancelledError:

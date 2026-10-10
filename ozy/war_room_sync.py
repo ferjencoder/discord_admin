@@ -44,7 +44,7 @@ class WarRoomSync:
 
     async def run(self):
         if not self.bot.settings.schedule_url or not self.bot.settings.ozy_data_api_token:
-            return
+            return 0
         async with self.lock:
             pending = await self.api()
             active_ids = {e['id'] for e in pending.get('events', [])}
@@ -68,6 +68,8 @@ class WarRoomSync:
                             'lease':lease,'error': 'Discord update failed. Check bot permissions and schedule channel.'})
                     except Exception:
                         log.warning('Could not acknowledge War Room sync failure')
+
+            return len(self.retry_after)
 
     async def apply(self, item):
         bot = self.bot

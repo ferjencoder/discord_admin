@@ -157,6 +157,8 @@ def test_background_loop_recovers_and_cancels(tmp_path, monkeypatch):
             data=SimpleNamespace(current_mercs=AsyncMock(side_effect=[DataUnavailable("Merc API HTTP 401"), []])),
             is_closed=lambda: False, wait_until_ready=AsyncMock(), get_channel=lambda _: channel,
         )
+        monkeypatch.setattr(bot, "merc_event_active", lambda snapshot: True)
+        client.calendar_client = SimpleNamespace(snapshot=None)
         monkeypatch.setattr(bot.discord, "TextChannel", SimpleNamespace)
         monkeypatch.setattr(bot.asyncio, "sleep", sleep)
         with pytest.raises(asyncio.CancelledError):
