@@ -1,6 +1,6 @@
 from __future__ import annotations
 from ozy.calendar_sources import install_calendar_sources
-from ozy.sync_signals import merc_event_active, install_sync_signal, run_changes
+from ozy.sync_signals import merc_event_active, install_sync_signal, run_changes, wait_merc_signal
 
 import asyncio
 import io
@@ -118,6 +118,7 @@ class OZYAdminBot(discord.Client):
         self.http_session: aiohttp.ClientSession | None = None
         self.website_sync_ready = False
         self._sync_wake = asyncio.Event()
+        self._merc_wake = asyncio.Event()
         self.data: DataProvider | None = None
         self.calendar_client: TournamentCalendarClient | None = None
         self.health_runner: web.AppRunner | None = None
@@ -194,8 +195,12 @@ class OZYAdminBot(discord.Client):
             if not merc_event_active(self.calendar_client.snapshot if self.calendar_client else None):
                 failures = 0
                 # Local timer only: no HTTP or database queries outside the event.
-                await asyncio.sleep(30)
+                self._merc_wake.clear()
+                await wait_merc_signal(self._merc_wake, 30)
                 continue
+            # Clear before reading so notifications arriving during a fetch or
+            # send remain pending for the next pass, rather than being lost.
+            self._merc_wake.clear()
             try:
                 rows = await self.data.current_mercs()
                 channel = self.get_channel(self.settings.mercs_channel_id)
@@ -229,8 +234,12 @@ class OZYAdminBot(discord.Client):
                     log.info("Merc API health: %s (%d records, %d invalid); empty does not prove scanner failure",
                              health, len(rows), invalid)
                 last_health, last_log = health, clock
-            delay = min(300, self.settings.mercs_poll_seconds * 2 ** min(failures, 5))
-            await asyncio.sleep(delay)
+            if failures:
+                # Signals cannot bypass quota/error backoff.
+                delay = min(300, self.settings.mercs_poll_seconds * 2 ** min(failures, 5))
+                await asyncio.sleep(delay)
+            else:
+                await wait_merc_signal(self._merc_wake, 60)
 
     async def close(self) -> None:
         for task in self.background_tasks:
@@ -322,6 +331,7 @@ class OZYAdminBot(discord.Client):
                     "website_sync_ready": self.website_sync_ready,
                     "website_sync_mode": "changes_only",
                     "merc_feed_active": merc_event_active(self.calendar_client.snapshot if self.calendar_client else None),
+                    "merc_delivery_mode": "signal_with_60s_recovery",
                     "guild": self.settings.server_id,
                     "state_backend": self.state.backend,
                     "utc": datetime.now(timezone.utc).isoformat(),
@@ -331,7 +341,7 @@ class OZYAdminBot(discord.Client):
         app = web.Application()
         install_auth_verifier(app)
         install_calendar_sources(app)
-        install_sync_signal(app, self._sync_wake)
+        install_sync_signal(app, self._sync_wake, merc_wake=self._merc_wake)
         app.router.add_get("/", health)
         app.router.add_get("/healthz", health)
         self.health_runner = web.AppRunner(app, access_log=None)

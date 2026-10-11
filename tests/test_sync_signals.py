@@ -59,3 +59,26 @@ def test_private_change_notification_does_not_allow_public_wakeups():
             assert (await client.post('/internal/website-changed',headers={'Authorization':'Bearer '+'t'*64})).status==202
             assert wake.is_set()
     asyncio.run(check())
+
+
+def test_merc_signals_wake_immediately_and_do_not_trigger_website_sync():
+    from ozy.sync_signals import wait_merc_signal
+    async def check():
+        website=asyncio.Event();merc=asyncio.Event();app=web.Application()
+        install_sync_signal(app,website,token='t'*64,merc_wake=merc)
+        async with TestClient(TestServer(app)) as client:
+            assert (await client.post('/internal/mercs-changed')).status==401
+            assert not merc.is_set()
+            task=asyncio.create_task(wait_merc_signal(merc,60))
+            assert (await client.post('/internal/mercs-changed',headers={'Authorization':'Bearer '+'t'*64})).status==202
+            await asyncio.wait_for(task,0.2)
+            assert merc.is_set() and not website.is_set()
+            # A notification received during delivery survives until the next
+            # pass: the waiter does not erase an already-pending event.
+            await asyncio.wait_for(wait_merc_signal(merc,60),0.2)
+            merc.clear()
+            await wait_merc_signal(merc,0.01)
+            assert not merc.is_set()
+            response=await client.post('/internal/mercs-changed',headers={'Authorization':'Bearer '+'t'*64},data='bad')
+            assert response.status==400 and not merc.is_set()
+    asyncio.run(check())

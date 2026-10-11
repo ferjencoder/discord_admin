@@ -58,3 +58,15 @@ Discord Community Onboarding owns member onboarding and normal access. OZY Admin
 
 Set `MERCS_CHANNEL_ID` to enable fresh OZY map locations in Discord. See
 [Merc feed setup and delivery semantics](docs/MERCS.md).
+
+
+### Merc discovery notifications
+
+The existing private auth-service token also protects POST
+`/internal/mercs-changed`. This sets an in-memory event; it accepts no sighting
+body. The Merc loop reads the verified Cloudflare snapshot immediately after a
+signal, and otherwise performs a 60-second recovery read only during the event.
+Signals received while delivering remain pending. Errors retain exponential
+backoff; signals cannot bypass it. Discord deduplication and immediate durable
+send checkpoints are unchanged. Health exposes
+`merc_delivery_mode=signal_with_60s_recovery`. No new service or paid resource.

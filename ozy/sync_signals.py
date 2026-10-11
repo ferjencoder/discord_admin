@@ -22,7 +22,7 @@ def merc_event_active(snapshot, now=None):
             return True
     return False
 
-def install_sync_signal(app, wake, token=None):
+def install_sync_signal(app, wake, token=None, merc_wake=None):
     token = os.environ.get('OZY_AUTH_SERVICE_TOKEN','') if token is None else token
     async def changed(request):
         provided=request.headers.get('Authorization','')
@@ -30,9 +30,10 @@ def install_sync_signal(app, wake, token=None):
             return web.json_response({'error':'unauthorized'},status=401)
         if request.content_length not in (None,0):
             return web.json_response({'error':'body_not_needed'},status=400)
-        wake.set()
+        (merc_wake if request.path=='/internal/mercs-changed' else wake).set()
         return web.json_response({'accepted':True},status=202,headers={'Cache-Control':'no-store'})
     app.router.add_post('/internal/website-changed',changed)
+    if merc_wake is not None:app.router.add_post('/internal/mercs-changed',changed)
 
 async def run_changes(wake, drain, is_closed, sleep=asyncio.sleep):
     wake.set()  # One recovery pass after restart; no periodic idle polling.
@@ -52,3 +53,11 @@ async def run_changes(wake, drain, is_closed, sleep=asyncio.sleep):
             wake.set()
         else:
             failures=0
+
+
+async def wait_merc_signal(wake, timeout):
+    """Wake immediately on discovery; timeout only recovers a lost notification."""
+    try:
+        await asyncio.wait_for(wake.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass

@@ -159,11 +159,15 @@ def test_background_loop_recovers_and_cancels(tmp_path, monkeypatch):
         )
         monkeypatch.setattr(bot, "merc_event_active", lambda snapshot: True)
         client.calendar_client = SimpleNamespace(snapshot=None)
+        client._merc_wake = asyncio.Event()
         monkeypatch.setattr(bot.discord, "TextChannel", SimpleNamespace)
         monkeypatch.setattr(bot.asyncio, "sleep", sleep)
+        async def wait_signal(wake, timeout):
+            await sleep(timeout)
+        monkeypatch.setattr(bot, "wait_merc_signal", wait_signal)
         with pytest.raises(asyncio.CancelledError):
             await bot.OZYAdminBot._mercs_loop(client)
         assert client.data.current_mercs.await_count == 2
-        assert sleeps == [30, 15]
+        assert sleeps == [30, 60]
         channel.send.assert_not_awaited()
     asyncio.run(run())
