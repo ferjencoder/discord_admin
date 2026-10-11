@@ -213,3 +213,34 @@ def test_event_reminders_roundtrip_and_reschedule(tmp_path):
 
     assert state.delete_event_reminders(77) == 3
     assert state.event_reminders_for_event(77) == []
+
+
+def test_remote_transport_compressed_roundtrip(tmp_path, monkeypatch):
+    import gzip
+    import urllib.request
+    remote = {"payload": None}
+    class Response:
+        headers = {"content-type": "application/vnd.ozy.sqlite+gzip"}
+        def __init__(self, body): self.body = body
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    def urlopen(request, timeout):
+        assert request.get_header("Accept-encoding") == "identity"
+        if request.method == "GET":
+            if remote["payload"] is None:
+                from urllib.error import HTTPError
+                raise HTTPError(request.full_url,404,"not found",{},None)
+            return Response(remote["payload"])
+        assert request.get_header("Content-type") == "application/vnd.ozy.sqlite+gzip"
+        assert gzip.decompress(request.data).startswith(AdminState.SQLITE_HEADER)
+        remote["payload"] = request.data
+        response = Response(b'{"ok":true}')
+        response.headers = {"content-type":"application/json"}
+        return response
+    monkeypatch.setattr(urllib.request,"urlopen",urlopen)
+    first=AdminState(tmp_path/'first.db',remote_url='https://test/state',remote_token='x'*32)
+    first.set_link(123,'Transport Test','fixture')
+    second=AdminState(tmp_path/'second.db',remote_url='https://test/state',remote_token='x'*32)
+    assert second.get_link(123)=='Transport Test'
+    assert len(remote['payload']) < len(gzip.decompress(remote['payload']))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import gzip
 import sqlite3
 import tempfile
 import urllib.error
@@ -151,10 +152,13 @@ class AdminState:
         headers = {
             "X-OZY-State-Token": self.remote_token,
             "Accept": "application/octet-stream",
+            "Accept-Encoding": "identity",
+            "X-OZY-State-Format": "gzip-v1",
             "User-Agent": "OZYAdmin/1.0",
         }
         if body is not None:
-            headers["Content-Type"] = "application/octet-stream"
+            body = gzip.compress(body, compresslevel=1, mtime=0)
+            headers["Content-Type"] = "application/vnd.ozy.sqlite+gzip"
         request = urllib.request.Request(
             self.remote_url,
             data=body,
@@ -164,6 +168,8 @@ class AdminState:
         try:
             with urllib.request.urlopen(request, timeout=self.remote_timeout_seconds) as response:
                 payload = response.read()
+                if response.headers.get("content-type", "").startswith("application/vnd.ozy.sqlite+gzip"):
+                    payload = gzip.decompress(payload)
                 if method == "GET" and payload is not None and not payload.startswith(self.SQLITE_HEADER):
                     content_type = response.headers.get("content-type", "")
                     final_url = response.geturl()
