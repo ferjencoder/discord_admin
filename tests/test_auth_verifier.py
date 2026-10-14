@@ -149,3 +149,22 @@ def test_cancelled_request_keeps_cpu_slot_reserved():
             release.set()
             await verifier.active
     asyncio.run(run())
+
+
+def test_personal_pin_policy_and_legacy_verification():
+    for password in ("Ab12", "1234", "ABCDEFGH", "aB123456"):
+        value = {**BASE, "password": password}
+        created = calculate(validate(value))
+        assert calculate(validate({**value, "operation": "verify", **created})) == {"matched": True}
+        assert calculate(validate({**value, "operation": "verify", "password": "wrong", **created})) == {"matched": False}
+    for password in ("abc", "abcdefghi", "abc!", "ab c", "ábc1", "１２３４"):
+        try:
+            validate({**BASE, "password": password})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid PIN accepted")
+    # Existing longer PINs can still prove identity before a member chooses a new PIN.
+    legacy = {**BASE, "password": "123456789012"}
+    created = calculate(legacy)
+    assert calculate(validate({**legacy, "operation": "verify", **created})) == {"matched": True}

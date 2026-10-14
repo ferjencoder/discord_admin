@@ -54,7 +54,7 @@ def validate(value):
     if not isinstance(subject, str) or not re.fullmatch(r"[a-f0-9]{64}", subject):
         raise ValueError("invalid subject")
     if operation == "hash":
-        if kind == "personal" and not re.fullmatch(r"[0-9]{6,12}", password):
+        if kind == "personal" and not re.fullmatch(r"[A-Za-z0-9]{4,8}", password):
             raise ValueError("invalid PIN")
         if kind == "admin" and not 12 <= len(password) <= 128:
             raise ValueError("invalid password")
