@@ -1,6 +1,6 @@
 from __future__ import annotations
 from ozy.calendar_sources import install_calendar_sources
-from ozy.sync_signals import merc_event_active, install_sync_signal, run_changes, wait_merc_signal
+from ozy.sync_signals import MercCalendarGate, merc_event_active, install_sync_signal, run_changes, wait_merc_signal
 
 import asyncio
 import io
@@ -187,14 +187,15 @@ class OZYAdminBot(discord.Client):
 
     async def _mercs_loop(self) -> None:
         feed = MercFeed(self.state, self.settings.mercs_channel_id)
+        calendar_gate = MercCalendarGate()
         last_health = None
         last_log = 0.0
         failures = 0
         while not self.is_closed():
             await self.wait_until_ready()
-            if not merc_event_active(self.calendar_client.snapshot if self.calendar_client else None):
+            if not await calendar_gate.active(self.calendar_client, signaled=self._merc_wake.is_set()):
                 failures = 0
-                # Local timer only: no HTTP or database queries outside the event.
+                # Idle timer only; discovery-triggered calendar reads are bounded above.
                 self._merc_wake.clear()
                 await wait_merc_signal(self._merc_wake, 30)
                 continue

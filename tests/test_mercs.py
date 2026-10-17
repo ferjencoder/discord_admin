@@ -157,9 +157,19 @@ def test_background_loop_recovers_and_cancels(tmp_path, monkeypatch):
             data=SimpleNamespace(current_mercs=AsyncMock(side_effect=[DataUnavailable("Merc API HTTP 401"), []])),
             is_closed=lambda: False, wait_until_ready=AsyncMock(), get_channel=lambda _: channel,
         )
-        monkeypatch.setattr(bot, "merc_event_active", lambda snapshot: True)
+        from datetime import timedelta
+        from ozy.event_calendar import CalendarSnapshot, CalendarAction
+        now = datetime.now(timezone.utc)
+        corrected = CalendarSnapshot((
+            CalendarAction(now-timedelta(minutes=1), 'STARTS', 'Mercenary Exchange'),
+            CalendarAction(now+timedelta(hours=1), 'ENDS', 'Mercenary Exchange'),
+        ), (), 'corrected', fetched_at_utc=now)
         client.calendar_client = SimpleNamespace(snapshot=None)
+        async def refresh(**kwargs):
+            client.calendar_client.snapshot = corrected
+        client.calendar_client.refresh = AsyncMock(side_effect=refresh)
         client._merc_wake = asyncio.Event()
+        client._merc_wake.set()
         monkeypatch.setattr(bot.discord, "TextChannel", SimpleNamespace)
         monkeypatch.setattr(bot.asyncio, "sleep", sleep)
         async def wait_signal(wake, timeout):
@@ -167,6 +177,7 @@ def test_background_loop_recovers_and_cancels(tmp_path, monkeypatch):
         monkeypatch.setattr(bot, "wait_merc_signal", wait_signal)
         with pytest.raises(asyncio.CancelledError):
             await bot.OZYAdminBot._mercs_loop(client)
+        client.calendar_client.refresh.assert_awaited_once_with(force=True)
         assert client.data.current_mercs.await_count == 2
         assert sleeps == [30, 60]
         channel.send.assert_not_awaited()
