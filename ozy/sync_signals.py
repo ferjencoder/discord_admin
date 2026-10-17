@@ -2,6 +2,7 @@
 import asyncio
 import hmac
 import os
+import time
 from datetime import datetime, timezone
 from aiohttp import web
 
@@ -21,6 +22,33 @@ def merc_event_active(snapshot, now=None):
         if end and start.timestamp_utc <= now < end.timestamp_utc:
             return True
     return False
+
+
+class MercCalendarGate:
+    """Refresh an inactive calendar on discovery signals, never on idle ticks."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.next_refresh = 0.0
+
+    async def active(self, client, *, signaled):
+        if client is None:
+            return False
+        if merc_event_active(client.snapshot):
+            return True
+        if not signaled or self.clock() < self.next_refresh:
+            return False
+        # Bound bursts and failures to one read per minute. This only reads the
+        # website cache; it does not refresh providers or post calendar messages.
+        self.next_refresh = self.clock() + 60
+        try:
+            await client.refresh(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        return merc_event_active(client.snapshot)
+
 
 def install_sync_signal(app, wake, token=None, merc_wake=None):
     token = os.environ.get('OZY_AUTH_SERVICE_TOKEN','') if token is None else token
