@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -15,6 +16,7 @@ class Merc:
     y: int
     level: int | None
     seen: float
+    event_start: float
 
     @classmethod
     def parse(cls, row: dict) -> Merc:
@@ -29,9 +31,12 @@ class Merc:
         seen = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         if seen.tzinfo is None:
             raise ValueError("Merc seen timestamp must include a timezone")
+        event_start = float(row["event_start"]) / 1000
+        if not math.isfinite(event_start) or not 0 <= seen.timestamp() - event_start <= 48 * 3600:
+            raise ValueError("Invalid Merc event scope")
         return cls(str(row.get("object_id") or ""), number("kingdom"), number("x"),
                    number("y"), number("level") if row.get("level") is not None else None,
-                   seen.timestamp())
+                   seen.timestamp(), event_start)
 
     @property
     def keys(self):
@@ -54,6 +59,7 @@ class MercFeed:
         self.key = f"merc_feed:v1:{channel_id}"
         self.records = None
         self.saved = None
+        self.lock = asyncio.Lock()
 
     async def flush(self):
         payload = json.dumps(self.records, sort_keys=True)
@@ -62,6 +68,10 @@ class MercFeed:
             self.saved = payload
 
     async def publish(self, rows, send, *, now=None):
+        async with self.lock:
+            return await self._publish(rows, send, now=now)
+
+    async def _publish(self, rows, send, *, now=None):
         now = datetime.now(timezone.utc).timestamp() if now is None else now
         if self.records is None:
             raw = await asyncio.to_thread(self.state.get_value, self.key)
@@ -82,20 +92,22 @@ class MercFeed:
             current = max(now, datetime.now(timezone.utc).timestamp())
             if not -5 <= current - merc.seen <= 90:
                 continue
+            key = f"event:{int(merc.event_start)}:{merc.keys[0]}"
+            if key in self.records:
+                continue
+            # Adopt existing v1 delivery evidence without clearing any history.
             previous = [self.records[k] for k in merc.keys if k in self.records]
-            newest = max((p["seen"] for p in previous), default=0)
-            if merc.seen < newest:
-                continue  # An out-of-order scanner must not revert newer state.
-            duplicate = any(p["seen"] == newest and p["signature"] == merc.signature and merc.seen - p["seen"] <= 90
-                            for p in previous)
-            if not duplicate:
-                await send(merc.message())
-                posted += 1
-            for key in merc.keys:
-                self.records[key] = {"seen": merc.seen, "signature": merc.signature}
-            # Persist immediately after a send; retain memory if persistence fails.
-            if not duplicate:
-                await self.flush()
-        self.records = {k: v for k, v in self.records.items() if now - v["seen"] <= 86400}
+            duplicate = any(p.get("seen", 0) >= merc.event_start for p in previous)
+            self.records[key] = {"seen": merc.seen, "signature": merc.signature,
+                                 "status": "legacy" if duplicate else "attempted"}
+            # Commit locally AND to the production remote snapshot before send.
+            # An ambiguous send consumes its claim and is never retried.
+            await self.flush()
+            if duplicate:
+                continue
+            await send(merc.message())
+            posted += 1
+            self.records[key]["status"] = "sent"
+            await self.flush()
         await self.flush()
         return posted, invalid

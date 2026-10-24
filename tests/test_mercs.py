@@ -14,7 +14,8 @@ from test_data_provider import make_settings
 
 def row(at, **changes):
     return dict(object_id="123", kingdom=35, x=843, y=603, level=10,
-                last_seen=datetime.fromtimestamp(at, timezone.utc).isoformat(), **changes)
+                last_seen=datetime.fromtimestamp(at, timezone.utc).isoformat(),
+                event_start=int((at-3600)//86400)*86400000, **changes)
 
 
 def test_read_api_timestamp_takes_precedence():
@@ -22,6 +23,7 @@ def test_read_api_timestamp_takes_precedence():
     record = dict(object_id="1374476599231", kind="merc", kingdom=320,
                   x=156, y=312, static_id=400, level=10,
                   first_seen="2026-09-30T01:39:10Z", last_seen="2026-09-30T01:39:10Z",
+                  event_start=datetime(2026,9,30,tzinfo=timezone.utc).timestamp()*1000,
                   seen_count=1, scanner_id="scanner-02", age_seconds=25)
     merc = Merc.parse(record)
     assert "K:320 X:156 Y:312" in merc.message()
@@ -44,13 +46,13 @@ def test_dedup_updates_restart_and_destination(tmp_path):
         await MercFeed(state, 1).publish([row(now + 15)], send, now=now + 15)
         assert send.await_count == 1
         await feed.publish([{**row(now + 30), "level": 11}], send, now=now + 30)
-        assert send.await_count == 2
+        assert send.await_count == 1
         await feed.publish([{**row(now + 45), "x": 844}], send, now=now + 45)
-        assert send.await_count == 3
+        assert send.await_count == 2
         await feed.publish([row(now + 140)], send, now=now + 140)
-        assert send.await_count == 4
+        assert send.await_count == 2
         await MercFeed(state, 2).publish([row(now + 140)], send, now=now + 140)
-        assert send.await_count == 5
+        assert send.await_count == 3
     asyncio.run(run())
 
 
@@ -67,7 +69,7 @@ def test_location_alias_stale_out_of_order_and_bad_records(tmp_path):
     asyncio.run(run())
 
 
-def test_failed_delivery_retries_and_persistence_failure_keeps_memory(tmp_path):
+def test_ambiguous_delivery_is_not_retried_and_persistence_precedes_send(tmp_path):
     async def run():
         now = datetime.now(timezone.utc).timestamp()
         state = AdminState(tmp_path / "state.db")
@@ -76,16 +78,42 @@ def test_failed_delivery_retries_and_persistence_failure_keeps_memory(tmp_path):
         with pytest.raises(RuntimeError):
             await feed.publish([row(now)], send, now=now)
         send.side_effect = None
-        await feed.publish([row(now)], send, now=now)
-        assert send.await_count == 2
+        await MercFeed(state,1).publish([row(now)], send, now=now)
+        assert send.await_count == 1
         real_set = state.set_value
         state.set_value = lambda *args: (_ for _ in ()).throw(OSError("disk"))
         with pytest.raises(OSError):
-            await feed.publish([{**row(now + 10), "level": 11}], send, now=now + 10)
-        assert send.await_count == 3
+            await feed.publish([{**row(now + 10), "x": 844}], send, now=now + 10)
+        assert send.await_count == 1
         state.set_value = real_set
-        await feed.publish([{**row(now + 10), "level": 11}], send, now=now + 10)
-        assert send.await_count == 3
+        await feed.publish([{**row(now + 10), "x": 844}], send, now=now + 10)
+        assert send.await_count == 1
+    asyncio.run(run())
+
+
+def test_event_location_survives_absence_changed_id_restart_and_migration(tmp_path):
+    import json
+    async def run():
+        now = datetime.now(timezone.utc).timestamp()
+        state = AdminState(tmp_path / "state.db")
+        send = AsyncMock()
+        state.set_value("merc_feed:v1:1", json.dumps({
+            "location:35:843:603": {"seen": now-600, "signature": [35,843,603,10]}
+        }))
+        base = row(now)
+        feed = MercFeed(state,1)
+        await feed.publish([{**base,"object_id":"new-id","level":12}],send,now=now)
+        assert send.await_count == 0
+        await feed.publish([],send,now=now+2000)
+        later = {**base,"last_seen":datetime.fromtimestamp(now+2000,timezone.utc).isoformat()}
+        await MercFeed(state,1).publish([later],send,now=now+2000)
+        assert send.await_count == 0
+        await feed.publish([{**later,"kingdom":36}],send,now=now+2000)
+        assert send.await_count == 1
+        next_event = {**later,"event_start":(now+86400)*1000,
+                      "last_seen":datetime.fromtimestamp(now+86400,timezone.utc).isoformat()}
+        await MercFeed(state,1).publish([next_event],send,now=now+86400)
+        assert send.await_count == 2
     asyncio.run(run())
 
 
