@@ -6,10 +6,28 @@ import time
 from datetime import datetime, timezone
 from aiohttp import web
 
+def confirmed_merc_window():
+    """Optional operator-confirmed occurrence; malformed configuration fails closed."""
+    start = os.environ.get('MERCS_EVENT_START_UTC', '').strip()
+    end = os.environ.get('MERCS_EVENT_END_UTC', '').strip()
+    if not start and not end:
+        return None
+    try:
+        start, end = (datetime.fromisoformat(v.replace('Z', '+00:00')) for v in (start, end))
+        if start.tzinfo is None or end.tzinfo is None or not 0 < (end-start).total_seconds() <= 48*3600:
+            return ()
+        return start, end
+    except ValueError:
+        return ()
+
+
 def merc_event_active(snapshot, now=None):
+    now = now or datetime.now(timezone.utc)
+    confirmed = confirmed_merc_window()
+    if confirmed is not None:
+        return bool(confirmed) and confirmed[0] <= now < confirmed[1]
     if snapshot is None:
         return False
-    now = now or datetime.now(timezone.utc)
     fetched = snapshot.fetched_at_utc
     if fetched is None or not 0 <= (now-fetched).total_seconds() <= 26*3600:
         return False
@@ -32,6 +50,8 @@ class MercCalendarGate:
         self.next_refresh = 0.0
 
     async def active(self, client, *, signaled):
+        if confirmed_merc_window() is not None:
+            return merc_event_active(None)
         if client is None:
             return False
         if merc_event_active(client.snapshot):

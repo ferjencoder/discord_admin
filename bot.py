@@ -1,6 +1,6 @@
 from __future__ import annotations
 from ozy.calendar_sources import install_calendar_sources
-from ozy.sync_signals import MercCalendarGate, merc_event_active, install_sync_signal, run_changes, wait_merc_signal
+from ozy.sync_signals import MercCalendarGate, confirmed_merc_window, merc_event_active, install_sync_signal, run_changes, wait_merc_signal
 
 import asyncio
 import io
@@ -204,6 +204,10 @@ class OZYAdminBot(discord.Client):
             self._merc_wake.clear()
             try:
                 rows = await self.data.current_mercs()
+                confirmed = confirmed_merc_window()
+                if confirmed:
+                    # A confirmed occurrence cannot admit another event's rows.
+                    rows = [r for r in rows if str(r.get('event_start')) == str(int(confirmed[0].timestamp()*1000))]
                 channel = self.get_channel(self.settings.mercs_channel_id)
                 if channel is None:
                     channel = await self.fetch_channel(self.settings.mercs_channel_id)
@@ -212,6 +216,8 @@ class OZYAdminBot(discord.Client):
                     raise ValueError("Merc channel must be a text channel/thread in SERVER_ID")
 
                 async def send(content):
+                    if not merc_event_active(self.calendar_client.snapshot if self.calendar_client else None):
+                        raise ValueError('Merc event ended before delivery')
                     await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
 
                 posted, invalid = await feed.publish(rows, send)
