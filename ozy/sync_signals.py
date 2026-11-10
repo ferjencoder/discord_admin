@@ -33,8 +33,10 @@ def merc_event_active(snapshot, now=None):
         return False
     actions = sorted(snapshot.actions, key=lambda a:a.timestamp_utc)
     for start in actions:
-        name = start.title.casefold().replace('’', "'")
-        if 'mercenar' not in name or 'exchange' not in name or start.action != 'STARTS':
+        name = " ".join(start.title.casefold().replace('’', "'").split())
+        # Trade Routes is the tournament that creates Mercenary Exchanges.
+        is_merc_event = name == 'trade routes' or ('mercenar' in name and 'exchange' in name)
+        if start.action != 'STARTS' or not is_merc_event:
             continue
         end = next((a for a in actions if a.key == start.key and a.action == 'ENDS' and a.timestamp_utc > start.timestamp_utc), None)
         if end and start.timestamp_utc <= now < end.timestamp_utc:
